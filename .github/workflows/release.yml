@@ -52,8 +52,10 @@ jobs:
       - name: Enable Corepack (pinned Yarn)
         shell: bash
         run: |
-          corepack enable --install-directory "$RUNNER_TEMP/corepack" \
-            || { npm i -g corepack@latest && corepack enable --install-directory "$RUNNER_TEMP/corepack"; }
+          # --install-directory requires the target dir to exist; create it with
+          # Node so the path is handled natively on Windows.
+          node -e "require('fs').mkdirSync(process.env.RUNNER_TEMP + '/corepack', { recursive: true })"
+          corepack enable --install-directory "$RUNNER_TEMP/corepack"
           echo "$RUNNER_TEMP/corepack" >> "$GITHUB_PATH"
 
       - name: Cache Yarn
@@ -104,8 +106,10 @@ jobs:
       - name: Enable Corepack (pinned Yarn)
         shell: bash
         run: |
-          corepack enable --install-directory "$RUNNER_TEMP/corepack" \
-            || { npm i -g corepack@latest && corepack enable --install-directory "$RUNNER_TEMP/corepack"; }
+          # --install-directory requires the target dir to exist; create it with
+          # Node so the path is handled natively on Windows.
+          node -e "require('fs').mkdirSync(process.env.RUNNER_TEMP + '/corepack', { recursive: true })"
+          corepack enable --install-directory "$RUNNER_TEMP/corepack"
           echo "$RUNNER_TEMP/corepack" >> "$GITHUB_PATH"
 
       - name: Cache Yarn
