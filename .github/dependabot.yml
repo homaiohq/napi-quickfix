@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Keep npm dependencies (deps + devDeps) up to date.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+
+  # Keep GitHub Actions pinned in workflows up to date.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10

@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build-test (${{ matrix.os }}, node ${{ matrix.node-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node-version: ['22', '24']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Provision a modern, deterministic CMake (>= 3.15 required) on every OS.
+      # Runners ship a CMake + compiler already, but pinning via get-cmake keeps
+      # the toolchain version consistent across the matrix.
+      - name: Set up CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      # yarn Berry 4.x is pinned via package.json "packageManager"; corepack
+      # provisions the exact version. Works in the default shell on all 3 OSes.
+      - name: Enable corepack
+        run: corepack enable
+
+      # Cache the Yarn global cache (enableGlobalCache: true in .yarnrc.yml).
+      - name: Cache Yarn
+        uses: actions/cache@v6
+        with:
+          path: |
+            .yarn/cache
+            ~/.yarn/berry/cache
+          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-
+
+      # Cache the CMake FetchContent-fetched QuickFIX sources/build. cmake-js
+      # builds into ./build, so QuickFIX lands in ./build/_deps. Keyed on the
+      # OS + CMakeLists.txt (the pinned QuickFIX tag lives there).
+      - name: Cache CMake FetchContent deps
+        uses: actions/cache@v6
+        with:
+          path: build/_deps
+          key: cmake-deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            cmake-deps-${{ runner.os }}-
+
+      # --immutable: fail if yarn.lock would change. --mode=skip-build: skip the
+      # package "install" script (node-gyp-build || cmake-js compile) so the
+      # explicit "yarn build" step below is the single authoritative native build.
+      - name: Install dependencies
+        run: yarn install --immutable --mode=skip-build
+
+      # build:native (cmake-js -> QuickFIX via FetchContent) + build:ts (dual ESM/CJS).
+      - name: Build
+        run: yarn build
+
+      # Runs node --test with tsx; requires the native + TS build above.
+      - name: Test
+        run: yarn test

@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# contents: write  -> create the GitHub Release and upload assets.
+# id-token: write  -> mint the OIDC token for npm Trusted Publishing (provenance).
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # Build N-API-tagged prebuilt binaries on each target platform. Because the
+  # addon is N-API-tagged (--napi), ONE prebuild per platform serves all Node
+  # LTS versions, so we only need a single Node here (22).
+  prebuild:
+    name: prebuild (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS arch split: macos-15-intel runners are Intel (darwin-x64),
+        # while macos-latest is Apple Silicon (darwin-arm64). Both are needed
+        # to ship prebuilds for each macOS architecture. (Legacy Intel runner
+        # labels like macos-13 are being retired; use *-intel going forward.)
+        # TODO: add a Linux musl/Alpine job (container: node:*-alpine) to emit
+        #       a musl-tagged prebuild; scripts/prebuild.mjs auto-detects libc
+        #       and writes node.napi.musl.node there.
+        os: [ubuntu-latest, macos-15-intel, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable --mode=skip-build
+
+      # scripts/prebuild.mjs builds a Release binary with cmake-js and copies it
+      # to prebuilds/<platform>-<arch>/node.napi[.<libc>].node. The N-API tag
+      # means one prebuild per platform serves every supported Node LTS.
+      - name: Prebuild native binary
+        run: yarn prebuild
+
+      - name: Upload prebuilds
+        uses: actions/upload-artifact@v7
+        with:
+          name: prebuilds-${{ matrix.os }}
+          path: prebuilds/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Assemble every platform's prebuilds, build the TS, publish to npm with
+  # provenance (OIDC), and cut a GitHub Release with the tarball + prebuilds.
+  publish:
+    name: publish
+    needs: prebuild
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable --mode=skip-build
+
+      # Merge ALL per-platform prebuild artifacts back into ./prebuilds so the
+      # published tarball carries binaries for every supported platform/arch.
+      - name: Download all prebuilds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: prebuilds-*
+          merge-multiple: true
+          path: prebuilds
+
+      # Compile TypeScript only (dual ESM/CJS) for the tarball. The native
+      # binaries come from the merged prebuilds above, so no native build here.
+      - name: Build TypeScript
+        run: yarn build:ts
+
+      # npm Trusted Publishing (OIDC provenance) requires npm >= 11.5.1. The npm
+      # bundled with Node 22 may be older, so upgrade the global npm.
+      - name: Upgrade npm (for OIDC provenance)
+        run: npm install -g npm@latest
+
+      # OIDC Trusted Publishing: NO NPM_TOKEN needed. This requires a configured
+      # Trusted Publisher on npmjs.com for @homaiohq/napi-quickfix pointing at
+      # this repository + this workflow file (.github/workflows/release.yml).
+      # See: https://docs.npmjs.com/trusted-publishers
+      - name: Publish to npm (with provenance)
+        run: npm publish --provenance --access public
+
+      # Produce the tarball to attach to the GitHub Release.
+      - name: Pack tarball
+        run: npm pack
+
+      # Zip each platform's prebuilds into a single archive for the Release.
+      - name: Archive prebuilds
+        run: |
+          cd prebuilds
+          zip -r ../prebuilds.zip .
+          cd ..
+
+      # Create the GitHub Release for the pushed tag with auto-generated notes,
+      # attaching the npm tarball and the zipped prebuilt binaries.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            *.tgz
+            prebuilds.zip
