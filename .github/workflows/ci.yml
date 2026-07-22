@@ -33,26 +33,19 @@ jobs:
       - name: Set up CMake
         uses: lukka/get-cmake@latest
 
+      # yarn Berry 4.x is pinned via package.json "packageManager"; corepack
+      # provisions the exact version. Enable it BEFORE setup-node so setup-node's
+      # `cache: yarn` can resolve the Yarn binary + its (global) cache folder.
+      - name: Enable corepack
+        run: corepack enable
+
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
-
-      # yarn Berry 4.x is pinned via package.json "packageManager"; corepack
-      # provisions the exact version. Works in the default shell on all 3 OSes.
-      - name: Enable corepack
-        run: corepack enable
-
-      # Cache the Yarn global cache (enableGlobalCache: true in .yarnrc.yml).
-      - name: Cache Yarn
-        uses: actions/cache@v6
-        with:
-          path: |
-            .yarn/cache
-            ~/.yarn/berry/cache
-          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
-          restore-keys: |
-            yarn-${{ runner.os }}-
+          # Resolves the real cache folder via `yarn config get cacheFolder`,
+          # so it works correctly with enableGlobalCache across all 3 OSes.
+          cache: 'yarn'
 
       # Cache the CMake FetchContent-fetched QuickFIX sources/build. cmake-js
       # builds into ./build, so QuickFIX lands in ./build/_deps. Keyed on the
