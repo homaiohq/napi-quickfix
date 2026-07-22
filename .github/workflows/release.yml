@@ -11,6 +11,10 @@ permissions:
   contents: write
   id-token: write
 
+# Pin Yarn's cache to a deterministic project-local path on every OS.
+env:
+  YARN_ENABLE_GLOBAL_CACHE: 'false'
+
 jobs:
   # Build N-API-tagged prebuilt binaries on each target platform. Because the
   # addon is N-API-tagged (--napi), ONE prebuild per platform serves all Node
@@ -37,15 +41,23 @@ jobs:
       - name: Set up CMake
         uses: lukka/get-cmake@latest
 
-      # Enable corepack BEFORE setup-node so its `cache: yarn` can resolve Yarn.
-      - name: Enable corepack
-        run: corepack enable
-
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: '22'
-          cache: 'yarn'
+
+      # Enable Corepack AFTER setup-node so the yarn@4 shim targets the installed
+      # Node (avoids the runner's preinstalled classic Yarn 1.x on Windows).
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Cache Yarn
+        uses: actions/cache@v6
+        with:
+          path: .yarn/cache
+          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-
 
       - name: Install dependencies
         run: yarn install --immutable --mode=skip-build
@@ -75,16 +87,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # Enable corepack BEFORE setup-node so its `cache: yarn` can resolve Yarn.
-      - name: Enable corepack
-        run: corepack enable
-
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: '22'
           registry-url: https://registry.npmjs.org
-          cache: 'yarn'
+
+      # Enable Corepack AFTER setup-node so the yarn@4 shim targets the installed Node.
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Cache Yarn
+        uses: actions/cache@v6
+        with:
+          path: .yarn/cache
+          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-
 
       - name: Install dependencies
         run: yarn install --immutable --mode=skip-build

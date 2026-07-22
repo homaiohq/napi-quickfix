@@ -17,6 +17,10 @@ jobs:
   build-test:
     name: build-test (${{ matrix.os }}, node ${{ matrix.node-version }})
     runs-on: ${{ matrix.os }}
+    # Pin Yarn's cache to a deterministic project-local path (.yarn/cache) on
+    # every OS, overriding enableGlobalCache from .yarnrc.yml for CI only.
+    env:
+      YARN_ENABLE_GLOBAL_CACHE: 'false'
     strategy:
       fail-fast: false
       matrix:
@@ -33,19 +37,26 @@ jobs:
       - name: Set up CMake
         uses: lukka/get-cmake@latest
 
-      # yarn Berry 4.x is pinned via package.json "packageManager"; corepack
-      # provisions the exact version. Enable it BEFORE setup-node so setup-node's
-      # `cache: yarn` can resolve the Yarn binary + its (global) cache folder.
-      - name: Enable corepack
-        run: corepack enable
-
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
-          # Resolves the real cache folder via `yarn config get cacheFolder`,
-          # so it works correctly with enableGlobalCache across all 3 OSes.
-          cache: 'yarn'
+
+      # Enable Corepack AFTER setup-node so the yarn@4 shim (from package.json
+      # "packageManager") targets the Node just installed. Doing this before
+      # setup-node, or using setup-node's `cache: yarn`, picks up the runner's
+      # preinstalled classic Yarn 1.x and breaks on the Windows runner.
+      - name: Enable corepack
+        run: corepack enable
+
+      # Cache the Yarn cache (project-local via YARN_ENABLE_GLOBAL_CACHE=false).
+      - name: Cache Yarn
+        uses: actions/cache@v6
+        with:
+          path: .yarn/cache
+          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-
 
       # Cache the CMake FetchContent-fetched QuickFIX sources/build. cmake-js
       # builds into ./build, so QuickFIX lands in ./build/_deps. Keyed on the
