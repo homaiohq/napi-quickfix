@@ -42,12 +42,16 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
-      # Enable Corepack AFTER setup-node so the yarn@4 shim (from package.json
-      # "packageManager") targets the Node just installed. Doing this before
-      # setup-node, or using setup-node's `cache: yarn`, picks up the runner's
-      # preinstalled classic Yarn 1.x and breaks on the Windows runner.
-      - name: Enable corepack
-        run: corepack enable
+      # Corepack's default shim location doesn't reliably override the runner's
+      # preinstalled classic Yarn 1.x (notably on Windows, and on Node 26 where
+      # Corepack is unbundled). Install the yarn@4 shim to a dir we control and
+      # prepend it to PATH so `yarn` resolves to the pinned version everywhere.
+      - name: Enable Corepack (pinned Yarn)
+        shell: bash
+        run: |
+          corepack enable --install-directory "$RUNNER_TEMP/corepack" \
+            || { npm i -g corepack@latest && corepack enable --install-directory "$RUNNER_TEMP/corepack"; }
+          echo "$RUNNER_TEMP/corepack" >> "$GITHUB_PATH"
 
       # Cache the Yarn cache (project-local via YARN_ENABLE_GLOBAL_CACHE=false).
       - name: Cache Yarn
