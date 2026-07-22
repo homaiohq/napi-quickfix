@@ -1,0 +1,60 @@
+{
+  "name": "@homaiohq/napi-quickfix",
+  "version": "0.1.0",
+  "description": "Modern Node-API (N-API) C++ binding for the QuickFIX FIX-protocol engine.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "yarn@4.17.1",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/",
+    "prebuilds/",
+    "cpp/",
+    "CMakeLists.txt",
+    "src/load-native.cjs",
+    "THIRD_PARTY_LICENSES"
+  ],
+  "scripts": {
+    "build:native": "cmake-js compile --CDCMAKE_BUILD_TYPE=Release --CDCMAKE_POLICY_VERSION_MINIMUM=3.5",
+    "build:ts:esm": "tsc -p tsconfig.esm.json",
+    "build:ts:cjs": "tsc -p tsconfig.cjs.json",
+    "build:ts:copy": "node -e \"const fs=require('node:fs');for(const d of ['dist/esm','dist/cjs']){fs.mkdirSync(d,{recursive:true});fs.copyFileSync('src/load-native.cjs',d+'/load-native.cjs');}fs.writeFileSync('dist/cjs/package.json',JSON.stringify({type:'commonjs'})+'\\n');\"",
+    "build:ts": "yarn build:ts:esm && yarn build:ts:cjs && yarn build:ts:copy",
+    "build": "yarn build:native && yarn build:ts",
+    "test": "node --test --import tsx test/*.test.ts",
+    "prebuild": "node scripts/prebuild.mjs",
+    "install": "node-gyp-build || cmake-js compile --CDCMAKE_BUILD_TYPE=Release --CDCMAKE_POLICY_VERSION_MINIMUM=3.5",
+    "clean": "node -e \"const fs=require('node:fs');for(const d of ['dist','build']){fs.rmSync(d,{recursive:true,force:true});}\""
+  },
+  "cmake-js": {
+    "runtime": "node"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.9.0",
+    "node-gyp-build": "^4.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "cmake-js": "^8",
+    "tsx": "^4",
+    "typescript": "~7"
+  }
+}
