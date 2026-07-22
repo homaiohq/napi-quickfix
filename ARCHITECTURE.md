@@ -100,7 +100,7 @@ flowchart TD
 ```
 
 The loader is one authored `.cjs` file copied into both build outputs, so ESM and CJS resolve the exact same binary
-from the package root. The `napi` tag means a single prebuild per platform serves Node 22 and 24.
+from the package root. The `napi` tag means a single prebuild per platform serves Node 22, 24 and 26.
 
 ---
 
@@ -197,7 +197,7 @@ flowchart LR
 ```mermaid
 flowchart TD
   subgraph CI["ci.yml — push / PR"]
-    M["matrix: {ubuntu, macos, windows} × node {22, 24}"]
+    M["matrix: {ubuntu, macos, windows} × node {22, 24, 26}"]
     M --> S1["get-cmake → yarn install → yarn build → yarn test"]
   end
   subgraph REL["release.yml — tag v*"]

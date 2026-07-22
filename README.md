@@ -339,7 +339,7 @@ TypeScript API, the C++ Node-API addon, and the QuickFIX engine fit together
 
 | | |
 | --- | --- |
-| **Node.js** | LTS **22** and **24** |
+| **Node.js** | LTS **22**, **24** and **26** (current) |
 | **N-API version** | 9 |
 | **Platforms** | Linux, macOS, Windows |
 | **Architectures** | x64, arm64 (prebuilt) |

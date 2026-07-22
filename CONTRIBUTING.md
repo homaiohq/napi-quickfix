@@ -6,7 +6,7 @@ engine.
 
 ## Prerequisites
 
-- **Node.js** LTS **22** or **24**
+- **Node.js** LTS **22**, **24** or **26**
 - **CMake** (>= 3.12)
 - A **C++17** compiler (GCC, Clang, or MSVC)
 - **Corepack** (bundled with Node) to provision the pinned Yarn version
