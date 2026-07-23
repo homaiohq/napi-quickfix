@@ -348,6 +348,18 @@ TypeScript API, the C++ Node-API addon, and the QuickFIX engine fit together
 Because prebuilds are N-API-tagged (not ABI-tagged), a single binary per
 platform serves all supported Node LTS versions.
 
+## Versioning
+
+This package follows [Semantic Versioning](https://semver.org/) and is currently
+in the **`0.x`** (pre-1.0) phase. While in `0.x`, **minor releases may include
+breaking changes** — pre-1.0 has no separate major channel — so review the
+[CHANGELOG](./CHANGELOG.md) before upgrading across a minor bump. Note that npm's
+caret range locks the minor for `0.x`: `^0.1.0` resolves to `>=0.1.0 <0.2.0`.
+
+The package version tracks *this binding's* API and behavior, not the bundled
+QuickFIX release (statically linked, currently `v1.16.0` — see the table above).
+See [VERSIONING.md](./VERSIONING.md) for the full policy.
+
 ## License
 
 This package (`@homaiohq/napi-quickfix`) is licensed under the **MIT License** —
