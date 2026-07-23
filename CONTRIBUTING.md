@@ -54,7 +54,29 @@ Useful scripts:
 1. Fork and create a feature branch.
 2. Make your change with accompanying tests where practical.
 3. Ensure `yarn build && yarn test` passes locally.
-4. Open a pull request describing the change and its motivation.
+4. Write commits (and your PR title) in the
+   [Conventional Commits](https://www.conventionalcommits.org/) format — e.g.
+   `feat: add session reset API`, `fix: handle empty tag 35`, or `feat!: drop Node 22`
+   for a breaking change. This signals the intended version bump; see the
+   [type → bump mapping](./VERSIONING.md#conventional-commits).
+5. Open a pull request describing the change and its motivation.
+
+## Versioning & releasing
+
+This project follows [Semantic Versioning](https://semver.org/) with pre-1.0
+conventions. The full policy — including how each kind of change maps to a version
+bump for a native binding — lives in [VERSIONING.md](./VERSIONING.md). In short, while
+in `0.x`:
+
+- **PATCH** — backward-compatible bug fixes and no-op internal changes.
+- **MINOR** — new features **and** breaking changes (pre-1.0 has no major channel).
+
+"Breaking" here is broader than the TS surface: raising the minimum Node version,
+dropping a platform/arch prebuild, or bumping the pinned QuickFIX version in a way that
+changes observable behavior all count. When your change warrants a version bump, add a
+[CHANGELOG.md](./CHANGELOG.md) entry describing it (and note the bundled QuickFIX version
+if it changed). Maintainers cut releases by bumping `package.json` and pushing a matching
+`vX.Y.Z` tag; see [VERSIONING.md](./VERSIONING.md#version--tag-contract) for the flow.
 
 ## License
 

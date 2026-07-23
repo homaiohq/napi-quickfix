@@ -137,6 +137,18 @@ jobs:
       - name: Build TypeScript
         run: yarn build:ts
 
+      # package.json is the single source of truth for the version; the tag must
+      # be v<that version>. Fail fast if they disagree so a mistyped/stale tag
+      # never publishes a wrong version. See VERSIONING.md.
+      - name: Verify version matches tag
+        shell: bash
+        run: |
+          pkg=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::package.json ($pkg) != tag ($tag)"; exit 1
+          fi
+
       # npm Trusted Publishing (OIDC provenance) requires npm >= 11.5.1. The npm
       # bundled with Node 22 may be older, so upgrade the global npm.
       - name: Upgrade npm (for OIDC provenance)
@@ -146,8 +158,16 @@ jobs:
       # Trusted Publisher on npmjs.com for @homaiohq/napi-quickfix pointing at
       # this repository + this workflow file (.github/workflows/release.yml).
       # See: https://docs.npmjs.com/trusted-publishers
+      #
+      # SemVer prereleases (tags with a hyphen, e.g. v0.2.0-rc.1) go to the `next`
+      # dist-tag; stable releases go to `latest`. See VERSIONING.md.
       - name: Publish to npm (with provenance)
-        run: npm publish --provenance --access public
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          dist=latest
+          case "$tag" in *-*) dist=next ;; esac
+          npm publish --provenance --access public --tag "$dist"
 
       # Produce the tarball to attach to the GitHub Release.
       - name: Pack tarball
@@ -166,6 +186,8 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
+          # Flag prerelease tags (those containing a hyphen, e.g. v0.2.0-rc.1).
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             *.tgz
             prebuilds.zip
