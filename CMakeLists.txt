@@ -28,6 +28,24 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(quickfix)
 
+# Give musl the same clock as glibc. QuickFIX picks its clock in
+# src/C++/FieldTypes.cpp:
+#     #if defined(_POSIX_SOURCE) || defined(HAVE_GETTIMEOFDAY)   -> gettimeofday, us
+#     #elif defined(HAVE_FTIME)                                  -> ftime, ms only
+# glibc's <features.h> defines _POSIX_SOURCE whenever _GNU_SOURCE is set (and g++
+# always sets it), so glibc takes the gettimeofday branch for free. musl never
+# defines _POSIX_SOURCE, and QuickFIX -- although it probes gettimeofday in
+# cmake/QuickfixPlatformSettings.cmake -- never propagates HAVE_GETTIMEOFDAY to the
+# compiler (it is absent from cmake_config.h.in). musl does get HAVE_FTIME, so it
+# lands on the obsolete ftime() branch and is capped at MILLISECOND resolution.
+# That is invisible at the default TimestampPrecision=3, but with
+# TimestampPrecision=6 a musl build emits .NNN000 where glibc emits true
+# microseconds. Forcing the probe result on removes that divergence.
+# No-op on glibc, which already takes the first branch.
+if(UNIX AND TARGET quickfix)
+  target_compile_definitions(quickfix PRIVATE HAVE_GETTIMEOFDAY)
+endif()
+
 # ---------------------------------------------------------------------------
 # Include-tree shim (risk #1): QuickFIX ships headers flat in src/C++/*.h but
 # code includes them as "quickfix/Message.h". Assemble a quickfix/ include tree
@@ -85,6 +103,15 @@ target_link_libraries(napi_quickfix PRIVATE ${CMAKE_JS_LIB} quickfix)
 if(UNIX AND NOT APPLE)
   find_package(Threads REQUIRED)
   target_link_libraries(napi_quickfix PRIVATE Threads::Threads)
+  # Statically absorb libstdc++/libgcc so a prebuild does not pin consumers to the
+  # build image's GLIBCXX version. This matters most for musl: docker-node only keeps
+  # the newest Alpine bases, so node:22-alpine's GCC keeps advancing (already 15.2 on
+  # Alpine 3.24) and a consumer on an older node:22-alpineX.Y would otherwise hit
+  # "GLIBCXX_3.4.3x not found". Safe here because the addon is a leaf: C++ exceptions
+  # and RTTI never cross out of the .node (Node's addon ABI is C, and QuickFIX is
+  # statically linked into this same object), and Node dlopen()s addons RTLD_LOCAL, so
+  # the absorbed symbols stay private to this module.
+  target_link_options(napi_quickfix PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
 if(APPLE)

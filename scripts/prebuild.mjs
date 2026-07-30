@@ -7,7 +7,7 @@
 // prebuild serves every supported Node LTS. On Linux we add a libc tag so
 // glibc/musl consumers each pick the right binary.
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 const cmakeJs = process.platform === 'win32' ? 'cmake-js.cmd' : 'cmake-js';
@@ -19,17 +19,48 @@ execFileSync(
   { stdio: 'inherit', cwd: process.cwd() },
 );
 
-// Detect libc on Linux: glibc reports a runtime version in the process report;
-// musl does not.
+// Detect libc on Linux: glibc reports a runtime version in the process report
+// (Node emits header.glibcVersionRuntime only under #ifdef __GLIBC__); musl does not.
+//
+// Never guess here. Mislabelling produces a binary that node-gyp-build hands to the
+// wrong libc at runtime -- a load-time crash on a consumer's machine. A failed build
+// is strictly better than a poisoned release.
 function detectLibc() {
   if (process.platform !== 'linux') return '';
-  try {
-    const report = process.report?.getReport?.();
-    const header = typeof report === 'object' ? report?.header : undefined;
-    return header?.glibcVersionRuntime ? 'glibc' : 'musl';
-  } catch {
-    return 'glibc';
+
+  // Escape hatch for cross-builds, exotic musl distros, or a broken process.report.
+  // Must be one of the two tags node-gyp-build parses.
+  const override = process.env.PREBUILD_LIBC;
+  if (override) {
+    if (override !== 'glibc' && override !== 'musl') {
+      throw new Error(`PREBUILD_LIBC must be "glibc" or "musl", got "${override}"`);
+    }
+    return override;
   }
+
+  const report = process.report?.getReport?.();
+  const header = typeof report === 'object' ? report?.header : undefined;
+  if (!header) {
+    throw new Error(
+      'cannot determine libc: process.report returned no header; set PREBUILD_LIBC',
+    );
+  }
+  const libc = header.glibcVersionRuntime ? 'glibc' : 'musl';
+
+  // Cross-check against the rule the CONSUMER uses, so we cannot publish a tag that
+  // is unreachable on the machine that produced it. node-gyp-build resolves with
+  //   process.env.LIBC || (existsSync('/etc/alpine-release') ? 'musl' : 'glibc')
+  // i.e. it detects Alpine, not musl in general.
+  const resolverLibc = existsSync('/etc/alpine-release') ? 'musl' : 'glibc';
+  if (libc !== resolverLibc) {
+    throw new Error(
+      `libc mismatch: linkage is ${libc} but node-gyp-build would resolve ` +
+        `${resolverLibc} here. Build musl prebuilds on Alpine, or set ` +
+        `PREBUILD_LIBC=${libc} to override.`,
+    );
+  }
+
+  return libc;
 }
 
 const dir = join('prebuilds', `${process.platform}-${process.arch}`);

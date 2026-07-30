@@ -39,14 +39,22 @@ npm install @homaiohq/napi-quickfix
 pnpm add @homaiohq/napi-quickfix
 ```
 
-Prebuilt binaries are published for **linux**, **macOS**, and **Windows** on
-**x64** and **arm64**. On these platforms installation requires no toolchain.
+Prebuilt binaries are published for **Linux x64** (both **glibc** and
+**musl/Alpine**), **macOS** x64 + arm64, and **Windows** x64. On these platforms
+installation requires no toolchain.
+
+The two Linux binaries are libc-tagged and picked automatically: `node-gyp-build`
+selects the musl build when `/etc/alpine-release` exists. On a musl distro that
+is *not* Alpine, set `LIBC=musl` to force it.
 
 If a matching prebuild is not available for your platform/arch, the install
 falls back to building from source, which requires:
 
 - **CMake** (>= 3.12)
 - A **C++17** compiler (GCC / Clang / MSVC)
+
+  On Alpine/musl that is `apk add build-base cmake git` — `build-base` supplies
+  g++/make, and `git` is needed for the QuickFIX `FetchContent` clone.
 
 QuickFIX itself is fetched at build time via CMake `FetchContent` (pinned to
 `v1.16.0`) — nothing is vendored or committed to this repository.
@@ -341,8 +349,9 @@ TypeScript API, the C++ Node-API addon, and the QuickFIX engine fit together
 | --- | --- |
 | **Node.js** | LTS **22**, **24** and **26** (current) |
 | **N-API version** | 9 |
-| **Platforms** | Linux, macOS, Windows |
-| **Architectures** | x64, arm64 (prebuilt) |
+| **Platforms** | Linux (glibc + musl/Alpine), macOS, Windows |
+| **Prebuilt targets** | `linux-x64` (glibc, musl), `darwin-x64`, `darwin-arm64`, `win32-x64` |
+| **libc (Linux)** | glibc **and** musl — separate libc-tagged prebuilds; musl is x64-only |
 | **QuickFIX** | v1.16.0 (statically linked into prebuilds) |
 
 Because prebuilds are N-API-tagged (not ABI-tagged), a single binary per

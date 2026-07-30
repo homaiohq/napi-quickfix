@@ -88,3 +88,89 @@ jobs:
       # Runs node --test with tsx; requires the native + TS build above.
       - name: Test
         run: yarn test
+
+  # ---------------------------------------------------------------------------
+  # Linux / musl (Alpine) build + test.
+  #
+  # Deliberately a SEPARATE job rather than a strategy.matrix entry: the step list
+  # genuinely differs (no setup-node, no get-cmake, plus an apk step), and GitHub
+  # has no supported way to express "no container" for only some matrix entries.
+  #
+  # linux-x64 only: the runner ships musl Node externals for JavaScript actions
+  # (node20_alpine / node24_alpine) on x64 Linux runners only.
+  # ---------------------------------------------------------------------------
+  build-test-musl:
+    name: build-test (alpine musl, node 22)
+    runs-on: ubuntu-latest
+    # musl-linked Node 22, which also still bundles Corepack (unbundled from Node
+    # 25+). One Node version is enough here: the addon is N-API-tagged, so the ABI
+    # story is identical across Node LTS lines.
+    container: node:22-alpine
+    env:
+      YARN_ENABLE_GLOBAL_CACHE: 'false'
+    # Alpine has no bash, and GitHub's default `bash -e {0}` silently degrades to
+    # `sh`. State it explicitly and keep every run body POSIX sh.
+    defaults:
+      run:
+        shell: sh
+
+    steps:
+      # Must precede checkout and the cache steps.
+      #   build-base -> g++ / gcc / make / binutils / musl-dev (the C++17 toolchain)
+      #   cmake      -> lukka/get-cmake installs glibc-only Kitware binaries, which
+      #                 cannot execute here; apk ships CMake 4.x, satisfied by the
+      #                 build's existing --CDCMAKE_POLICY_VERSION_MINIMUM=3.5
+      #   git        -> the QuickFIX FetchContent clone, and it lets actions/checkout
+      #                 clone instead of falling back to the REST API tarball
+      #   tar zstd   -> actions/cache shells out to GNU tar (busybox tar has no
+      #                 --posix) and prefers zstd; /usr/bin/tar precedes busybox
+      #                 /bin/tar on this image's PATH
+      - name: Install toolchain (apk)
+        run: apk add --no-cache build-base cmake git tar zstd
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Deliberately no actions/setup-node (it would fetch a glibc Node that cannot
+      # execute on musl) and no lukka/get-cmake (glibc-only) -- see the apk step.
+
+      # node:*-alpine does preinstall classic Yarn 1.x at /usr/local/bin/yarn, which
+      # is also Corepack's own default install directory -- so the same shim override
+      # as the glibc jobs is needed. RUNNER_TEMP is /__w/_temp inside a container job
+      # and is writable (container jobs run as root).
+      - name: Enable Corepack (pinned Yarn)
+        run: |
+          node -e "require('fs').mkdirSync(process.env.RUNNER_TEMP + '/corepack', { recursive: true })"
+          corepack enable --install-directory "$RUNNER_TEMP/corepack"
+          echo "$RUNNER_TEMP/corepack" >> "$GITHUB_PATH"
+
+      # runner.os is "Linux" for both this job and the glibc ubuntu jobs, so the libc
+      # tag is FRONT-loaded. As a suffix it would not help: the glibc jobs'
+      # `restore-keys: yarn-Linux-` / `cmake-deps-Linux-` prefixes would still match.
+      - name: Cache Yarn
+        uses: actions/cache@v6
+        with:
+          path: .yarn/cache
+          key: yarn-musl-Linux-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            yarn-musl-Linux-
+
+      # Critical: build/_deps holds a COMPILED libquickfix.a. Sharing this cache with
+      # the glibc jobs would link musl objects into a glibc addon (or vice versa), so
+      # the two key namespaces are disjoint by construction.
+      - name: Cache CMake FetchContent deps
+        uses: actions/cache@v6
+        with:
+          path: build/_deps
+          key: cmake-deps-musl-Linux-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            cmake-deps-musl-Linux-
+
+      - name: Install dependencies
+        run: yarn install --immutable --mode=skip-build
+
+      - name: Build
+        run: yarn build
+
+      - name: Test
+        run: yarn test

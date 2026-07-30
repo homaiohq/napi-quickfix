@@ -10,6 +10,7 @@ engine.
 - **CMake** (>= 3.12)
 - A **C++17** compiler (GCC, Clang, or MSVC)
 - **Corepack** (bundled with Node) to provision the pinned Yarn version
+- **Docker** (optional) — only to reproduce the Alpine/musl build locally
 
 QuickFIX itself is **not** vendored: it is fetched at build time via CMake
 `FetchContent` (pinned to `v1.16.0`). The sources are downloaded automatically
@@ -29,7 +30,36 @@ Useful scripts:
 - `yarn build:native` — build only the native addon (`cmake-js`).
 - `yarn build:ts` — build only the TypeScript (ESM + CJS).
 - `yarn clean` — remove `dist/` and `build/`.
-- `yarn prebuild` — produce prebuilt binaries for the current platform.
+- `yarn prebuild` — produce prebuilt binaries for the current platform. On Linux the
+  binary is libc-tagged (`node.napi.glibc.node` / `node.napi.musl.node`); detection is
+  automatic and the script *fails* rather than guessing. Override with `PREBUILD_LIBC`.
+
+## Building for Alpine / musl
+
+CI builds a separate musl-tagged prebuild inside `node:22-alpine`. To reproduce it
+locally without disturbing your glibc `build/` and `node_modules/`:
+
+```sh
+docker run --rm -v "$PWD":/src:ro -w /w node:22-alpine sh -euxc '
+  apk add --no-cache build-base cmake git
+  mkdir -p /w && tar -C /src -cf - --exclude=./build --exclude=./node_modules \
+    --exclude=./dist --exclude=./prebuilds --exclude=./.git . | tar -C /w -xf -
+  mkdir -p /cp && corepack enable --install-directory /cp && export PATH="/cp:$PATH"
+  yarn install --immutable --mode=skip-build
+  yarn build && yarn test && yarn prebuild
+  readelf -d prebuilds/linux-x64/node.napi.musl.node | grep NEEDED
+'
+```
+
+Gotchas, all of which the CI job encodes:
+
+- Do **not** use `actions/setup-node` or `lukka/get-cmake` on Alpine — both ship
+  glibc-only binaries. The container's Node is the toolchain; CMake comes from `apk`.
+- `corepack enable --install-directory` requires the target directory to already exist.
+- `CMakeLists.txt` forces `HAVE_GETTIMEOFDAY` on the QuickFIX target. Without it, musl
+  builds fall through to QuickFIX's obsolete `ftime()` branch and are capped at
+  millisecond resolution, while glibc builds get microseconds — a silent cross-libc
+  divergence at `TimestampPrecision=6`. The loopback test asserts the parity.
 
 ## Project layout
 

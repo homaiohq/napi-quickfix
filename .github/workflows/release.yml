@@ -29,9 +29,8 @@ jobs:
         # while macos-latest is Apple Silicon (darwin-arm64). Both are needed
         # to ship prebuilds for each macOS architecture. (Legacy Intel runner
         # labels like macos-13 are being retired; use *-intel going forward.)
-        # TODO: add a Linux musl/Alpine job (container: node:*-alpine) to emit
-        #       a musl-tagged prebuild; scripts/prebuild.mjs auto-detects libc
-        #       and writes node.napi.musl.node there.
+        # The Linux musl/Alpine prebuild lives in its own `prebuild-musl` job
+        # below -- it needs a container and a different step list.
         os: [ubuntu-latest, macos-15-intel, macos-latest, windows-latest]
 
     steps:
@@ -83,11 +82,84 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Linux / musl (Alpine) prebuild. A separate job rather than a matrix entry: it
+  # needs a container and a different step list (no setup-node, no get-cmake, plus
+  # an apk step). See ci.yml's build-test-musl for the full rationale. linux-x64
+  # only -- the runner ships musl Node externals for JavaScript actions on x64
+  # Linux runners only.
+  #
+  # No job-level env: needed; YARN_ENABLE_GLOBAL_CACHE is set workflow-wide above.
+  prebuild-musl:
+    name: prebuild (alpine musl)
+    runs-on: ubuntu-latest
+    container: node:22-alpine
+    # Alpine has no bash; keep every run body POSIX sh.
+    defaults:
+      run:
+        shell: sh
+
+    steps:
+      # Must precede checkout and cache. Per-package rationale in ci.yml:
+      #   build-base -> g++ / gcc / make / binutils / musl-dev
+      #   cmake      -> get-cmake ships glibc-only Kitware binaries
+      #   git        -> QuickFIX FetchContent clone + a real actions/checkout clone
+      #   tar zstd   -> actions/cache needs GNU tar (not busybox) and prefers zstd
+      - name: Install toolchain (apk)
+        run: apk add --no-cache build-base cmake git tar zstd
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Deliberately no actions/setup-node (would install a glibc Node) and no
+      # lukka/get-cmake (glibc-only).
+
+      # node:*-alpine preinstalls classic Yarn 1.x at /usr/local/bin/yarn, which is
+      # also Corepack's default install directory, so the shim override still
+      # applies. RUNNER_TEMP is /__w/_temp inside a container job.
+      - name: Enable Corepack (pinned Yarn)
+        run: |
+          node -e "require('fs').mkdirSync(process.env.RUNNER_TEMP + '/corepack', { recursive: true })"
+          corepack enable --install-directory "$RUNNER_TEMP/corepack"
+          echo "$RUNNER_TEMP/corepack" >> "$GITHUB_PATH"
+
+      # Front-loaded libc tag: runner.os is "Linux" here and in the glibc prebuild
+      # job, whose `restore-keys: yarn-Linux-` would otherwise prefix-match this.
+      - name: Cache Yarn
+        uses: actions/cache@v6
+        with:
+          path: .yarn/cache
+          key: yarn-musl-Linux-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            yarn-musl-Linux-
+
+      - name: Install dependencies
+        run: yarn install --immutable --mode=skip-build
+
+      # Emits prebuilds/linux-x64/node.napi.musl.node: scripts/prebuild.mjs tags
+      # musl by the ABSENCE of header.glibcVersionRuntime in the process report
+      # (Node emits that field only under #ifdef __GLIBC__), and cross-checks it
+      # against /etc/alpine-release before writing.
+      - name: Prebuild native binary
+        run: yarn prebuild
+
+      # Distinct name: upload-artifact errors on duplicates and the glibc job
+      # already claims "prebuilds-ubuntu-latest". Still matches the publish job's
+      # `pattern: prebuilds-*`; merge-multiple is safe because the two Linux
+      # artifacts share the linux-x64/ directory but differ in FILENAME
+      # (node.napi.glibc.node vs node.napi.musl.node).
+      - name: Upload prebuilds
+        uses: actions/upload-artifact@v7
+        with:
+          name: prebuilds-linux-musl
+          path: prebuilds/
+          if-no-files-found: error
+          retention-days: 7
+
   # Assemble every platform's prebuilds, build the TS, publish to npm with
   # provenance (OIDC), and cut a GitHub Release with the tarball + prebuilds.
   publish:
     name: publish
-    needs: prebuild
+    needs: [prebuild, prebuild-musl]
     runs-on: ubuntu-latest
 
     steps:
