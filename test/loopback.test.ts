@@ -62,7 +62,7 @@ describe('loopback integration (in-process)', () => {
   test(
     'Acceptor + Initiator log on and a NewOrderSingle round-trips (send -> fromApp)',
     { timeout: HANDSHAKE_TIMEOUT_MS + 6000 },
-    async () => {
+    async (t) => {
       const port = await freePort();
 
       const acceptorCfg = `[DEFAULT]
@@ -72,6 +72,10 @@ UseDataDictionary=N
 StartTime=00:00:00
 EndTime=00:00:00
 ResetOnLogon=Y
+# Microsecond SendingTime. Also the lever for the clock-parity assertion at the
+# end of this test -- at the default precision of 3 the assertion cannot tell
+# gettimeofday from ftime.
+TimestampPrecision=6
 
 [SESSION]
 BeginString=FIX.4.4
@@ -89,6 +93,10 @@ UseDataDictionary=N
 StartTime=00:00:00
 EndTime=00:00:00
 ResetOnLogon=Y
+# Microsecond SendingTime. Also the lever for the clock-parity assertion at the
+# end of this test -- at the default precision of 3 the assertion cannot tell
+# gettimeofday from ftime.
+TimestampPrecision=6
 
 [SESSION]
 BeginString=FIX.4.4
@@ -97,7 +105,9 @@ TargetCompID=SERVER
 `;
 
       // The acceptor records inbound application messages via its handler.
-      const received: { msgType: string; symbol: string }[] = [];
+      // sendingTime (header tag 52) is captured to guard the subsecond-clock fix
+      // in CMakeLists.txt — see the assertions at the end of this test.
+      const received: { msgType: string; symbol: string; sendingTime: string }[] = [];
 
       const acc = new Acceptor({
         settings: SessionSettings.fromString(acceptorCfg),
@@ -111,7 +121,13 @@ TargetCompID=SERVER
             } catch {
               symbol = '?';
             }
-            received.push({ msgType: msg.getMsgType(), symbol });
+            let sendingTime = '';
+            try {
+              sendingTime = msg.getHeaderField(FIELD.SendingTime ?? 52);
+            } catch {
+              sendingTime = '';
+            }
+            received.push({ msgType: msg.getMsgType(), symbol, sendingTime });
           },
         },
       });
@@ -150,10 +166,25 @@ TargetCompID=SERVER
         const accepted = await sendToTarget(order, iniSession);
         assert.equal(accepted, true, 'sendToTarget should report the message was accepted');
 
-        // Give the message time to traverse the loopback socket and be delivered
+        // Two more, so the SendingTime assertions below have several samples to
+        // look at (see the comment there for why one is not enough).
+        const EXTRA_ORDERS = 2;
+        for (let i = 0; i < EXTRA_ORDERS; i++) {
+          await sendToTarget(
+            createMessage()
+              .setField(FIELD.MsgType, MsgType.NewOrderSingle)
+              .setField(FIELD.Symbol ?? 55, 'AAPL')
+              .setField(FIELD.Side ?? 54, Side.Buy)
+              .setField(FIELD.OrderQty ?? 38, 100),
+            iniSession,
+          );
+        }
+
+        // Give the messages time to traverse the loopback socket and be delivered
         // to the acceptor's fromApp callback.
+        const expected = 1 + EXTRA_ORDERS;
         const deadline = Date.now() + 5000;
-        while (received.length === 0 && Date.now() < deadline) {
+        while (received.length < expected && Date.now() < deadline) {
           await new Promise((r) => setTimeout(r, 50));
         }
 
@@ -164,6 +195,48 @@ TargetCompID=SERVER
           eventMsgTypes.includes(MsgType.NewOrderSingle),
           "acceptor 'fromApp' event should also have fired with 35=D",
         );
+
+        // --- SendingTime clock parity across libc -------------------------------
+        //
+        // Guards the HAVE_GETTIMEOFDAY definition in CMakeLists.txt (see the long
+        // comment there). QuickFIX's nowUtc() has two viable branches:
+        //   gettimeofday -> real microseconds
+        //   ftime        -> milliseconds, zero-padded to the requested precision
+        // glibc always takes the first; musl takes the second unless we force
+        // HAVE_GETTIMEOFDAY. With TimestampPrecision=6 above, the difference is
+        // observable: the ftime path emits .NNN000, always zero in digits 4-6.
+        //
+        // This is a POSIX-only invariant. MSVC has no gettimeofday() at all, and
+        // upstream QuickFIX propagates HAVE_FTIME on Windows (its src/C++/CMakeLists.txt
+        // probes for it), so a Windows build is millisecond-capped by design and there
+        // is nothing for us to force on. The precision-6 *format* is still checked
+        // everywhere; only the microsecond-tail check below is POSIX-gated.
+        const sendingTimes = received.slice(0, expected).map((r) => r.sendingTime);
+        for (const st of sendingTimes) {
+          assert.match(
+            st,
+            /^\d{8}-\d{2}:\d{2}:\d{2}\.\d{6}$/,
+            `expected a 6-digit subsecond SendingTime, got ${JSON.stringify(st)}`,
+          );
+        }
+        // A genuine microsecond clock can land on x000 occasionally, so require only
+        // that ONE sample has a non-zero microsecond tail; the ftime path has all
+        // three digits zero every single time. False-failure odds ~(1/1000)^3.
+        const microTails = sendingTimes.map((st) => st.slice(-3));
+        if (process.platform === 'win32') {
+          t.diagnostic(
+            'SendingTime microsecond-tail check skipped: Windows QuickFIX is ftime()-based ' +
+              `(millisecond resolution) -- got ${sendingTimes.join(', ')}`,
+          );
+        } else {
+          assert.ok(
+            microTails.some((tail) => /[1-9]/.test(tail)),
+            `every SendingTime had a zero microsecond tail (${sendingTimes.join(', ')}) -- ` +
+              'QuickFIX is compiled against ftime() rather than gettimeofday(), so the ' +
+              'clock is only millisecond-accurate; check the HAVE_GETTIMEOFDAY ' +
+              'definition in CMakeLists.txt',
+          );
+        }
       } finally {
         // Tear down both live sessions; awaiting stop() must not hang.
         await ini.stop().catch(() => {});

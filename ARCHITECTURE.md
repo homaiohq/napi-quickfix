@@ -79,7 +79,7 @@ flowchart LR
   I --> K["dist/cjs (+ package.json type:commonjs)"]
   J & K --> L["copy load-native.cjs into both"]
 
-  H -.->|"yarn prebuild"| M["prebuilds/&lt;platform&gt;-&lt;arch&gt;/<br/>node.napi[.libc].node"]
+  H -.->|"yarn prebuild"| M["prebuilds/&lt;platform&gt;-&lt;arch&gt;/<br/>node.napi.node · node.napi.glibc.node · node.napi.musl.node"]
 ```
 
 Key detail: QuickFIX ships headers **flat** in `src/C++/*.h` but code includes them as `quickfix/Message.h`, so
@@ -199,10 +199,14 @@ flowchart TD
   subgraph CI["ci.yml — push / PR"]
     M["matrix: {ubuntu, macos, windows} × node {22, 24, 26}"]
     M --> S1["get-cmake → yarn install → yarn build → yarn test"]
+    MU["build-test-musl<br/>container: node:22-alpine"]
+    MU --> S2["apk build-base cmake git → yarn install → yarn build → yarn test"]
   end
   subgraph REL["release.yml — tag v*"]
     P["prebuild matrix<br/>ubuntu · macos-intel · macos-arm · windows"]
+    PM["prebuild-musl<br/>container: node:22-alpine"]
     P --> UP["upload prebuilds/ artifacts"]
+    PM --> UP
     UP --> PUB["publish job"]
     PUB --> DL["download + merge all prebuilds"]
     DL --> NPM["npm publish --provenance (OIDC, no token)"]
@@ -212,6 +216,13 @@ flowchart TD
 
 Because binaries are N-API-tagged, one prebuild per platform/arch covers every supported Node LTS. Publishing uses
 npm **trusted publishing** (OIDC) — no long-lived token.
+
+The musl jobs are deliberately **separate jobs** rather than matrix entries: they need a container and a different step
+list (no `setup-node`, which would install a glibc Node; no `lukka/get-cmake`, whose Kitware binaries are glibc-only —
+CMake comes from `apk`). Note that `runner.os` is `Linux` for both the glibc and musl jobs, so their cache keys carry a
+**front-loaded** `musl-` discriminator (`cmake-deps-musl-Linux-…`). Front-loaded, not suffixed: `build/_deps` holds a
+compiled `libquickfix.a`, and as a suffix the glibc job's `restore-keys: cmake-deps-Linux-` would still prefix-match the
+musl entries and link musl objects into a glibc addon.
 
 ---
 
