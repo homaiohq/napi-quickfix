@@ -42,6 +42,11 @@ FetchContent_MakeAvailable(quickfix)
 # TimestampPrecision=6 a musl build emits .NNN000 where glibc emits true
 # microseconds. Forcing the probe result on removes that divergence.
 # No-op on glibc, which already takes the first branch.
+#
+# UNIX-only on purpose: MSVC has no gettimeofday() to point HAVE_GETTIMEOFDAY at, and
+# upstream QuickFIX does propagate HAVE_FTIME on Windows (it probes for it in
+# src/C++/CMakeLists.txt), so Windows is millisecond-capped by design. The loopback
+# test's microsecond-tail assertion is POSIX-gated to match.
 if(UNIX AND TARGET quickfix)
   target_compile_definitions(quickfix PRIVATE HAVE_GETTIMEOFDAY)
 endif()

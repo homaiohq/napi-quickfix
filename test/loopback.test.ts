@@ -62,7 +62,7 @@ describe('loopback integration (in-process)', () => {
   test(
     'Acceptor + Initiator log on and a NewOrderSingle round-trips (send -> fromApp)',
     { timeout: HANDSHAKE_TIMEOUT_MS + 6000 },
-    async () => {
+    async (t) => {
       const port = await freePort();
 
       const acceptorCfg = `[DEFAULT]
@@ -205,6 +205,12 @@ TargetCompID=SERVER
         // glibc always takes the first; musl takes the second unless we force
         // HAVE_GETTIMEOFDAY. With TimestampPrecision=6 above, the difference is
         // observable: the ftime path emits .NNN000, always zero in digits 4-6.
+        //
+        // This is a POSIX-only invariant. MSVC has no gettimeofday() at all, and
+        // upstream QuickFIX propagates HAVE_FTIME on Windows (its src/C++/CMakeLists.txt
+        // probes for it), so a Windows build is millisecond-capped by design and there
+        // is nothing for us to force on. The precision-6 *format* is still checked
+        // everywhere; only the microsecond-tail check below is POSIX-gated.
         const sendingTimes = received.slice(0, expected).map((r) => r.sendingTime);
         for (const st of sendingTimes) {
           assert.match(
@@ -217,13 +223,20 @@ TargetCompID=SERVER
         // that ONE sample has a non-zero microsecond tail; the ftime path has all
         // three digits zero every single time. False-failure odds ~(1/1000)^3.
         const microTails = sendingTimes.map((st) => st.slice(-3));
-        assert.ok(
-          microTails.some((tail) => /[1-9]/.test(tail)),
-          `every SendingTime had a zero microsecond tail (${sendingTimes.join(', ')}) -- ` +
-            'QuickFIX is compiled against ftime() rather than gettimeofday(), so the ' +
-            'clock is only millisecond-accurate; check the HAVE_GETTIMEOFDAY ' +
-            'definition in CMakeLists.txt',
-        );
+        if (process.platform === 'win32') {
+          t.diagnostic(
+            'SendingTime microsecond-tail check skipped: Windows QuickFIX is ftime()-based ' +
+              `(millisecond resolution) -- got ${sendingTimes.join(', ')}`,
+          );
+        } else {
+          assert.ok(
+            microTails.some((tail) => /[1-9]/.test(tail)),
+            `every SendingTime had a zero microsecond tail (${sendingTimes.join(', ')}) -- ` +
+              'QuickFIX is compiled against ftime() rather than gettimeofday(), so the ' +
+              'clock is only millisecond-accurate; check the HAVE_GETTIMEOFDAY ' +
+              'definition in CMakeLists.txt',
+          );
+        }
       } finally {
         // Tear down both live sessions; awaiting stop() must not hang.
         await ini.stop().catch(() => {});

@@ -59,7 +59,11 @@ Gotchas, all of which the CI job encodes:
 - `CMakeLists.txt` forces `HAVE_GETTIMEOFDAY` on the QuickFIX target. Without it, musl
   builds fall through to QuickFIX's obsolete `ftime()` branch and are capped at
   millisecond resolution, while glibc builds get microseconds — a silent cross-libc
-  divergence at `TimestampPrecision=6`. The loopback test asserts the parity.
+  divergence at `TimestampPrecision=6`. The loopback test asserts the parity, but only
+  on POSIX: MSVC has no `gettimeofday()` and upstream hands Windows the `ftime()` branch,
+  so Windows is millisecond-capped by design and the test skips the microsecond-tail
+  assertion there (with a `t.diagnostic()` note). The precision-6 *format* is still
+  asserted on every platform.
 
 ## Project layout
 

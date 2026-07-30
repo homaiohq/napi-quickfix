@@ -353,9 +353,15 @@ TypeScript API, the C++ Node-API addon, and the QuickFIX engine fit together
 | **Prebuilt targets** | `linux-x64` (glibc, musl), `darwin-x64`, `darwin-arm64`, `win32-x64` |
 | **libc (Linux)** | glibc **and** musl — separate libc-tagged prebuilds; musl is x64-only |
 | **QuickFIX** | v1.16.0 (statically linked into prebuilds) |
+| **Timestamp resolution** | microseconds on Linux (glibc + musl) and macOS; **milliseconds on Windows** |
 
 Because prebuilds are N-API-tagged (not ABI-tagged), a single binary per
 platform serves all supported Node LTS versions.
+
+On Windows, QuickFIX has no microsecond clock available (it falls back to
+`ftime()`), so sub-second `SendingTime` digits beyond milliseconds are always
+zero — a `TimestampPrecision=6` session emits `.NNN000`. Setting a higher
+precision is still valid and interoperable; only the extra digits are padding.
 
 ## Versioning
 
