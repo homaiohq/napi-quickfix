@@ -104,9 +104,10 @@ are a feature; a **removed or renumbered** field, or a **removed or re-valued**
 value constant, is a breaking change for consumers (they lose a `FIELD.X` or
 `Side.X` they may be using) — note it for the Phase 6 classification. If
 `gen:values` aborts, a new upstream name defeated the naming rule documented at
-the top of `scripts/gen-values.mjs` (a key collision after PascalCase
-conversion, or an invalid identifier); extend the rule deliberately rather than
-hand-editing the generated file.
+the top of `scripts/gen-values.mjs` (a mixed-case name outside `VERBATIM_GROUPS`
+/ `PASCAL_CASE_EXCEPTIONS`, a key collision after PascalCase conversion, or an
+invalid identifier); extend the rule deliberately rather than hand-editing the
+generated file.
 
 ## Phase 4 — Fix C++ bridge breakage
 

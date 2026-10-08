@@ -1,7 +1,5 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 
 import {
   FIELD,
@@ -187,19 +185,5 @@ describe('enums', () => {
       (MsgType as any).Logon = 'ZZZ';
     });
     assert.equal(MsgType.Logon, 'A');
-  });
-
-  test('the checked-in generated tables match the pinned QuickFIX headers', () => {
-    // Same as `yarn gen:fields:check` / `yarn gen:values:check`: the generators read
-    // the FetchContent checkout under build/_deps (or GitHub at the pinned tag) and
-    // exit non-zero if src/generated/*.ts is stale.
-    for (const script of ['gen-fields.mjs', 'gen-values.mjs']) {
-      const path = fileURLToPath(new URL(`../scripts/${script}`, import.meta.url));
-      const out = execFileSync(process.execPath, [path, '--check'], {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      assert.match(out, /is up to date/, script);
-    }
   });
 });

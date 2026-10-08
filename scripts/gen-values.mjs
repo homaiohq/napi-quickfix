@@ -11,16 +11,19 @@
 //   1. The group is everything before the first underscore and is always a FIX
 //      field name (`Side_BUY` → group `Side`). Groups are emitted in alphabetical
 //      order; members keep their upstream (spec) order.
-//   2. A group whose names are already mixed-case upstream — more than half of its
-//      suffixes contain a lowercase letter; in v1.16.0 that is only `MsgType`, whose
-//      constants mirror message names — keeps every suffix verbatim:
-//      `MsgType_NewOrderSingle` → `NewOrderSingle`, `MsgType_IOI` → `IOI`,
+//   2. The groups listed in VERBATIM_GROUPS — only `MsgType`, whose constants mirror
+//      message names and are already mixed-case upstream — keep every suffix
+//      verbatim: `MsgType_NewOrderSingle` → `NewOrderSingle`, `MsgType_IOI` → `IOI`,
 //      `MsgType_XMLnonFIX` → `XMLnonFIX`.
 //   3. Every other group is SCREAMING_SNAKE upstream and is converted to PascalCase:
 //      split on `_`, lower-case each word, upper-case its first character, join.
 //      `Side_SELL_SHORT` → `SellShort`, `OrdType_LIMIT` → `Limit`,
 //      `EncryptMethod_NONE_OTHER` → `NoneOther`, `YieldType_..._OF32NDS` → `...Of32nds`.
-//      Leading, trailing and repeated underscores are ignored.
+//      Leading, trailing and repeated underscores are ignored. A lowercase letter in
+//      such a suffix aborts the generator unless the name is listed in
+//      PASCAL_CASE_EXCEPTIONS, so a new mixed-case upstream name is handled
+//      deliberately (verbatim group, exception, or new rule) instead of being
+//      silently renamed by a heuristic.
 //   4. A key that would start with a digit is prefixed with an underscore so it
 //      stays a valid identifier (`_30Days`). C identifiers cannot carry any other
 //      special character, so no further escaping exists; anything that still fails
@@ -138,6 +141,15 @@ function parseDeclarations(text) {
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+// Groups whose upstream suffixes are already mixed-case and are kept verbatim (rule 2).
+// Listing them explicitly, rather than voting on the data, keeps the output stable:
+// a future header cannot flip a whole group's keys without a change here.
+const VERBATIM_GROUPS = new Set(['MsgType']);
+
+// Upstream names outside VERBATIM_GROUPS that contain a lowercase letter and are still
+// PascalCased like their SCREAMING_SNAKE siblings (rule 3). `FIX4n` reads as "FIX 4.n".
+const PASCAL_CASE_EXCEPTIONS = new Set(['YieldType_FIX4n_YIELD_VALUE_OF32NDS']);
+
 function pascalCase(suffix) {
   return suffix
     .split('_')
@@ -169,13 +181,23 @@ function groupValues(decls) {
     groups.get(group).push({ suffix, value });
   }
 
+  for (const group of VERBATIM_GROUPS) {
+    if (!groups.has(group)) throw new Error(`verbatim group ${group} is missing upstream`);
+  }
+
   const out = [];
   for (const [group, items] of groups) {
-    const mixedCase = items.filter(({ suffix }) => /[a-z]/.test(suffix)).length;
-    const verbatim = mixedCase * 2 > items.length;
+    const verbatim = VERBATIM_GROUPS.has(group);
     const members = [];
     const keys = new Map();
     for (const { suffix, value } of items) {
+      const mixedCase = /[a-z]/.test(suffix);
+      if (!verbatim && mixedCase && !PASCAL_CASE_EXCEPTIONS.has(`${group}_${suffix}`)) {
+        throw new Error(
+          `${group}_${suffix} is not SCREAMING_SNAKE; add ${group} to VERBATIM_GROUPS, ` +
+            'list the name in PASCAL_CASE_EXCEPTIONS, or extend the naming rule',
+        );
+      }
       const key = toKey(group, suffix, verbatim);
       if (keys.has(key)) {
         throw new Error(
