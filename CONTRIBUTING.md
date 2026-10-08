@@ -119,6 +119,44 @@ changes observable behavior all count. When your change warrants a version bump,
 if it changed). Maintainers cut releases by bumping `package.json` and pushing a matching
 `vX.Y.Z` tag; see [VERSIONING.md](./VERSIONING.md#version--tag-contract) for the flow.
 
+### Release automation (npm Trusted Publishing)
+
+`.github/workflows/release.yml` publishes to npm with
+[Trusted Publishing](https://docs.npmjs.com/trusted-publishers): the `publish` job
+requests a GitHub Actions OIDC token (`id-token: write`) and npm exchanges it for a
+short-lived publish token. **No npm token is stored in GitHub secrets**, and none should
+be added.
+
+One-time setup on npmjs.com (package → *Settings* → *Trusted Publisher* → *GitHub
+Actions*). Every field is case-sensitive:
+
+| Field                | Value                                                 |
+| -------------------- | ----------------------------------------------------- |
+| Organization or user | `homaiohq`                                            |
+| Repository           | `napi-quickfix`                                       |
+| Workflow filename    | `release.yml` (filename only)                         |
+| Environment name     | leave blank                                           |
+| Allowed actions      | enable `npm publish` (only `npm stage publish` is on by default) |
+
+Then, under the package's *Publishing access*, select *Require two-factor
+authentication and disallow tokens* so OIDC becomes the only way to publish.
+
+Notes:
+
+- A trusted publisher is configured **on an existing package**, so the very first
+  version of `@homaiohq/napi-quickfix` has to be published by a maintainer from their
+  machine (`npm login` with 2FA, then `npm publish --access public` from a clean,
+  built checkout). Every later release goes through the workflow. npm expires a new
+  trusted-publisher configuration that has not completed a publish within 2 days, so
+  add it just before cutting the next release.
+- `repository.url` in `package.json` must match the GitHub repository exactly; npm
+  checks it against the OIDC claims.
+- Provenance attestations are generated automatically by npm for every release cut
+  from a public repository; do not pass `--provenance`. (Releases cut while the
+  repository was still private carry no attestation, which is an npm limitation, not a
+  workflow setting.) Consumers can verify with `npm audit signatures`.
+- Only GitHub-hosted runners are supported for the publish job.
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the

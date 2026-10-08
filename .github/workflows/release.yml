@@ -5,22 +5,40 @@ on:
     tags:
       - 'v*'
 
-# contents: write  -> create the GitHub Release and upload assets.
-# id-token: write  -> mint the OIDC token for npm Trusted Publishing (provenance).
+# Least privilege by default. The `publish` job alone elevates to
+# `contents: write` (GitHub Release) and `id-token: write` (npm OIDC).
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 # Pin Yarn's cache to a deterministic project-local path on every OS.
 env:
   YARN_ENABLE_GLOBAL_CACHE: 'false'
 
 jobs:
+  # package.json is the single source of truth for the version; the tag must
+  # be v<that version>. Fail fast -- before any prebuild minute is spent -- so a
+  # mistyped/stale tag never publishes a wrong version. See VERSIONING.md.
+  verify:
+    name: verify version matches tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Verify version matches tag
+        run: |
+          pkg=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::package.json ($pkg) != tag ($tag)"; exit 1
+          fi
+
   # Build N-API-tagged prebuilt binaries on each target platform. Because the
   # addon is N-API-tagged (--napi), ONE prebuild per platform serves all Node
   # LTS versions, so we only need a single Node here (22).
   prebuild:
     name: prebuild (${{ matrix.os }})
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -91,6 +109,7 @@ jobs:
   # No job-level env: needed; YARN_ENABLE_GLOBAL_CACHE is set workflow-wide above.
   prebuild-musl:
     name: prebuild (alpine musl)
+    needs: verify
     runs-on: ubuntu-latest
     container: node:22-alpine
     # Alpine has no bash; keep every run body POSIX sh.
@@ -155,12 +174,18 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Assemble every platform's prebuilds, build the TS, publish to npm with
-  # provenance (OIDC), and cut a GitHub Release with the tarball + prebuilds.
+  # Assemble every platform's prebuilds, build the TS, publish to npm via OIDC
+  # Trusted Publishing, and cut a GitHub Release with the tarball + prebuilds.
   publish:
     name: publish
     needs: [prebuild, prebuild-musl]
     runs-on: ubuntu-latest
+    # contents: write -> create the GitHub Release and upload assets.
+    # id-token: write -> let npm mint the GitHub OIDC token it exchanges for a
+    #                    short-lived publish token (Trusted Publishing).
+    permissions:
+      contents: write
+      id-token: write
 
     steps:
       - name: Checkout
@@ -209,37 +234,42 @@ jobs:
       - name: Build TypeScript
         run: yarn build:ts
 
-      # package.json is the single source of truth for the version; the tag must
-      # be v<that version>. Fail fast if they disagree so a mistyped/stale tag
-      # never publishes a wrong version. See VERSIONING.md.
-      - name: Verify version matches tag
-        shell: bash
+      # npm Trusted Publishing needs npm >= 11.5.1; Node 22 bundles npm 10.x, so
+      # upgrade the global npm. (npm@latest's engines range covers the runner's
+      # current Node 22.)
+      - name: Upgrade npm (for OIDC Trusted Publishing)
         run: |
-          pkg=$(node -p "require('./package.json').version")
-          tag="${GITHUB_REF_NAME#v}"
-          if [ "$pkg" != "$tag" ]; then
-            echo "::error::package.json ($pkg) != tag ($tag)"; exit 1
-          fi
+          npm install -g npm@latest
+          npm --version
 
-      # npm Trusted Publishing (OIDC provenance) requires npm >= 11.5.1. The npm
-      # bundled with Node 22 may be older, so upgrade the global npm.
-      - name: Upgrade npm (for OIDC provenance)
-        run: npm install -g npm@latest
+      # Dry run first: surfaces packaging mistakes (missing prebuilds, stray
+      # files) in the log without touching the registry.
+      - name: Preview package contents
+        run: npm publish --dry-run --access public
 
-      # OIDC Trusted Publishing: NO NPM_TOKEN needed. This requires a configured
-      # Trusted Publisher on npmjs.com for @homaiohq/napi-quickfix pointing at
-      # this repository + this workflow file (.github/workflows/release.yml).
-      # See: https://docs.npmjs.com/trusted-publishers
+      # OIDC Trusted Publishing: NO npm token is configured anywhere. npm detects
+      # GitHub Actions, requests an OIDC token (hence `id-token: write`), and
+      # exchanges it at the registry for a short-lived publish token. That token
+      # takes precedence over the placeholder `_authToken` setup-node writes to
+      # .npmrc, so `registry-url` above is harmless.
+      #
+      # Requires a Trusted Publisher configured on npmjs.com for this repo and
+      # workflow file: see CONTRIBUTING.md, "Release automation".
+      #
+      # No `--provenance` flag: with Trusted Publishing npm enables provenance
+      # by itself whenever the repository is public, so public releases get a
+      # Sigstore attestation with no extra configuration. Forcing the flag while
+      # the repository is still private is unsupported and would push the private
+      # repo's build details to the public transparency log.
       #
       # SemVer prereleases (tags with a hyphen, e.g. v0.2.0-rc.1) go to the `next`
       # dist-tag; stable releases go to `latest`. See VERSIONING.md.
-      - name: Publish to npm (with provenance)
-        shell: bash
+      - name: Publish to npm (OIDC Trusted Publishing)
         run: |
           tag="${GITHUB_REF_NAME#v}"
           dist=latest
           case "$tag" in *-*) dist=next ;; esac
-          npm publish --provenance --access public --tag "$dist"
+          npm publish --access public --tag "$dist"
 
       # Produce the tarball to attach to the GitHub Release.
       - name: Pack tarball

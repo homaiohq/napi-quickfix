@@ -59,6 +59,14 @@ falls back to building from source, which requires:
 QuickFIX itself is fetched at build time via CMake `FetchContent` (pinned to
 `v1.16.0`) — nothing is vendored or committed to this repository.
 
+Releases are published from GitHub Actions via npm Trusted Publishing with
+[provenance](https://docs.npmjs.com/generating-provenance-statements), so you can
+check that an installed version was built from this repository:
+
+```sh
+npm audit signatures
+```
+
 ## Quick start
 
 ### ESM

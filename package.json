@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "Modern Node-API (N-API) C++ binding for the QuickFIX FIX-protocol engine.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/homaiohq/napi-quickfix.git"
+  },
+  "homepage": "https://github.com/homaiohq/napi-quickfix#readme",
+  "bugs": {
+    "url": "https://github.com/homaiohq/napi-quickfix/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=22"
