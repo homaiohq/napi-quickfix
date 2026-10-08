@@ -20,10 +20,16 @@ const FETCHED_DIR = join(ROOT, 'build', '_deps', 'quickfix-src');
 // `{ check, fromPath }` from a generator's argv.
 export function parseArgs(argv = process.argv.slice(2)) {
   const fromIdx = argv.indexOf('--from');
-  return {
-    check: argv.includes('--check'),
-    fromPath: fromIdx >= 0 ? argv[fromIdx + 1] : undefined,
-  };
+  let fromPath;
+  if (fromIdx >= 0) {
+    fromPath = argv[fromIdx + 1];
+    // A `--from` without its path must not quietly fall through to the FetchContent
+    // checkout or GitHub: the operator meant to pin the header to a local copy.
+    if (fromPath === undefined || fromPath.startsWith('--')) {
+      throw new Error('--from requires a path argument');
+    }
+  }
+  return { check: argv.includes('--check'), fromPath };
 }
 
 export function pinnedTag() {

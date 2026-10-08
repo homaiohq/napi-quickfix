@@ -35,7 +35,19 @@ export {
   type ValueGroupName,
 } from './generated/values.js';
 
-/** A single group of FIX constants (name → value), e.g. {@link Side} or {@link FIELD}. */
+/**
+ * A single group of FIX constants widened to a string-indexed map (name → value).
+ *
+ * Every value group and {@link FIELD} is assignable to it, so use it where a group
+ * is looked up by a `string` key the compiler cannot narrow (a name read from
+ * configuration, say) instead of the literally-typed group itself:
+ *
+ * @example
+ * ```ts
+ * const group: EnumGroup = enums[name as ValueGroupName];
+ * const code = group[valueName];
+ * ```
+ */
 export type EnumGroup = Readonly<Record<string, number | string>>;
 
 /**

@@ -10,6 +10,8 @@ import {
   OrdType,
   TimeInForce,
   enums,
+  type EnumGroup,
+  type ValueGroupName,
 } from '../dist/esm/index.js';
 // Resolved through the package's own `exports` map (Node self-reference), so a
 // broken `./values` entry fails here rather than only for consumers.
@@ -156,6 +158,21 @@ describe('enums', () => {
     assert.equal(Side.Bye, undefined);
     // @ts-expect-error — so is a misspelt group name.
     assert.equal(VALUES.Sides, undefined);
+  });
+
+  test('EnumGroup widens any group for lookups by a string key', () => {
+    // Type-level: the migration path for code that indexed the former string-indexed
+    // `MsgType` / `Side` / `enums` with a `string` key (see CHANGELOG).
+    const groupName: string = 'Side';
+    const valueName: string = 'Buy';
+    const widened: EnumGroup = enums[groupName as ValueGroupName];
+    assert.equal(widened[valueName], '1');
+    const msgTypes: EnumGroup = MsgType;
+    assert.equal(msgTypes['Logon'], 'A');
+    const tags: EnumGroup = FIELD;
+    assert.equal(tags['MsgType'], 35);
+    // @ts-expect-error — the literally-typed group itself has no string index signature.
+    assert.equal(Side[valueName], '1');
   });
 
   test('the `values` subpath exposes the same objects without the native addon', () => {

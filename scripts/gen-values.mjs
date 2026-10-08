@@ -33,7 +33,9 @@
 //      something the generated module itself refers to (`Object`, `VALUES`,
 //      `ValueGroups`, `ValueGroupName`, see RESERVED_GROUPS) aborts the generator:
 //      `export const Object = Object.freeze(...)` would compile and then throw at
-//      import time.
+//      import time. `FIELD` is reserved for the same reason one level up:
+//      src/enums.ts spreads every group next to the tag table (`{ ...VALUES, FIELD }`),
+//      so a `FIELD` group would be silently shadowed there.
 //
 // Values are always strings — FIX is string-on-the-wire — whatever the C++
 // declaration form: `const char X[] = "ABC"` → `'ABC'`, `const char X = '1'` →
@@ -94,8 +96,9 @@ function parseDeclarations(text) {
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 // Group names the generated module cannot export without shadowing an identifier
-// it uses itself (rule 5). Keep in sync with render().
-const RESERVED_GROUPS = new Set(['Object', 'VALUES', 'ValueGroups', 'ValueGroupName']);
+// it uses itself, plus `FIELD`, which src/enums.ts merges the groups with (rule 5).
+// Keep in sync with render() and with `enums` in src/enums.ts.
+const RESERVED_GROUPS = new Set(['Object', 'VALUES', 'ValueGroups', 'ValueGroupName', 'FIELD']);
 
 // Groups whose upstream suffixes are already mixed-case and are kept verbatim (rule 2).
 // Listing them explicitly, rather than voting on the data, keeps the output stable:
@@ -131,9 +134,11 @@ function groupValues(decls) {
     if (underscore <= 0 || underscore === name.length - 1) {
       throw new Error(`value name is not of the form Group_SUFFIX: ${name}`);
     }
+    // `group` is a non-empty prefix of a name the parser already matched against
+    // IDENTIFIER, so it is always a valid identifier itself.
     const group = name.slice(0, underscore);
     const suffix = name.slice(underscore + 1);
-    if (!IDENTIFIER.test(group) || RESERVED_GROUPS.has(group)) {
+    if (RESERVED_GROUPS.has(group)) {
       throw new Error(`cannot export a value group named ${group} (from ${name})`);
     }
     if (!groups.has(group)) groups.set(group, []);

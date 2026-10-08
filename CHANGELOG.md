@@ -30,6 +30,13 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   hand-curated subset in the native addon. Their keys and values are unchanged, but they
   are now typed as literals (`Side.Buy` is `'1'`, a misspelt name is a compile error) and
   `Enums` is the precise tree type rather than a string-indexed record.
+- **Breaking (types only):** `MsgType`, `Side` and `enums` lose their `string` index
+  signatures. Dynamic lookups such as `MsgType[nameFromConfig]` or
+  `enums[groupName][valueName]` with `string` keys no longer compile; widen the group
+  to `EnumGroup` (`const g: EnumGroup = MsgType`) or narrow the key
+  (`enums[groupName as ValueGroupName]`). The `StringEnumGroup` and `NumericEnumGroup`
+  types are removed: a function that took a `StringEnumGroup` can take `EnumGroup`
+  (every group and `FIELD` is assignable to it) or `ValueGroups[ValueGroupName]`.
 - The native addon no longer exports `enums` (`cpp/enums.cpp` removed); the TypeScript
   public surface is a superset of what it provided.
 
