@@ -85,10 +85,13 @@ jobs:
       - name: Build
         run: yarn build
 
-      # The typed FIELD table (src/generated/fields.ts) is checked in; verify it still
-      # matches the FixFieldNumbers.h that FetchContent just fetched at the pinned tag.
+      # The typed FIELD table (src/generated/fields.ts) and the value groups
+      # (src/generated/values.ts) are checked in; verify they still match the
+      # FixFieldNumbers.h / FixValues.h that FetchContent just fetched at the pinned tag.
       - name: Check generated FIELD table
         run: yarn gen:fields:check
+      - name: Check generated value groups
+        run: yarn gen:values:check
 
       # Runs node --test with tsx; requires the native + TS build above.
       - name: Test

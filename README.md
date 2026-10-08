@@ -29,7 +29,7 @@ included.
   header/trailer field routing, typed rejections, and C++ exceptions surfaced as
   JavaScript `Error`s.
 - **Every FIX constant, typed** — `FIELD` (tag numbers) and one value group per
-  field (`MsgType`, `Side`, `ExecType`, `OrdStatus`, ... 690 groups) are
+  field (`MsgType`, `Side`, `ExecType`, `OrdStatus`, ...) are
   generated from the bundled QuickFIX headers with literal types, frozen, and
   importable without loading the native addon.
 

@@ -1,5 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 
 import {
   FIELD,
@@ -10,6 +11,8 @@ import {
   TimeInForce,
   enums,
 } from '../dist/esm/index.js';
+// Resolved through the package's own `exports` map (Node self-reference), so a
+// broken `./values` entry fails here rather than only for consumers.
 import {
   ExecType,
   OrdStatus,
@@ -18,7 +21,9 @@ import {
   PossDupFlag,
   Side as SideFromValues,
   VALUES as ValuesFromSubpath,
-} from '../dist/esm/generated/values.js';
+} from '@homaiohq/napi-quickfix/values';
+
+const require = createRequire(import.meta.url);
 
 describe('enums', () => {
   test('FIELD maps names to tag numbers', () => {
@@ -28,7 +33,9 @@ describe('enums', () => {
   });
 
   test('FIELD covers the full QuickFIX FixFieldNumbers.h table', () => {
-    // v1.16.0 declares 6107 names; a future QuickFIX may add more, never fewer.
+    // v1.16.0 declares 6107 names. The floor guards against a half-parsed header; lower
+    // it only on a QuickFIX bump that removes fields (a breaking change, see
+    // .agents/skills/upgrade-quickfix).
     const names = Object.keys(FIELD);
     assert.ok(names.length >= 6107, `expected >= 6107 field names, got ${names.length}`);
     // Aliases: several tags carry more than one name across FIX versions.
@@ -115,7 +122,9 @@ describe('enums', () => {
   });
 
   test('VALUES covers the full QuickFIX FixValues.h table', () => {
-    // v1.16.0 declares 690 groups / 5781 values; a future QuickFIX may add more, never fewer.
+    // v1.16.0 declares 690 groups / 5781 values. The floor guards against a half-parsed
+    // header; lower it only on a QuickFIX bump that removes constants (a breaking
+    // change, see .agents/skills/upgrade-quickfix).
     const groups = Object.keys(VALUES);
     assert.ok(groups.length >= 690, `expected >= 690 value groups, got ${groups.length}`);
     let total = 0;
@@ -152,6 +161,14 @@ describe('enums', () => {
   test('the `values` subpath exposes the same objects without the native addon', () => {
     assert.equal(SideFromValues, Side);
     assert.equal(ValuesFromSubpath, VALUES);
+  });
+
+  test('the `values` subpath resolves under the `require` condition too', () => {
+    // The CJS build is a separate module instance, so compare by value.
+    const cjs = require('@homaiohq/napi-quickfix/values') as typeof import('@homaiohq/napi-quickfix/values');
+    assert.equal(cjs.Side.Buy, '1');
+    assert.deepEqual(Object.keys(cjs.VALUES), Object.keys(VALUES));
+    assert.deepEqual(cjs.ExecType, ExecType);
   });
 
   test('the aggregate `enums` tree exposes the same groups', () => {

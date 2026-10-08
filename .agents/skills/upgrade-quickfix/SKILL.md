@@ -105,9 +105,21 @@ value constant, is a breaking change for consumers (they lose a `FIELD.X` or
 `Side.X` they may be using) — note it for the Phase 6 classification. If
 `gen:values` aborts, a new upstream name defeated the naming rule documented at
 the top of `scripts/gen-values.mjs` (a mixed-case name outside `VERBATIM_GROUPS`
-/ `PASCAL_CASE_EXCEPTIONS`, a key collision after PascalCase conversion, or an
-invalid identifier); extend the rule deliberately rather than hand-editing the
+/ `PASCAL_CASE_EXCEPTIONS`, a key collision after PascalCase conversion, an
+invalid identifier, or a group named like one of the module's own identifiers in
+`RESERVED_GROUPS`); extend the rule deliberately rather than hand-editing the
 generated file.
+
+The new counts (`gen:fields` / `gen:values` print them) are recorded in a few
+places that CI does not check; refresh them so they do not drift:
+
+- `test/enums.test.ts` — the `>= 6107` field-name and `>= 690` / `>= 5781` value
+  floors, plus the `v1.16.0 declares ...` comments. Raise them to the new counts;
+  lower them only when names were removed (breaking, see above).
+- `README.md` — the "every `FIX::FIELD::*` name ... (6000+)" and "(690 groups,
+  5700+ values)" prose in the enums section.
+- `CHANGELOG.md` gets the counts in the new Phase 6 entry, not by editing older
+  entries.
 
 ## Phase 4 — Fix C++ bridge breakage
 

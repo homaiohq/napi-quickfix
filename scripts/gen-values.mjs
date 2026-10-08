@@ -29,76 +29,28 @@
 //      special character, so no further escaping exists; anything that still fails
 //      `[A-Za-z_][A-Za-z0-9_]*`, or two upstream names that normalise to the same
 //      key within a group, aborts the generator rather than silently picking one.
+//   5. Each group becomes a top-level `export const <Group>`, so a group named like
+//      something the generated module itself refers to (`Object`, `VALUES`,
+//      `ValueGroups`, `ValueGroupName`, see RESERVED_GROUPS) aborts the generator:
+//      `export const Object = Object.freeze(...)` would compile and then throw at
+//      import time.
 //
 // Values are always strings — FIX is string-on-the-wire — whatever the C++
 // declaration form: `const char X[] = "ABC"` → `'ABC'`, `const char X = '1'` →
 // `'1'`, `const int X = 2` → `'2'`.
 //
-// Source resolution, in order:
-//   1. `--from <path>`                      an explicit FixValues.h
-//   2. build/_deps/quickfix-src/src/C++/    the sources CMake FetchContent fetched,
-//                                           only if that checkout is at the pinned tag
-//   3. raw.githubusercontent.com            at the GIT_TAG pinned in CMakeLists.txt
-//
-// (2) is guarded because a stale build tree from an older pin would otherwise be
-// stamped with the new tag and pass `--check`.
+// Where the header comes from (`--from`, the FetchContent checkout at the pinned
+// tag, or GitHub) is shared with gen-fields.mjs in scripts/lib/quickfix-header.mjs.
 //
 // Usage:
 //   node scripts/gen-values.mjs            write src/generated/values.ts
 //   node scripts/gen-values.mjs --check    exit 1 if the checked-in file is stale
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+import { ROOT, emit, loadHeader, parseArgs } from './lib/quickfix-header.mjs';
+
 const OUT = join(ROOT, 'src', 'generated', 'values.ts');
-const FETCHED = join(ROOT, 'build', '_deps', 'quickfix-src', 'src', 'C++', 'FixValues.h');
-
-const args = process.argv.slice(2);
-const check = args.includes('--check');
-const fromIdx = args.indexOf('--from');
-const fromPath = fromIdx >= 0 ? args[fromIdx + 1] : undefined;
-
-function pinnedTag() {
-  const cmake = readFileSync(join(ROOT, 'CMakeLists.txt'), 'utf8');
-  const m = /^\s*GIT_TAG\s+(\S+)/m.exec(cmake);
-  if (!m) throw new Error('could not find GIT_TAG in CMakeLists.txt');
-  return m[1];
-}
-
-// Tag of the FetchContent checkout, or undefined if it cannot be determined.
-function checkoutTag(dir) {
-  try {
-    return execFileSync('git', ['-C', dir, 'describe', '--tags', '--exact-match'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-  } catch {
-    return undefined;
-  }
-}
-
-async function loadHeader() {
-  const tag = pinnedTag();
-  if (fromPath) {
-    return { text: readFileSync(resolve(fromPath), 'utf8'), origin: fromPath, tag };
-  }
-  if (existsSync(FETCHED)) {
-    const fetchedTag = checkoutTag(dirname(dirname(dirname(FETCHED))));
-    if (fetchedTag === tag) {
-      return { text: readFileSync(FETCHED, 'utf8'), origin: 'build/_deps/quickfix-src', tag };
-    }
-    console.warn(
-      `build/_deps/quickfix-src is at ${fetchedTag ?? 'an unknown tag'}, not the pinned ${tag}; ` +
-        'fetching the header from GitHub instead (run `yarn clean && yarn build` to refresh)',
-    );
-  }
-  const url = `https://raw.githubusercontent.com/quickfix/quickfix/${tag}/src/C++/FixValues.h`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`fetch ${url} failed: ${res.status} ${res.statusText}`);
-  return { text: await res.text(), origin: url, tag };
-}
+const { check, fromPath } = parseArgs();
 
 // Undo the C escapes that can appear in a char / string literal of the header.
 function unescapeC(literal) {
@@ -141,6 +93,10 @@ function parseDeclarations(text) {
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+// Group names the generated module cannot export without shadowing an identifier
+// it uses itself (rule 5). Keep in sync with render().
+const RESERVED_GROUPS = new Set(['Object', 'VALUES', 'ValueGroups', 'ValueGroupName']);
+
 // Groups whose upstream suffixes are already mixed-case and are kept verbatim (rule 2).
 // Listing them explicitly, rather than voting on the data, keeps the output stable:
 // a future header cannot flip a whole group's keys without a change here.
@@ -177,6 +133,9 @@ function groupValues(decls) {
     }
     const group = name.slice(0, underscore);
     const suffix = name.slice(underscore + 1);
+    if (!IDENTIFIER.test(group) || RESERVED_GROUPS.has(group)) {
+      throw new Error(`cannot export a value group named ${group} (from ${name})`);
+    }
     if (!groups.has(group)) groups.set(group, []);
     groups.get(group).push({ suffix, value });
   }
@@ -271,23 +230,15 @@ function render(groups, tag) {
   return lines.join('\n');
 }
 
-const { text, origin, tag } = await loadHeader();
+const { text, origin, tag } = await loadHeader('FixValues.h', { fromPath });
 const groups = groupValues(parseDeclarations(text));
-const output = render(groups, tag);
 const count = groups.reduce((n, { members }) => n + members.length, 0);
-const summary = `${count} values in ${groups.length} groups`;
-
-if (check) {
-  // Compare with line endings normalised: a Windows checkout with core.autocrlf
-  // hands us CRLF while the generator renders LF.
-  const current = existsSync(OUT) ? readFileSync(OUT, 'utf8').replace(/\r\n/g, '\n') : '';
-  if (current !== output) {
-    console.error(`${OUT} is stale (source: ${origin}); run \`yarn gen:values\``);
-    process.exit(1);
-  }
-  console.log(`${OUT} is up to date (${summary}, QuickFIX ${tag})`);
-} else {
-  mkdirSync(dirname(OUT), { recursive: true });
-  writeFileSync(OUT, output);
-  console.log(`wrote ${OUT}: ${summary} from ${origin} (QuickFIX ${tag})`);
-}
+emit({
+  out: OUT,
+  output: render(groups, tag),
+  check,
+  summary: `${count} values in ${groups.length} groups`,
+  script: 'gen:values',
+  origin,
+  tag,
+});
