@@ -8,7 +8,9 @@
 #include "engine_common.h"
 #include "engine_workers.h"
 #include "errors.h"
+#include "session_id_wrap.h"
 #include "session_settings_wrap.h"
+#include "session_wrap.h"
 
 namespace napi_quickfix {
 
@@ -34,6 +36,8 @@ Napi::Object InitiatorWrap::Init(Napi::Env env, Napi::Object exports) {
           InstanceMethod("start", &InitiatorWrap::Start),
           InstanceMethod("stop", &InitiatorWrap::Stop),
           InstanceMethod("isLoggedOn", &InitiatorWrap::IsLoggedOn),
+          InstanceMethod("getSessions", &InitiatorWrap::GetSessions),
+          InstanceMethod("getSession", &InitiatorWrap::GetSession),
           InstanceMethod("ref", &InitiatorWrap::Ref),
           InstanceMethod("unref", &InitiatorWrap::Unref),
       });
@@ -87,6 +91,7 @@ InitiatorWrap::InitiatorWrap(const Napi::CallbackInfo& info)
 
     initiator_ = std::make_unique<FIX::SocketInitiator>(
         *bridge_, *storeFactory_, settings, *logFactory_);
+    sessionIDs_ = initiator_->getSessions();
   } NQ_CATCH(env)
 
   // Register a cleanup hook so teardown runs deterministically on the MAIN
@@ -199,6 +204,9 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
     // Never started (or already torn down): just release the TSFN and resolve.
     stopped_ = true;
     if (bridge_) bridge_->Release();
+    // Destroy the (never started) engine now so its FIX::Session objects leave
+    // the process-wide registry; see the comment in the started path below.
+    initiator_.reset();
     deferred.Resolve(env.Undefined());
     return deferred.Promise();
   }
@@ -224,20 +232,66 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
             bridge->Release();
           }
         }
+        // stop() has joined the network threads, so nothing else references
+        // the engine. Destroy it NOW (on the JS thread) rather than at GC:
+        // QuickFIX only deletes its FIX::Session objects -- and removes them
+        // from the process-wide registry that lookupSession()/sendToTarget()
+        // read -- in the engine destructor. Deferring that to GC would leave
+        // stale Session handles resolvable and make a new engine with the
+        // same SessionIDs fail with a "Duplicate Session" ConfigError until
+        // the old wrap happened to be collected. A stopped engine cannot be
+        // restarted anyway (start() rejects once stopped_ is set).
+        self->initiator_.reset();
       });
   Napi::Promise promise = worker->Promise();
   worker->Queue();
   return promise;
 }
 
+// isLoggedOn(sessionID?): with no argument, true if ANY session of this engine
+// is logged on (FIX::Initiator/Acceptor::isLoggedOn); with a SessionID, true
+// only if THAT session belongs to this engine and is logged on. Always false
+// before start() and after stop().
 Napi::Value InitiatorWrap::IsLoggedOn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  const bool hasId = info.Length() >= 1 && !info[0].IsUndefined();
+  // Validate the argument even when the engine is down, for a stable API.
+  SessionIDWrap* id =
+      hasId ? SessionIDWrap::UnwrapArg(env, info[0], "sessionID") : nullptr;
   if (!initiator_ || !started_ || stopped_) {
     return Napi::Boolean::New(env, false);
   }
   NQ_TRY(env) {
-    return Napi::Boolean::New(env, initiator_->isLoggedOn());
+    if (id == nullptr) {
+      return Napi::Boolean::New(env, initiator_->isLoggedOn());
+    }
+    FIX::Session* session = initiator_->getSession(id->SessionID());
+    return Napi::Boolean::New(env,
+                              session != nullptr && session->isLoggedOn());
   } NQ_CATCH(env)
+}
+
+// getSessions(): SessionID[] -- the sessions this engine was configured with.
+Napi::Value InitiatorWrap::GetSessions(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Array out = Napi::Array::New(env, sessionIDs_.size());
+  uint32_t i = 0;
+  for (const FIX::SessionID& sid : sessionIDs_) {
+    out.Set(i++, SessionIDWrap::NewInstance(env, sid));
+  }
+  return out;
+}
+
+// getSession(sessionID): Session | undefined -- undefined if the id is not one
+// of this engine's sessions or the engine has been stopped (its sessions are
+// destroyed on stop, see Stop()).
+Napi::Value InitiatorWrap::GetSession(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  SessionIDWrap* id = SessionIDWrap::UnwrapArg(env, info[0], "sessionID");
+  if (!initiator_ || stopped_ || !initiator_->has(id->SessionID())) {
+    return env.Undefined();
+  }
+  return SessionWrap::NewInstance(env, id->SessionID());
 }
 
 Napi::Value InitiatorWrap::Ref(const Napi::CallbackInfo& info) {

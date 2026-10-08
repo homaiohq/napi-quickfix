@@ -6,7 +6,7 @@
  */
 import { native } from './native.js';
 import type { Message } from './message.js';
-import type { SessionID } from './session-id.js';
+import { SessionID } from './session-id.js';
 
 // --- Pure layer -----------------------------------------------------------
 export { Message, createMessage, parseMessage } from './message.js';
@@ -20,6 +20,7 @@ export { Initiator } from './initiator.js';
 export { Acceptor } from './acceptor.js';
 export { Engine } from './engine.js';
 export type { EngineOptions, EngineEvents } from './engine.js';
+export { Session, lookupSession, doesSessionExist, getSessions, numSessions } from './session.js';
 export { FixReject, fixReject } from './application.js';
 export type { ApplicationHandlers, FixRejectKind } from './application.js';
 export type { QuickFixError } from './native.js';
@@ -53,8 +54,30 @@ export type { Enums, EnumGroup, FieldName, ValueGroups, ValueGroupName } from '.
  * await sendToTarget(order, new SessionID('FIX.4.4', 'CLIENT', 'BROKER'));
  * ```
  */
-export function sendToTarget(message: Message, sessionID: SessionID): Promise<boolean> {
-  return native.sendToTarget(message.nativeHandle, sessionID.nativeHandle);
+export function sendToTarget(message: Message, sessionID: SessionID): Promise<boolean>;
+/**
+ * Send a message to the session identified by the message's **own header**
+ * (`BeginString`, `SenderCompID`, `TargetCompID`) plus an optional session
+ * qualifier.
+ *
+ * Wraps the `FIX::Session::sendToTarget(message, qualifier)` overload. Same
+ * threading and error behaviour as the SessionID form; a message whose header
+ * does not identify an existing session rejects with
+ * `fixErrorName: 'SessionNotFound'`.
+ *
+ * @param message The message to send; its header must carry tags 8, 49 and 56.
+ * @param qualifier Optional session qualifier (`SessionQualifier` in the settings).
+ */
+export function sendToTarget(message: Message, qualifier?: string): Promise<boolean>;
+export function sendToTarget(
+  message: Message,
+  sessionIDOrQualifier?: SessionID | string,
+): Promise<boolean> {
+  const target =
+    sessionIDOrQualifier instanceof SessionID
+      ? sessionIDOrQualifier.nativeHandle
+      : sessionIDOrQualifier;
+  return native.sendToTarget(message.nativeHandle, target);
 }
 
 /** The QuickFIX engine / addon version string. */

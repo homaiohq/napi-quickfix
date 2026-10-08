@@ -14,6 +14,7 @@ import {
 } from './native.js';
 import { Message } from './message.js';
 import { SessionID } from './session-id.js';
+import { Session } from './session.js';
 import type { ApplicationHandlers } from './application.js';
 import type { SessionSettings } from './session-settings.js';
 
@@ -162,9 +163,45 @@ export abstract class Engine extends EventEmitter {
     return this.#native.stop(force);
   }
 
-  /** Whether any session is currently logged on. */
-  isLoggedOn(): boolean {
-    return this.#native.isLoggedOn();
+  /**
+   * Whether a session is logged on.
+   *
+   * With no argument: `true` if **any** of this engine's sessions is logged on.
+   * With a {@link SessionID}: `true` only if that session belongs to this engine
+   * and is logged on (`false`, not an error, for a foreign id). Always `false`
+   * before {@link Engine.start} and after {@link Engine.stop}.
+   */
+  isLoggedOn(sessionID?: SessionID): boolean {
+    return this.#native.isLoggedOn(sessionID?.nativeHandle);
+  }
+
+  /**
+   * The ids of the sessions this engine was configured with (every `[SESSION]`
+   * in its settings). Stable for the engine's lifetime, including after
+   * {@link Engine.stop}.
+   */
+  getSessions(): SessionID[] {
+    return this.#native.getSessions().map((h) => SessionID.fromNative(h));
+  }
+
+  /**
+   * A handle on one of this engine's sessions.
+   *
+   * @returns The {@link Session}, or `undefined` if `sessionID` is not one of
+   *   this engine's sessions or the engine has been stopped (stopping destroys
+   *   its sessions).
+   *
+   * @example
+   * ```ts
+   * initiator.on('logon', (id) => {
+   *   const session = initiator.getSession(id)!;
+   *   console.log('next seq', session.getExpectedSenderNum());
+   * });
+   * ```
+   */
+  getSession(sessionID: SessionID): Session | undefined {
+    const handle = this.#native.getSession(sessionID.nativeHandle);
+    return handle ? Session.fromNative(handle) : undefined;
   }
 
   /**

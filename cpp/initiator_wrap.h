@@ -4,9 +4,11 @@
 #include <napi.h>
 
 #include <memory>
+#include <set>
 
 #include "quickfix/Log.h"
 #include "quickfix/MessageStore.h"
+#include "quickfix/SessionID.h"
 #include "quickfix/SocketInitiator.h"
 
 #include "application_bridge.h"
@@ -19,7 +21,8 @@ namespace napi_quickfix {
 //     store: 'file' | 'memory'         (default 'file')
 //     log:   'screen' | 'file' | 'none' (default 'screen')
 //
-// Methods: start / stop(force?) / isLoggedOn / ref / unref.
+// Methods: start / stop(force?) / isLoggedOn(sessionID?) / getSessions /
+// getSession(sessionID) / ref / unref.
 class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap> {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -32,6 +35,8 @@ class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap> {
   Napi::Value Start(const Napi::CallbackInfo& info);
   Napi::Value Stop(const Napi::CallbackInfo& info);
   Napi::Value IsLoggedOn(const Napi::CallbackInfo& info);
+  Napi::Value GetSessions(const Napi::CallbackInfo& info);
+  Napi::Value GetSession(const Napi::CallbackInfo& info);
   Napi::Value Ref(const Napi::CallbackInfo& info);
   Napi::Value Unref(const Napi::CallbackInfo& info);
 
@@ -44,6 +49,10 @@ class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap> {
   std::unique_ptr<FIX::MessageStoreFactory> storeFactory_;
   std::unique_ptr<FIX::LogFactory> logFactory_;
   std::unique_ptr<FIX::SocketInitiator> initiator_;
+
+  // The SessionIDs this engine was configured with, copied at construction so
+  // getSessions() still answers after stop() has destroyed the engine.
+  std::set<FIX::SessionID> sessionIDs_;
 
   bool started_ = false;
   bool stopped_ = false;

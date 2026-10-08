@@ -8,7 +8,9 @@
 #include "engine_common.h"
 #include "engine_workers.h"
 #include "errors.h"
+#include "session_id_wrap.h"
 #include "session_settings_wrap.h"
+#include "session_wrap.h"
 
 namespace napi_quickfix {
 
@@ -34,6 +36,8 @@ Napi::Object AcceptorWrap::Init(Napi::Env env, Napi::Object exports) {
           InstanceMethod("start", &AcceptorWrap::Start),
           InstanceMethod("stop", &AcceptorWrap::Stop),
           InstanceMethod("isLoggedOn", &AcceptorWrap::IsLoggedOn),
+          InstanceMethod("getSessions", &AcceptorWrap::GetSessions),
+          InstanceMethod("getSession", &AcceptorWrap::GetSession),
           InstanceMethod("ref", &AcceptorWrap::Ref),
           InstanceMethod("unref", &AcceptorWrap::Unref),
       });
@@ -86,6 +90,7 @@ AcceptorWrap::AcceptorWrap(const Napi::CallbackInfo& info)
 
     acceptor_ = std::make_unique<FIX::SocketAcceptor>(
         *bridge_, *storeFactory_, settings, *logFactory_);
+    sessionIDs_ = acceptor_->getSessions();
   } NQ_CATCH(env)
 
   // Deterministic teardown on env shutdown, before the TSFN is finalized. See
@@ -182,6 +187,9 @@ Napi::Value AcceptorWrap::Stop(const Napi::CallbackInfo& info) {
   if (!acceptor_ || !started_) {
     stopped_ = true;
     if (bridge_) bridge_->Release();
+    // Destroy the (never started) engine now so its FIX::Session objects leave
+    // the process-wide registry; see the comment in the started path below.
+    acceptor_.reset();
     deferred.Resolve(env.Undefined());
     return deferred.Promise();
   }
@@ -203,20 +211,66 @@ Napi::Value AcceptorWrap::Stop(const Napi::CallbackInfo& info) {
             bridge->Release();
           }
         }
+        // stop() has joined the network threads, so nothing else references
+        // the engine. Destroy it NOW (on the JS thread) rather than at GC:
+        // QuickFIX only deletes its FIX::Session objects -- and removes them
+        // from the process-wide registry that lookupSession()/sendToTarget()
+        // read -- in the engine destructor. Deferring that to GC would leave
+        // stale Session handles resolvable and make a new engine with the
+        // same SessionIDs fail with a "Duplicate Session" ConfigError until
+        // the old wrap happened to be collected. A stopped engine cannot be
+        // restarted anyway (start() rejects once stopped_ is set).
+        self->acceptor_.reset();
       });
   Napi::Promise promise = worker->Promise();
   worker->Queue();
   return promise;
 }
 
+// isLoggedOn(sessionID?): with no argument, true if ANY session of this engine
+// is logged on (FIX::Initiator/Acceptor::isLoggedOn); with a SessionID, true
+// only if THAT session belongs to this engine and is logged on. Always false
+// before start() and after stop().
 Napi::Value AcceptorWrap::IsLoggedOn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  const bool hasId = info.Length() >= 1 && !info[0].IsUndefined();
+  // Validate the argument even when the engine is down, for a stable API.
+  SessionIDWrap* id =
+      hasId ? SessionIDWrap::UnwrapArg(env, info[0], "sessionID") : nullptr;
   if (!acceptor_ || !started_ || stopped_) {
     return Napi::Boolean::New(env, false);
   }
   NQ_TRY(env) {
-    return Napi::Boolean::New(env, acceptor_->isLoggedOn());
+    if (id == nullptr) {
+      return Napi::Boolean::New(env, acceptor_->isLoggedOn());
+    }
+    FIX::Session* session = acceptor_->getSession(id->SessionID());
+    return Napi::Boolean::New(env,
+                              session != nullptr && session->isLoggedOn());
   } NQ_CATCH(env)
+}
+
+// getSessions(): SessionID[] -- the sessions this engine was configured with.
+Napi::Value AcceptorWrap::GetSessions(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Array out = Napi::Array::New(env, sessionIDs_.size());
+  uint32_t i = 0;
+  for (const FIX::SessionID& sid : sessionIDs_) {
+    out.Set(i++, SessionIDWrap::NewInstance(env, sid));
+  }
+  return out;
+}
+
+// getSession(sessionID): Session | undefined -- undefined if the id is not one
+// of this engine's sessions or the engine has been stopped (its sessions are
+// destroyed on stop, see Stop()).
+Napi::Value AcceptorWrap::GetSession(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  SessionIDWrap* id = SessionIDWrap::UnwrapArg(env, info[0], "sessionID");
+  if (!acceptor_ || stopped_ || !acceptor_->has(id->SessionID())) {
+    return env.Undefined();
+  }
+  return SessionWrap::NewInstance(env, id->SessionID());
 }
 
 Napi::Value AcceptorWrap::Ref(const Napi::CallbackInfo& info) {

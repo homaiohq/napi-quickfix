@@ -4,9 +4,11 @@
 #include <napi.h>
 
 #include <memory>
+#include <set>
 
 #include "quickfix/Log.h"
 #include "quickfix/MessageStore.h"
+#include "quickfix/SessionID.h"
 #include "quickfix/SocketAcceptor.h"
 
 #include "application_bridge.h"
@@ -28,6 +30,8 @@ class AcceptorWrap : public Napi::ObjectWrap<AcceptorWrap> {
   Napi::Value Start(const Napi::CallbackInfo& info);
   Napi::Value Stop(const Napi::CallbackInfo& info);
   Napi::Value IsLoggedOn(const Napi::CallbackInfo& info);
+  Napi::Value GetSessions(const Napi::CallbackInfo& info);
+  Napi::Value GetSession(const Napi::CallbackInfo& info);
   Napi::Value Ref(const Napi::CallbackInfo& info);
   Napi::Value Unref(const Napi::CallbackInfo& info);
 
@@ -38,6 +42,10 @@ class AcceptorWrap : public Napi::ObjectWrap<AcceptorWrap> {
   std::unique_ptr<FIX::MessageStoreFactory> storeFactory_;
   std::unique_ptr<FIX::LogFactory> logFactory_;
   std::unique_ptr<FIX::SocketAcceptor> acceptor_;
+
+  // The SessionIDs this engine was configured with, copied at construction so
+  // getSessions() still answers after stop() has destroyed the engine.
+  std::set<FIX::SessionID> sessionIDs_;
 
   bool started_ = false;
   bool stopped_ = false;

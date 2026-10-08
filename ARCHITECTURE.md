@@ -22,16 +22,16 @@ graph TD
     APP["Your application"]
     IDX["index.ts — public barrel"]
     MSG["Message · SessionID<br/>SessionSettings · DataDictionary"]
-    ENG["Engine (EventEmitter)<br/>Initiator · Acceptor"]
+    ENG["Engine (EventEmitter)<br/>Initiator · Acceptor · Session"]
     NAT["native.ts — typed NativeModule"]
     LOAD["load-native.cjs<br/>(node-gyp-build loader)"]
   end
 
   subgraph ADDON["C++ Node-API addon  (cpp/ → napi_quickfix.node)"]
     REG["addon.cpp — module init"]
-    WRAPS["ObjectWrap classes<br/>MessageWrap · SessionIDWrap<br/>SessionSettingsWrap · DataDictionaryWrap<br/>InitiatorWrap · AcceptorWrap"]
+    WRAPS["ObjectWrap classes<br/>MessageWrap · SessionIDWrap<br/>SessionSettingsWrap · DataDictionaryWrap<br/>InitiatorWrap · AcceptorWrap · SessionWrap"]
     BRIDGE["ApplicationBridge<br/>(FIX::Application + TSFN)"]
-    WORKERS["engine_workers.h<br/>AsyncWorkers (start/stop/send)"]
+    WORKERS["engine_workers.h<br/>AsyncWorkers (start/stop/send/session ops)"]
     ERR["errors.h — FIX::Exception → QuickFixError"]
   end
 
@@ -168,9 +168,34 @@ flowchart TD
   RES --> CALL
 ```
 
-Synchronous, non-blocking members stay sync: `isLoggedOn()`, `ref()`, `unref()`, and the entire pure layer
-(`Message`, `SessionID`, `SessionSettings`, `DataDictionary`). On GC/process exit, a cleanup hook deactivates the
-bridge and force-stops the engine **before** the TSFN is torn down, so a live session never crashes on shutdown.
+Synchronous, non-blocking members stay sync: `isLoggedOn()`, `getSessions()`, `getSession()`, `ref()`, `unref()`,
+and the entire pure layer (`Message`, `SessionID`, `SessionSettings`, `DataDictionary`). On GC/process exit, a
+cleanup hook deactivates the bridge and force-stops the engine **before** the TSFN is torn down, so a live session
+never crashes on shutdown.
+
+### `Session`: which members are async, and why
+
+`SessionWrap` is a handle on an engine-owned `FIX::Session`. The rule for its sync/async split is the lock, not the
+I/O: **QuickFIX holds `Session::m_mutex` while it runs application callbacks** (`sendRaw` holds it across
+`toAdmin`/`toApp`; `disconnect` holds it across `onLogout`). A QuickFIX thread blocked in one of those callbacks is
+waiting on the JS event loop via a `BlockingCall`, so any main-thread call that takes `m_mutex` would wait on a
+thread that is waiting on the main thread — deadlock.
+
+| Members | Thread | Why |
+| --- | --- | --- |
+| `isLoggedOn` · `isEnabled` · `sentLogon` · `sentLogout` · `receivedLogon` · `isInitiator` · `isAcceptor` · `isSessionTime` · `isLogonTime` · option getters/setters | sync, main | Read/write plain members of `FIX::Session`; no lock, no callback. |
+| `getExpectedSenderNum` · `getExpectedTargetNum` · `setNextSenderMsgSeqNum` · `setNextTargetMsgSeqNum` | sync, main | Touch the `MessageStore` under `SessionState`'s own mutex, which QuickFIX never holds across a callback. May throw `IOException` (mapped to `QuickFixError`). |
+| `reset` · `disconnect` | **async, `SessionOpWorker`** | Take `m_mutex` **and** fire `toAdmin` (`reset` sends a Logout) / `onLogout` through the TSFN — the deadlock case above. |
+| `logon` · `logout` · `refresh` | **async, `SessionOpWorker`** | Don't take `m_mutex` today, but they are state transitions whose effect is only observable through `'logon'`/`'logout'` events; they share the async shape so the control surface is uniform and robust to upstream locking changes. |
+
+**Lifetime.** `FIX::Session` objects are owned by the engine and `FIX::Session::lookupSession` returns a raw,
+non-owning pointer, so `SessionWrap` never caches it: it stores the `FIX::SessionID` by value and re-resolves on
+**every** call (on the worker thread for async ops), throwing/rejecting `QuickFixError{fixErrorName:
+'SessionNotFound'}` when the session is gone. QuickFIX only deletes sessions — and removes them from the registry
+`lookupSession` reads — in the engine destructor, so `InitiatorWrap`/`AcceptorWrap` destroy their engine as soon
+as `stop()` settles (all network threads are joined by then) rather than waiting for GC. That is what makes a stale
+`Session` handle fail deterministically after `stop()`, and lets a new engine reuse the same `SessionID`s
+immediately instead of hitting a "Duplicate Session" `ConfigError`.
 
 ---
 
@@ -233,9 +258,10 @@ musl entries and link musl objects into a glibc addon.
 | Public TS API | `src/index.ts`, `message.ts`, `session-id.ts`, `session-settings.ts`, `data-dictionary.ts`, `enums.ts` |
 | Generated FIX constants | `scripts/gen-fields.mjs` → `src/generated/fields.ts` (`FIELD`), `scripts/gen-values.mjs` → `src/generated/values.ts` (value groups, `VALUES`) — both from the QuickFIX headers at the pinned tag |
 | Engine + handlers | `src/engine.ts`, `initiator.ts`, `acceptor.ts`, `application.ts` |
+| Per-session control | `src/session.ts` (`Session`, `lookupSession`, `doesSessionExist`, `getSessions`, `numSessions`), `cpp/session_wrap.{h,cpp}` |
 | Native loader | `src/native.ts`, `src/load-native.cjs` |
-| Addon entry / wraps | `cpp/addon.cpp`, `cpp/*_wrap.{h,cpp}`, `cpp/session_static.cpp` |
-| Bridge / async / errors | `cpp/application_bridge.{h,cpp}`, `cpp/engine_workers.h`, `cpp/errors.h` |
+| Addon entry / wraps | `cpp/addon.cpp`, `cpp/*_wrap.{h,cpp}`, `cpp/session_static.cpp` (`sendToTarget` + session lookups) |
+| Bridge / async / errors | `cpp/application_bridge.{h,cpp}`, `cpp/engine_workers.h` (`EngineOpWorker`, `SessionOpWorker`), `cpp/errors.h` |
 | Build / dist | `CMakeLists.txt`, `scripts/prebuild.mjs`, `tsconfig.*.json`, `package.json` |
-| Tests | `test/*.test.ts` |
+| Tests | `test/*.test.ts`, `test/helpers.ts` (loopback harness) |
 | CI | `.github/workflows/ci.yml`, `.github/workflows/release.yml` |

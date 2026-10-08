@@ -24,6 +24,28 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   value group next to `FIELD`.
 - `yarn gen:values` / `yarn gen:values:check` regenerate and verify the table, like
   `gen:fields`.
+- `Session`: a handle on a live `FIX::Session`, obtained from `engine.getSession(id)` or
+  the module-level `lookupSession(id)`. Sync state getters (`isLoggedOn`, `isEnabled`,
+  `sentLogon`, `sentLogout`, `receivedLogon`, `isInitiator`, `isAcceptor`,
+  `isSessionTime(now?)`, `isLogonTime(now?)`), sequence-number access
+  (`getExpectedSenderNum`, `getExpectedTargetNum`, `setNextSenderMsgSeqNum`,
+  `setNextTargetMsgSeqNum`), getters/setters for the runtime options (`ResetOnLogon`,
+  `ResetOnLogout`, `ResetOnDisconnect`, `RefreshOnLogon`, `CheckCompId`, `CheckLatency`,
+  `MaxLatency`, `LogonTimeout`, `LogoutTimeout`, `PersistMessages`,
+  `SendRedundantResendRequests`, `ValidateLengthAndChecksum`, `SendNextExpectedMsgSeqNum`,
+  `IsNonStopSession`, `TimestampPrecision`), and async control (`logon()`,
+  `logout(reason?)`, `disconnect()`, `reset()`, `refresh()`), which run off the main
+  thread because `reset`/`disconnect` fire application callbacks. The handle re-resolves
+  the session on every call and throws/rejects `QuickFixError{fixErrorName:
+  'SessionNotFound'}` once the owning engine has been stopped.
+- Module functions `lookupSession(id)`, `doesSessionExist(id)`, `getSessions()` and
+  `numSessions()` over every session in the process.
+- `Initiator`/`Acceptor`: `getSessions()` (the configured `[SESSION]`s),
+  `getSession(id)`, and `isLoggedOn(sessionID?)` — the no-argument form keeps its
+  engine-wide meaning.
+- `sendToTarget(message, qualifier?)` overload that resolves the session from the
+  message's own header (`BeginString`/`SenderCompID`/`TargetCompID`), alongside the
+  existing `sendToTarget(message, sessionID)`.
 
 ### Changed
 
@@ -43,6 +65,12 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   public surface is a superset of what it provided.
 - `dist/` no longer ships `.js.map` / `.d.ts.map` files. `src/` is not published, so they
   could never resolve, and they roughly doubled the footprint of the generated tables.
+- An engine now destroys its QuickFIX engine (and therefore its sessions) as soon as
+  `stop()` settles, instead of when the JS object is garbage-collected. A stopped engine
+  could not be restarted before either; the visible differences are that `Session`
+  handles fail deterministically with `SessionNotFound` after `stop()`, and that a new
+  `Initiator`/`Acceptor` configured with the same `SessionID`s can be created right after
+  stopping the old one (previously a `ConfigError` "Duplicate Session" until GC ran).
 
 ## [0.1.0] - 2026-10-08
 
