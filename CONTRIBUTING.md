@@ -29,7 +29,14 @@ Useful scripts:
 
 - `yarn build:native` — build only the native addon (`cmake-js`).
 - `yarn build:ts` — build only the TypeScript (ESM + CJS).
+- `yarn typecheck` — type-check the test suite (`yarn test` runs through tsx, which does
+  not check types). Needs `dist/` from `yarn build:ts`.
 - `yarn clean` — remove `dist/` and `build/`.
+- `yarn gen:fields` — regenerate `src/generated/fields.ts` (the typed `FIELD` table)
+  from QuickFIX's `FixFieldNumbers.h`. It reads the sources CMake fetched under
+  `build/_deps/` when that checkout is at the pinned tag, otherwise GitHub at the pinned
+  tag, so run it after moving the QuickFIX pin. `yarn gen:fields:check` fails if the
+  checked-in file is stale.
 - `yarn prebuild` — produce prebuilt binaries for the current platform. On Linux the
   binary is libc-tagged (`node.napi.glibc.node` / `node.napi.musl.node`); detection is
   automatic and the script *fails* rather than guessing. Override with `PREBUILD_LIBC`.

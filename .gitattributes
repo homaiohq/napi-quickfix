@@ -1,0 +1,3 @@
+# The generated FIELD table is byte-compared against the generator output in CI;
+# keep it LF on every platform so a Windows checkout does not read as stale.
+src/generated/fields.ts text eol=lf

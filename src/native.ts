@@ -171,7 +171,8 @@ export interface NativeEngineConstructor {
 
 /**
  * The nested FIX-constants object exported by the addon, e.g.
- * `enums.FIELD.MsgType`, `enums.MsgType.Logon`, `enums.Side.Buy`.
+ * `enums.MsgType.Logon`, `enums.Side.Buy`. Field tags (`FIELD`) are not exported
+ * by the addon; they are generated on the TS side (`src/generated/fields.ts`).
  */
 export type NativeEnums = Readonly<Record<string, Readonly<Record<string, number | string>>>>;
 
