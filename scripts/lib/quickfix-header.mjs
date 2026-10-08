@@ -19,20 +19,29 @@ import { fileURLToPath } from 'node:url';
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const FETCHED_DIR = join(ROOT, 'build', '_deps', 'quickfix-src');
 
-// `{ check, fromPath }` from a generator's argv.
+// `{ check, fromPath }` from a generator's argv. Accepts `--check`, `--from <path>`
+// and `--from=<path>`; anything else is an error rather than a silent no-op, so a
+// misspelt `--chekc` cannot overwrite the file it was meant to verify.
 export function parseArgs(argv = process.argv.slice(2)) {
-  const fromIdx = argv.indexOf('--from');
+  let check = false;
   let fromPath;
-  if (fromIdx >= 0) {
-    fromPath = argv[fromIdx + 1];
-    // A `--from` without its path (missing, empty — e.g. an unset shell variable — or
-    // another flag) must not quietly fall through to the FetchContent checkout or
-    // GitHub: the operator meant to pin the header to a local copy.
-    if (!fromPath || fromPath.startsWith('--')) {
-      throw new Error('--from requires a path argument');
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--check') {
+      check = true;
+    } else if (arg === '--from' || arg.startsWith('--from=')) {
+      fromPath = arg === '--from' ? argv[++i] : arg.slice('--from='.length);
+      // A `--from` without its path (missing, empty — e.g. an unset shell variable — or
+      // another flag) must not quietly fall through to the FetchContent checkout or
+      // GitHub: the operator meant to pin the header to a local copy.
+      if (!fromPath || fromPath.startsWith('--')) {
+        throw new Error('--from requires a path argument');
+      }
+    } else {
+      throw new Error(`unknown argument ${arg}; expected --check and/or --from <path>`);
     }
   }
-  return { check: argv.includes('--check'), fromPath };
+  return { check, fromPath };
 }
 
 export function pinnedTag() {
@@ -55,31 +64,49 @@ function gitOutput(dir, args) {
   }
 }
 
-// Tag of a git checkout, or undefined if it cannot be determined.
-function checkoutTag(dir) {
-  return gitOutput(dir, ['describe', '--tags', '--exact-match']);
+// Whether the checkout at `dir` has `tag` checked out, by comparing commits: unlike
+// `describe --exact-match`, a HEAD past the tag (e.g. master) is a plain `false`
+// rather than "no tag", and a commit carrying several tags cannot be misreported.
+// Undefined when `dir` is not a checkout or does not know `tag`.
+function checkoutIsAt(dir, tag) {
+  const head = gitOutput(dir, ['rev-parse', '--verify', 'HEAD^{commit}']);
+  const pinned = gitOutput(dir, ['rev-parse', '--verify', `refs/tags/${tag}^{commit}`]);
+  if (head === undefined || pinned === undefined) return undefined;
+  return head === pinned;
+}
+
+// Human-readable position of a checkout for messages: nearest tag, or the commit.
+function describeCheckout(dir) {
+  return gitOutput(dir, ['describe', '--tags', '--always']) ?? 'an unknown commit';
 }
 
 // The generated banner is stamped with the pinned tag, so a `--from` header must hold
-// that version. When the file sits inside a QuickFIX git checkout, compare the
-// checkout's tag with the pin and abort on a mismatch; otherwise there is nothing to
+// that version. When the file sits inside a QuickFIX git checkout, require that
+// checkout to be at the pinned tag and abort otherwise; a loose copy has nothing to
 // compare against, so say so instead of letting the banner claim a version nobody
 // verified.
 function verifyFromTag(file, headerName, tag) {
   const top = gitOutput(dirname(file), ['rev-parse', '--show-toplevel']);
   const isQuickfix = top !== undefined && existsSync(join(top, 'src', 'C++', headerName));
-  const fromTag = isQuickfix ? checkoutTag(top) : undefined;
-  if (fromTag === undefined) {
+  if (!isQuickfix) {
     console.warn(
       `--from: cannot tell which QuickFIX version ${file} belongs to; ` +
         `the generated file will claim the pinned ${tag}`,
     );
     return;
   }
-  if (fromTag !== tag) {
+  const atTag = checkoutIsAt(top, tag);
+  if (atTag === undefined) {
     throw new Error(
-      `--from: ${file} is from QuickFIX ${fromTag} but CMakeLists.txt pins ${tag}; ` +
-        'move GIT_TAG first so the generated file is stamped with the version it holds',
+      `--from: ${top} does not know the pinned tag ${tag}, so ${file} cannot be ` +
+        `verified against it (run \`git -C ${top} fetch --tags\`)`,
+    );
+  }
+  if (!atTag) {
+    throw new Error(
+      `--from: ${file} is from QuickFIX ${describeCheckout(top)} but CMakeLists.txt ` +
+        `pins ${tag}; check out ${tag} there, or move GIT_TAG first so the generated ` +
+        'file is stamped with the version it holds',
     );
   }
 }
@@ -94,12 +121,11 @@ export async function loadHeader(headerName, { fromPath } = {}) {
   }
   const fetched = join(FETCHED_DIR, 'src', 'C++', headerName);
   if (existsSync(fetched)) {
-    const fetchedTag = checkoutTag(FETCHED_DIR);
-    if (fetchedTag === tag) {
+    if (checkoutIsAt(FETCHED_DIR, tag) === true) {
       return { text: readFileSync(fetched, 'utf8'), origin: 'build/_deps/quickfix-src', tag };
     }
     console.warn(
-      `build/_deps/quickfix-src is at ${fetchedTag ?? 'an unknown tag'}, not the pinned ${tag}; ` +
+      `build/_deps/quickfix-src is at ${describeCheckout(FETCHED_DIR)}, not the pinned ${tag}; ` +
         'fetching the header from GitHub instead (run `yarn clean && yarn build` to refresh)',
     );
   }

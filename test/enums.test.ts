@@ -1,6 +1,10 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   FIELD,
@@ -29,6 +33,9 @@ import {
 } from '@homaiohq/napi-quickfix/values';
 
 const require = createRequire(import.meta.url);
+// Package self-reference (`@homaiohq/napi-quickfix/...`) resolves from inside the
+// package, so child processes run from its root.
+const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 describe('enums', () => {
   test('FIELD maps names to tag numbers', () => {
@@ -184,9 +191,40 @@ describe('enums', () => {
     assert.equal(Side[valueName], '1');
   });
 
-  test('the `values` subpath exposes the same objects without the native addon', () => {
+  test('the `values` subpath exposes the same objects', () => {
     assert.equal(SideFromValues, Side);
     assert.equal(ValuesFromSubpath, VALUES);
+  });
+
+  test('the `values` subpath does not load the native addon', () => {
+    // This file already imported the main entry (and so the addon) above, so the
+    // check has to happen in a fresh process: import only the subpath and assert the
+    // native loader never entered the module cache. Both builds, since the CJS one
+    // is what `require` consumers get.
+    for (const [label, load] of [
+      ['import', "await import('@homaiohq/napi-quickfix/values')"],
+      ['require', "createRequire(import.meta.url)('@homaiohq/napi-quickfix/values')"],
+    ]) {
+      const script = [
+        "import { createRequire } from 'node:module';",
+        `${load};`,
+        'const loaded = Object.keys(createRequire(import.meta.url).cache);',
+        "console.log(JSON.stringify(loaded.filter((f) => /load-native|\\.node$/.test(f))));",
+      ].join('\n');
+      const { status, stdout, stderr } = spawnSync(
+        process.execPath,
+        ['--input-type=module', '-e', script],
+        { cwd: packageRoot, encoding: 'utf8' },
+      );
+      assert.equal(status, 0, `${label}: ${stderr}`);
+      assert.deepEqual(JSON.parse(stdout), [], `${label}: native loader was loaded`);
+    }
+    // And the built modules carry no import at all, so a bundler cannot pull it in
+    // either.
+    for (const built of ['dist/esm/generated/values.js', 'dist/cjs/generated/values.js']) {
+      const js = readFileSync(join(packageRoot, built), 'utf8');
+      assert.doesNotMatch(js, /^\s*(import\b|export\s.*\sfrom\s)|\brequire\(/m, built);
+    }
   });
 
   test('the `values` subpath resolves under the `require` condition too', () => {
