@@ -28,8 +28,8 @@ included.
 - **Ergonomic, safe API** — chainable message building with automatic
   header/trailer field routing, repeating groups (`Group`), typed rejections,
   and C++ exceptions surfaced as JavaScript `Error`s.
-- **Your field order, on the wire** — body and group fields are sent in the
-  order you set them; the library never sorts them numerically.
+- **Explicit field order** — pass an `order` to a `Message` or `Group` to
+  control the wire sequence, exactly like QuickFIX's own ordered constructors.
 
 ## Install
 
@@ -208,8 +208,8 @@ come from `@homaiohq/napi-quickfix`.
 ### Message
 
 ```ts
-new Message(raw?: string, opts?: { validate?: boolean; dictionary?: DataDictionary });
-Message.parse(raw: string, opts?: { validate?: boolean; dictionary?: DataDictionary }): Message;
+new Message(raw?: string, opts?: { validate?: boolean; dictionary?: DataDictionary; order?: number[] });
+Message.parse(raw: string, opts?: { validate?: boolean; dictionary?: DataDictionary; order?: number[] }): Message;
 
 message.setField(tag: number, value: string | number): this; // chainable, auto-routes header/trailer fields
 message.getField(tag: number): string;
@@ -224,8 +224,8 @@ message.toString(): string;   // raw SOH-delimited wire string
 message.toPretty(): string;   // human-readable
 message.toJSON(): { msgType?: string; raw: string };
 
-createMessage(fields?: Record<number, string | number>): Message;
-parseMessage(raw: string, opts?: { validate?: boolean; dictionary?: DataDictionary }): Message;
+createMessage(fields?: Record<number, string | number>, opts?: { order?: number[] }): Message;
+parseMessage(raw: string, opts?: { validate?: boolean; dictionary?: DataDictionary; order?: number[] }): Message;
 ```
 
 Field values are accepted as `string | number` (numbers are stringified) and
@@ -234,23 +234,26 @@ always returned as `string`. Header/trailer fields such as `MsgType`,
 section by `setField`, so you rarely need `setHeaderField`/`setTrailerField`
 directly.
 
-**Field order.** Body fields are written in the order you first set them, and
-setting a tag again overwrites it in place. Nothing is sorted numerically, so
-a counterparty that needs one tag before another gets exactly the sequence you
-built. The header keeps the layout FIX requires (`8`, `9`, `35` first) and the
-trailer ends with `10`. Two cases keep QuickFIX's own order instead:
+**Field order** follows QuickFIX. Body fields sort numerically by tag unless
+you build the message with an explicit `order`, the equivalent of
+`FIX::Message(headerOrder, trailerOrder, order)`: the listed tags are written
+in that sequence and any other tag follows them in numeric order. The header
+keeps the layout FIX requires (`8`, `9`, `35` first) and the trailer ends with
+`10`. A resend is rebuilt by the engine from the message store, so PossDup
+copies go out in numeric (or dictionary) order regardless.
 
-- Messages that come out of a parse (`Message.parse`, inbound engine
-  callbacks) carry the numeric parse order, with groups in the dictionary's
-  field order; a field you set on one afterwards is appended after the
-  existing fields.
-- **Resends.** On a ResendRequest the engine rebuilds the stored messages from
-  the message store, so PossDup copies go out in numeric (or dictionary) order
-  rather than the order the original was built in.
+```ts
+const msg = createMessage(
+  { [FIELD.Symbol]: 'AAPL', [FIELD.OrderQty]: 100, [FIELD.ClOrdID]: 'ord-1' },
+  { order: [FIELD.Symbol, FIELD.OrderQty, FIELD.ClOrdID] },
+);
+// ...|35=D|55=AAPL|38=100|11=ord-1|10=...|
+```
 
-Tags passed to `setField` must be integers in `1..100000` (a `TypeError`
-otherwise); reads accept any integer and report an absent tag as
-`FieldNotFound`.
+Tags passed to `setField` must be positive integers (a `TypeError` otherwise);
+reads accept any integer and report an absent tag as `FieldNotFound`. Tags in
+an `order` must lie in `1..100000`, since QuickFIX indexes an array by tag for
+ordered maps.
 
 Pass a `dictionary` when parsing a raw string that contains repeating groups:
 QuickFIX only recognises groups it can look up, and without one every repeated
@@ -272,11 +275,12 @@ group.toString(): string;  group.toPretty(): string;  // this instance's fields,
 A repeating group is a count field (`NoXxx`) followed by that many instances,
 each opened by the same delimiter tag. Build a `Group`, set its fields, and
 `addGroup` it to a message, or to a parent group for nesting. `addGroup`
-**copies** the instance, so one object can be reused for several instances,
-and throws if the delimiter field is not set. Fields go on the wire in the
-order you set them, with two exceptions FIX itself imposes: the delimiter
-always comes first, and tags listed in `order` keep that sequence no matter
-when they are set. Header groups such as `NoHops` are routed to the header.
+**copies** the instance, so one object can be reused for several instances.
+Field order is QuickFIX's: without `order` (`FIX::Group(field, delim)`) the
+delimiter comes first and the rest sort numerically; with `order`
+(`FIX::Group(field, delim, order[])`) the listed tags are written in that
+sequence, which must start with the delimiter, and any other tag follows them
+numerically. Header groups such as `NoHops` are routed to the header.
 
 ```ts
 import { Group, createMessage, FIELD, MsgType } from '@homaiohq/napi-quickfix';
@@ -286,14 +290,14 @@ const order = createMessage()
   .setField(FIELD.ClOrdID, 'ord-1')
   .setField(FIELD.Symbol, 'AAPL');
 
-const party = new Group(FIELD.NoPartyIDs, FIELD.PartyID);
-party.setField(FIELD.PartyID, 'TRADER-1').setField(FIELD.PartyRole, 11);
+const party = new Group(FIELD.NoPartyIDs, FIELD.PartyID, [FIELD.PartyID, FIELD.PartyRole, FIELD.PartyIDSource]);
+party.setField(FIELD.PartyID, 'TRADER-1').setField(FIELD.PartyIDSource, 'D').setField(FIELD.PartyRole, 11);
 order.addGroup(party);
 party.setField(FIELD.PartyID, 'FIRM-1').setField(FIELD.PartyRole, 1);
 order.addGroup(party);
 
 order.toPretty();
-// ...|35=D|11=ord-1|55=AAPL|453=2|448=TRADER-1|452=11|448=FIRM-1|452=1|10=...|
+// ...|35=D|11=ord-1|55=AAPL|453=2|448=TRADER-1|452=11|447=D|448=FIRM-1|452=1|447=D|10=...|
 order.getGroup(2, FIELD.NoPartyIDs).getField(FIELD.PartyID); // 'FIRM-1'
 ```
 

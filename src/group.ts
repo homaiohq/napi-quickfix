@@ -13,12 +13,11 @@ import { native, type NativeGroup } from './native.js';
  * a parent `Group` for nesting) with `addGroup`. Adding copies the group, so
  * one object can be reused for several instances.
  *
- * **Field order.** Fields go on the wire in the order they were first set,
- * with two exceptions that FIX itself imposes: the delimiter tag always comes
- * first, and tags listed in the constructor's `order` argument keep that
- * sequence regardless of when they are set. Nothing is sorted numerically.
- * The delimiter field must be set before the group is added to a message or
- * a parent group; `addGroup` throws otherwise.
+ * **Field order** follows QuickFIX. Without `order` (`FIX::Group(field,
+ * delim)`) the delimiter comes first and the other fields sort numerically.
+ * With `order` (`FIX::Group(field, delim, order[])`) the listed tags are
+ * written in that sequence, which must start with the delimiter, and any
+ * other tag follows them numerically.
  *
  * @example
  * ```ts
@@ -48,9 +47,9 @@ export class Group {
    *
    * @param countTag The group's count tag (`NoXxx`), e.g. `FIELD.NoPartyIDs`.
    * @param delimiterTag The tag that opens every instance, e.g. `FIELD.PartyID`.
-   * @param order Optional tags whose relative order is fixed in advance. It
-   *   must start with `delimiterTag`. Tags not listed follow in the order they
-   *   are set.
+   * @param order Optional explicit field order, starting with
+   *   `delimiterTag`. Tags not listed follow the listed ones numerically.
+   *   Tags must be integers in `1..100000`.
    */
   constructor(countTag: number, delimiterTag: number, order?: readonly number[]);
   // Implementation signature only (not part of the public overloads): also
@@ -100,10 +99,9 @@ export class Group {
   }
 
   /**
-   * Set a field. Returns `this` for chaining. A tag set for the first time
-   * goes after the fields already present (see the class notes on order).
+   * Set a field. Returns `this` for chaining.
    *
-   * @throws A `TypeError` unless `tag` is an integer in `1..100000`.
+   * @throws A `TypeError` unless `tag` is a positive integer.
    */
   setField(tag: number, value: string | number): this {
     this.#native.setField(tag, String(value));
@@ -115,10 +113,7 @@ export class Group {
     return this.#native.hasField(tag);
   }
 
-  /**
-   * Append one instance of a nested repeating group (copied). Returns `this`.
-   * @throws An `Error` if `group` has no delimiter field set.
-   */
+  /** Append one instance of a nested repeating group (copied). Returns `this`. */
   addGroup(group: Group): this {
     this.#native.addGroup(group.nativeHandle);
     return this;

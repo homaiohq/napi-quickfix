@@ -36,11 +36,10 @@ Napi::Object GroupWrap::Init(Napi::Env env, Napi::Object exports) {
 
 Napi::Object GroupWrap::NewInstance(Napi::Env env, int countTag,
                                     const FIX::FieldMap& instance) {
-  // A dictionary-parsed instance is stored as a FIX::Group and knows its
-  // delimiter. One added through addGroup is sliced to a plain FieldMap, so
-  // fall back to its first field: RequireDelimiter guarantees the delimiter
-  // was set, and both sorters put it first. An empty instance can only come
-  // from QuickFIX itself; use the count tag so tag validation passes.
+  // Both QuickFIX's parser and our addGroup store instances as FIX::Group
+  // objects, which know their delimiter. Fall back to the first field (every
+  // group sorter puts the delimiter first), then to the count tag for an
+  // empty instance, so the constructor's tag validation passes.
   int delim = countTag;
   if (const auto* asGroup = dynamic_cast<const FIX::Group*>(&instance)) {
     delim = asGroup->delim();
@@ -54,14 +53,6 @@ Napi::Object GroupWrap::NewInstance(Napi::Env env, int countTag,
   // copy serialises exactly like the original.
   static_cast<FIX::FieldMap&>(wrap->group_) = instance;
   return obj;
-}
-
-void GroupWrap::RequireDelimiter(Napi::Env env) const {
-  if (!group_.isSetField(group_.delim())) {
-    throw Napi::Error::New(
-        env, "group delimiter field " + std::to_string(group_.delim()) +
-                 " must be set before the group is added");
-  }
 }
 
 GroupWrap* GroupWrap::UnwrapArg(Napi::Env env, Napi::Value value,
@@ -85,47 +76,22 @@ GroupWrap::GroupWrap(const Napi::CallbackInfo& info)
   }
   const int countTag = CoerceSetTag(env, info[0]);
   const int delim = CoerceSetTag(env, info[1]);
+  const std::vector<int> order =
+      info.Length() >= 3 ? CoerceOrder(env, info[2], "order") : std::vector<int>();
 
-  pinned_.push_back(delim);
-  if (info.Length() >= 3 && !info[2].IsUndefined() && !info[2].IsNull()) {
-    if (!info[2].IsArray()) {
-      throw Napi::TypeError::New(env, "order must be an array of field tags");
+  if (order.empty()) {
+    // FIX::Group(field, delim): delimiter first, then numeric.
+    group_ = FIX::Group(countTag, delim);
+  } else {
+    // FIX::Group(field, delim, order[]): the delimiter must open every
+    // instance on the wire, so it has to lead the order.
+    if (order[0] != delim) {
+      throw Napi::TypeError::New(
+          env, "order must start with the delimiter tag (" +
+                   std::to_string(delim) + "), got " + std::to_string(order[0]));
     }
-    Napi::Array arr = info[2].As<Napi::Array>();
-    for (uint32_t i = 0; i < arr.Length(); i++) {
-      const int tag = CoerceSetTag(env, arr.Get(i));
-      if (i == 0 && tag != delim) {
-        throw Napi::TypeError::New(
-            env, "order must start with the delimiter tag (" +
-                     std::to_string(delim) + "), got " + std::to_string(tag));
-      }
-      AppendUnique(pinned_, tag);
-    }
+    group_ = FIX::Group(countTag, delim, MakeOrder(order));
   }
-
-  group_ = FIX::Group(countTag, delim, MakeOrder(pinned_));
-}
-
-void GroupWrap::EnsureTag(int tag) {
-  if (group_.isSetField(tag) ||
-      std::find(pinned_.begin(), pinned_.end(), tag) != pinned_.end()) {
-    // Already has a slot in the sorter: pinned tags are listed from the start,
-    // set tags were listed by the rebuild that admitted them.
-    return;
-  }
-  if (!CanReorder(group_)) {
-    // Out-of-range or repeated tags (see field_map_util.h): let QuickFIX
-    // insert under the existing sorter instead of rebuilding.
-    return;
-  }
-  std::vector<int> order = pinned_;
-  for (int t : CurrentTagOrder(group_)) {
-    AppendUnique(order, t);
-  }
-  order.push_back(tag);
-  FIX::Group fresh(group_.field(), group_.delim(), MakeOrder(order));
-  CopyContents(group_, fresh);
-  group_ = fresh;
 }
 
 Napi::Value GroupWrap::GetField(const Napi::CallbackInfo& info) {
@@ -141,7 +107,6 @@ Napi::Value GroupWrap::SetField(const Napi::CallbackInfo& info) {
   int tag = CoerceSetTag(env, info[0]);
   std::string value = CoerceValue(env, info[1]);
   NQ_TRY(env) {
-    EnsureTag(tag);
     group_.setField(tag, value);
   } NQ_CATCH(env)
   return env.Undefined();
@@ -156,10 +121,10 @@ Napi::Value GroupWrap::HasField(const Napi::CallbackInfo& info) {
 Napi::Value GroupWrap::AddGroup(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   GroupWrap* sub = UnwrapArg(env, info[0], "group");
-  sub->RequireDelimiter(env);
   NQ_TRY(env) {
-    EnsureTag(sub->group_.field());
-    group_.addGroup(sub->group_);
+    // Store a FIX::Group copy (not a sliced FieldMap) so getGroup can read
+    // the delimiter back; QuickFIX's parser stores instances the same way.
+    group_.addGroupPtr(sub->group_.field(), new FIX::Group(sub->group_));
   } NQ_CATCH(env)
   return env.Undefined();
 }

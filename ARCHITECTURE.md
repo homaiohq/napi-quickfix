@@ -143,15 +143,13 @@ sequenceDiagram
 
 ### Field order
 
-QuickFIX sorts every `FieldMap` with a `message_order` fixed at construction (numeric for a body, dictionary order
-for a group). `MessageWrap` and `GroupWrap` keep **insertion order** instead: before a new tag is set they rebuild
-the map with a `group`-mode order listing the existing tags in their current sequence plus the new one
-(`cpp/field_map_util.h`). Existing tags are overwritten in place. A `Group` always puts its delimiter first and
-honours an optional pinned order given at construction. Messages produced by a parse keep QuickFIX's parse order.
-The rebuild is skipped, leaving QuickFIX's own insertion, when the map cannot be expressed as a tag-keyed order:
-a tag outside `1..100000` (the order array is indexed by tag, so a parsed negative or huge tag would write out of
-bounds or allocate gigabytes), a repeated flat tag (a group parsed without a dictionary; duplicates would collapse),
-or a parse flagged as structurally invalid.
+Field order is QuickFIX's own. Every `FieldMap` sorts with the `message_order` it was constructed with: numeric
+for a message body, `FIX::Message(hdrOrder, trlOrder, order)` for an explicit order, and for a group
+`FIX::Group(field, delim)` (delimiter first, then numeric) or `FIX::Group(field, delim, order[])`. The wrappers
+expose exactly that through the `order` option of `Message` and the third `Group` constructor argument
+(`cpp/field_map_util.h` turns the JS array into a `message_order`). Tags not listed in an explicit order sort after
+the listed ones, numerically. Group instances are stored as `FIX::Group` objects (via `addGroupPtr`), the same way
+QuickFIX's parser stores them, so `getGroup` can read the delimiter back.
 
 ---
 

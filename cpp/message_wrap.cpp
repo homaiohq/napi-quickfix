@@ -11,7 +11,6 @@
 #include "field_map_util.h"
 #include "group_wrap.h"
 #include "quickfix/FieldNumbers.h"
-#include "quickfix/MessageSorters.h"
 
 namespace napi_quickfix {
 
@@ -66,15 +65,16 @@ MessageWrap::MessageWrap(const Napi::CallbackInfo& info)
     : Napi::ObjectWrap<MessageWrap>(info) {
   Napi::Env env = info.Env();
   if (info.Length() == 0) {
-    // Empty message.
+    // Empty message, numeric body order.
     return;
   }
-  if (!info[0].IsString()) {
+  const bool haveRaw = !info[0].IsUndefined() && !info[0].IsNull();
+  if (haveRaw && !info[0].IsString()) {
     throw Napi::TypeError::New(
         env,
-        "new Message(raw: string, validate?: boolean, dictionary?: DataDictionary)");
+        "new Message(raw?: string, validate?: boolean, dictionary?: DataDictionary, "
+        "order?: number[])");
   }
-  const std::string raw = info[0].As<Napi::String>().Utf8Value();
   bool validate = false;
   if (info.Length() >= 2 && !info[1].IsUndefined() && !info[1].IsNull()) {
     validate = info[1].ToBoolean().Value();
@@ -87,6 +87,21 @@ MessageWrap::MessageWrap(const Napi::CallbackInfo& info)
     dictionary =
         &DataDictionaryWrap::UnwrapArg(env, info[2], "dictionary")->Dictionary();
   }
+  const std::vector<int> order =
+      info.Length() >= 4 ? CoerceOrder(env, info[3], "order") : std::vector<int>();
+
+  if (!order.empty()) {
+    // FIX::Message(hdrOrder, trlOrder, order): the body sorts by `order`.
+    FIX::Message ordered(FIX::message_order(FIX::message_order::header),
+                         FIX::message_order(FIX::message_order::trailer),
+                         MakeOrder(order));
+    ordered.clear();  // this constructor leaves m_tag uninitialised
+    message_ = std::move(ordered);
+  }
+  if (!haveRaw) {
+    return;
+  }
+  const std::string raw = info[0].As<Napi::String>().Utf8Value();
   NQ_TRY(env) {
     if (dictionary) {
       message_.setString(raw, validate, dictionary);
@@ -94,33 +109,6 @@ MessageWrap::MessageWrap(const Napi::CallbackInfo& info)
       message_.setString(raw, validate);
     }
   } NQ_CATCH(env)
-}
-
-void MessageWrap::EnsureBodyTag(int tag) {
-  if (message_.isSetField(tag)) {
-    return;
-  }
-  int badTag = 0;
-  if (!CanReorder(message_) || !message_.hasValidStructure(badTag)) {
-    // Out-of-range or repeated tags, or a structurally invalid parse: leave
-    // QuickFIX to insert the field under the message's existing order rather
-    // than rebuilding (which would corrupt memory, lose duplicates, or drop
-    // the invalid-structure flag).
-    return;
-  }
-  std::vector<int> order = CurrentTagOrder(message_);
-  order.push_back(tag);
-  FIX::Message fresh(FIX::message_order(FIX::message_order::header),
-                     FIX::message_order(FIX::message_order::trailer),
-                     MakeOrder(order));
-  fresh.clear();  // the order-taking constructor leaves m_tag uninitialised
-  fresh.getHeader() = message_.getHeader();
-  fresh.getTrailer() = message_.getTrailer();
-  CopyContents(message_, static_cast<FIX::FieldMap&>(fresh));
-  // QuickFIX's move-assignment does not free the group instances it replaces;
-  // clear() does.
-  message_.clear();
-  message_ = std::move(fresh);
 }
 
 Napi::Value MessageWrap::GetField(const Napi::CallbackInfo& info) {
@@ -148,7 +136,6 @@ Napi::Value MessageWrap::SetField(const Napi::CallbackInfo& info) {
     } else if (FIX::Message::isTrailerField(tag)) {
       message_.getTrailer().setField(tag, value);
     } else {
-      EnsureBodyTag(tag);
       message_.setField(tag, value);
     }
   } NQ_CATCH(env)
@@ -177,15 +164,14 @@ static FIX::FieldMap& SectionFor(FIX::Message& message, int countTag) {
 Napi::Value MessageWrap::AddGroup(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   GroupWrap* group = GroupWrap::UnwrapArg(env, info[0], "group");
-  group->RequireDelimiter(env);
   const int countTag = group->Group().field();
   NQ_TRY(env) {
-    if (&SectionFor(message_, countTag) == &message_) {
-      // The NoXxx count field takes the next slot in the wire order; QuickFIX
-      // then maintains its value as instances are added.
-      EnsureBodyTag(countTag);
-    }
-    SectionFor(message_, countTag).addGroup(countTag, group->Group());
+    // Store a FIX::Group copy (not a sliced FieldMap) so getGroup can read
+    // the delimiter back; QuickFIX's parser stores instances the same way.
+    // QuickFIX sets the NoXxx count field and keeps it equal to the number
+    // of instances.
+    SectionFor(message_, countTag)
+        .addGroupPtr(countTag, new FIX::Group(group->Group()));
   } NQ_CATCH(env)
   return env.Undefined();
 }

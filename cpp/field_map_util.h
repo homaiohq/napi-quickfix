@@ -1,16 +1,12 @@
-// Helpers shared by MessageWrap and GroupWrap for keeping FIX::FieldMap bodies
-// in INSERTION order rather than QuickFIX's default numeric tag order.
+// Argument coercion shared by MessageWrap and GroupWrap, plus the helper that
+// turns a JS tag array into a QuickFIX `message_order`.
 //
-// QuickFIX sorts every FieldMap with a `message_order` fixed at construction
-// (numeric for a message body, dictionary order for a group). The sorter is
-// immutable, so "keep the order the caller set the fields in" is implemented
-// by rebuilding the map: whenever a NEW tag is about to be set, construct a
-// fresh map whose `group`-mode order lists every existing tag in its current
-// sequence followed by the new tag, copy the contents across, and swap. A tag
-// that is already present is overwritten in place and never moves.
-//
-// `message_order` indexes a flat array by tag number, so tags are capped at
-// kMaxTag to bound that allocation (see CoerceTag).
+// Field order follows QuickFIX exactly. Every FieldMap sorts with the
+// `message_order` it was constructed with: numeric for a message body unless
+// an explicit order is given (FIX::Message(hdrOrder, trlOrder, order)), and
+// for a group the delimiter first followed by the given order
+// (FIX::Group(field, delim, order[])). Tags not listed in an explicit order
+// sort after the listed ones, numerically.
 #ifndef NAPI_QUICKFIX_FIELD_MAP_UTIL_H
 #define NAPI_QUICKFIX_FIELD_MAP_UTIL_H
 
@@ -19,21 +15,18 @@
 #include <string>
 #include <vector>
 
-#include "quickfix/FieldMap.h"
 #include "quickfix/MessageSorters.h"
 
 namespace napi_quickfix {
 
-// Largest tag number accepted when SETTING a field. FIX tags are small
-// positive integers (standard tags stay below 10000, user-defined ones rarely
-// exceed a few tens of thousands); the cap bounds the per-message order array,
-// which costs 4 bytes per possible tag. Reads accept any 32-bit integer so a
-// tag that arrived in a parsed message can always be looked up.
-constexpr int kMaxTag = 100000;
+// Largest tag accepted in an explicit `order`. QuickFIX indexes a flat array
+// by tag for ordered maps (4 bytes per possible tag), so the cap bounds that
+// allocation. Standard FIX tags stay below 10000; user-defined ones rarely
+// exceed a few tens of thousands.
+constexpr int kMaxOrderTag = 100000;
 
-// Coerce a JS arg to a FIX tag for a READ. Any integer in the int32 range is
-// accepted; an unknown tag then surfaces as FieldNotFound from QuickFIX, as it
-// always did. Throws TypeError for non-numbers and non-integers.
+// Coerce a JS arg to a FIX tag: any int32 integer. Unknown tags surface as
+// FieldNotFound from QuickFIX on reads, as in the C++ API.
 inline int CoerceTag(Napi::Env env, Napi::Value v) {
   if (!v.IsNumber()) {
     throw Napi::TypeError::New(env, "field tag must be a number");
@@ -46,14 +39,13 @@ inline int CoerceTag(Napi::Env env, Napi::Value v) {
   return static_cast<int>(d);
 }
 
-// Coerce a JS arg to a FIX tag for a SET. Throws TypeError unless it is an
-// integer in [1, kMaxTag].
+// Coerce a JS arg to a tag being SET. Like CoerceTag but positive: QuickFIX's
+// ordered sorter indexes its array by tag, so a non-positive tag must never
+// enter a map that may carry an explicit order.
 inline int CoerceSetTag(Napi::Env env, Napi::Value v) {
   const int tag = CoerceTag(env, v);
-  if (tag < 1 || tag > kMaxTag) {
-    throw Napi::TypeError::New(
-        env, "field tag must be an integer between 1 and " +
-                 std::to_string(kMaxTag));
+  if (tag < 1) {
+    throw Napi::TypeError::New(env, "field tag must be a positive integer");
   }
   return tag;
 }
@@ -88,65 +80,41 @@ inline std::string CoerceValue(Napi::Env env, Napi::Value v) {
   throw Napi::TypeError::New(env, "field value must be a string or number");
 }
 
-// Tags of `map`'s own fields (not nested groups) in their current sequence.
-inline std::vector<int> CurrentTagOrder(const FIX::FieldMap& map) {
+// Coerce an optional JS `order` argument (undefined/null = none) to a list of
+// distinct tags in [1, kMaxOrderTag]. Throws TypeError otherwise.
+inline std::vector<int> CoerceOrder(Napi::Env env, Napi::Value v,
+                                    const char* argName) {
   std::vector<int> order;
-  order.reserve(map.totalFields());
-  for (const FIX::FieldBase& field : map) {
-    order.push_back(field.getTag());
+  if (v.IsUndefined() || v.IsNull()) {
+    return order;
+  }
+  if (!v.IsArray()) {
+    throw Napi::TypeError::New(
+        env, std::string(argName) + " must be an array of field tags");
+  }
+  Napi::Array arr = v.As<Napi::Array>();
+  for (uint32_t i = 0; i < arr.Length(); i++) {
+    const int tag = CoerceTag(env, arr.Get(i));
+    if (tag < 1 || tag > kMaxOrderTag) {
+      throw Napi::TypeError::New(
+          env, std::string(argName) + " tags must be integers between 1 and " +
+                   std::to_string(kMaxOrderTag));
+    }
+    bool seen = false;
+    for (int t : order) {
+      if (t == tag) seen = true;
+    }
+    if (!seen) order.push_back(tag);
   }
   return order;
 }
 
-// Whether `map` can be rebuilt with an explicit order. The order array is
-// indexed by tag, so every present tag must lie in [1, kMaxTag]: a parsed
-// message may carry a negative or huge tag (QuickFIX's parser accepts both),
-// which would write out of bounds or allocate gigabytes. And a tag-keyed
-// sorter cannot keep repeated tags in sequence, so a map holding duplicates
-// (a group parsed without a dictionary) is left to QuickFIX's own insertion,
-// which preserves the duplicates.
-inline bool CanReorder(const FIX::FieldMap& map) {
-  std::vector<int> seen;
-  for (const FIX::FieldBase& field : map) {
-    const int tag = field.getTag();
-    if (tag < 1 || tag > kMaxTag) return false;
-    for (int t : seen) {
-      if (t == tag) return false;
-    }
-    seen.push_back(tag);
-  }
-  return true;
-}
-
-// Append `tag` to `order` unless already listed.
-inline void AppendUnique(std::vector<int>& order, int tag) {
-  for (int t : order) {
-    if (t == tag) return;
-  }
-  order.push_back(tag);
-}
-
-// Build a `group`-mode sorter that orders tags exactly as listed; tags not
-// listed sort after them numerically (never the case right after a rebuild).
+// QuickFIX sorter for an explicit order (numeric when the list is empty).
 inline FIX::message_order MakeOrder(const std::vector<int>& order) {
   if (order.empty()) {
     return FIX::message_order(FIX::message_order::normal);
   }
   return FIX::message_order(order.data(), order.size());
-}
-
-// Copy every field and every nested group of `from` into `to`, honouring
-// `to`'s own sorter. Group instances are deep-copied; the count fields are
-// copied as ordinary fields (setCount=false), so their values are preserved.
-inline void CopyContents(const FIX::FieldMap& from, FIX::FieldMap& to) {
-  for (const FIX::FieldBase& field : from) {
-    to.setField(field);
-  }
-  for (const auto& tagWithGroups : from.groups()) {
-    for (const FIX::FieldMap* group : tagWithGroups.second) {
-      to.addGroup(tagWithGroups.first, *group, /*setCount=*/false);
-    }
-  }
 }
 
 }  // namespace napi_quickfix

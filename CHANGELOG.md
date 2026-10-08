@@ -11,32 +11,29 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ### Added
 
-- Repeating groups. A new `Group` class (count tag, delimiter tag, optional pinned
-  field order) with `setField`/`getField`/`hasField`, nested `addGroup`/`getGroup`/
-  `groupCount`, and `toString`/`toPretty`. `Message` gains `addGroup`, `getGroup`
-  (1-based, QuickFIX convention), `groupCount` and `hasField`.
+- Repeating groups. A new `Group` class (count tag, delimiter tag, optional explicit
+  field order, mirroring `FIX::Group(field, delim, order[])`) with
+  `setField`/`getField`/`hasField`, nested `addGroup`/`getGroup`/`groupCount`, and
+  `toString`/`toPretty`. `Message` gains `addGroup`, `getGroup` (1-based, QuickFIX
+  convention), `groupCount` and `hasField`. Header groups such as `NoHops` are routed
+  to the header like header fields are.
+- Explicit body field order: `new Message(raw?, { order })` / `createMessage(fields,
+  { order })`, mirroring `FIX::Message(headerOrder, trailerOrder, order)`. Listed tags
+  are written in that sequence, any other tag after them numerically. Without it the
+  body sorts numerically, as before.
 - `Message.parse` / `new Message(raw, opts)` accept a `dictionary` option so repeating
   groups in a raw string are parsed as groups instead of flat repeated tags.
 
 ### Changed
 
-- **Body fields are no longer sorted numerically.** A `Message` built with `setField`
-  emits body fields in the order they were first set; setting a tag again overwrites it
-  in place. A `Group` does the same, with its delimiter always first. Previously the
-  wire order followed QuickFIX's numeric sort. The header keeps the FIX layout
-  (`8`, `9`, `35` first) and the trailer still ends with `10`. Messages produced by a
-  parse keep QuickFIX's parse order.
 - Inbound handlers (`fromApp`, `fromAdmin`, `toApp`, `toAdmin`) now receive the
   engine's own message. On a session with `UseDataDictionary=Y` repeating groups are
   therefore parsed as groups: a tag that lives inside a group (e.g. `PartyID` on an
   ExecutionReport) is read with `getGroup`, and `getField` on it throws
   `FieldNotFound` where the flat re-parse used to return the last occurrence.
-- Tags passed to `setField`/`setHeaderField`/`setTrailerField` and to the `Group`
-  constructor must be integers in `1..100000`; anything else throws a `TypeError`.
-  Read accessors accept any integer tag (non-integers throw a `TypeError`) and keep
-  reporting absent tags as `FieldNotFound`.
-- Resends are not covered by the insertion-order guarantee: QuickFIX rebuilds a
-  PossDup message from its message store in numeric (or dictionary) order.
+- Tags passed to any accessor must be integers (`TypeError` otherwise); set paths and
+  the `Group` constructor additionally require them to be positive. Tags in an `order`
+  must lie in `1..100000`.
 
 ### Fixed
 

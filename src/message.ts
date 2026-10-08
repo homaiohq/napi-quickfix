@@ -5,8 +5,20 @@ import { native, type NativeMessage } from './native.js';
 import { Group } from './group.js';
 import type { DataDictionary } from './data-dictionary.js';
 
+/** Options for building a {@link Message}. */
+export interface MessageOptions {
+  /**
+   * Explicit body field order, mirroring QuickFIX's
+   * `FIX::Message(headerOrder, trailerOrder, order)`. Listed tags are written
+   * in this sequence; any other tag follows them in numeric order. Without it
+   * the body sorts numerically, as in QuickFIX. Tags must be integers in
+   * `1..100000`.
+   */
+  order?: readonly number[];
+}
+
 /** Options controlling how a raw FIX string is parsed into a {@link Message}. */
-export interface MessageParseOptions {
+export interface MessageParseOptions extends MessageOptions {
   /**
    * When `true`, the engine validates the message structure during parsing
    * (e.g. checksum / body-length). Defaults to `false` (lenient parse), matching
@@ -37,21 +49,14 @@ export interface MessageJSON {
  * Field values are accepted as `string | number` on input (numbers are
  * stringified, since FIX is string-on-the-wire) and always returned as `string`.
  *
- * **Field order.** Body fields are written to the wire in the order they were
- * first set; setting a tag again overwrites it in place. The library never
- * sorts them numerically, so a counterparty that requires one tag before
- * another gets exactly the sequence you built. Header fields keep the FIX
- * mandated layout (`8`, `9`, `35` first) and the trailer ends with `10`.
- *
- * Two cases keep QuickFIX's own order instead:
- * - Messages that come out of a parse (`Message.parse`, inbound engine
- *   callbacks) carry the numeric parse order, with repeating groups in the
- *   dictionary's field order. A new field set on such a message is appended
- *   after the existing ones. A parsed message with repeated flat tags (no
- *   dictionary) or an out-of-range tag keeps QuickFIX insertion throughout.
- * - A **resend**: on a ResendRequest the engine rebuilds stored messages from
- *   the message store, so PossDup copies go out in numeric (or dictionary)
- *   order, not the order the original was built in.
+ * **Field order** follows QuickFIX. Body fields sort numerically by tag
+ * unless the message is built with an explicit `order`
+ * (`new Message(undefined, { order })`, mirroring
+ * `FIX::Message(headerOrder, trailerOrder, order)`): the listed tags are
+ * written in that sequence and any other tag after them, numerically. The
+ * header keeps the FIX layout (`8`, `9`, `35` first) and the trailer ends with
+ * `10`. Note that a resend is rebuilt by the engine from the message store in
+ * numeric (or dictionary) order.
  *
  * Repeating groups (several occurrences of the same tags) are added with
  * {@link Message.addGroup}; see {@link Group}.
@@ -78,25 +83,27 @@ export class Message {
   readonly #native: NativeMessage;
 
   /**
-   * Create a message. With no argument, creates an empty message. With a raw
-   * FIX string, parses it.
+   * Create a message. With no `raw`, creates an empty message. With a raw
+   * FIX string, parses it. `opts.order` applies in both cases.
    *
    * Advanced: passing an existing {@link NativeMessage} handle adopts it (used
    * internally by the engine bridge to wrap inbound/outbound native messages).
    *
    * @param raw Optional raw FIX wire string (SOH-delimited) to parse, or an
    *   existing native handle to adopt.
-   * @param opts Optional parse options.
+   * @param opts Optional parse / ordering options.
    */
   constructor(raw?: string | NativeMessage, opts?: MessageParseOptions) {
-    if (raw === undefined) {
-      this.#native = new native.MessageWrap();
-    } else if (typeof raw === 'string') {
-      this.#native = new native.MessageWrap(
-        raw,
-        opts?.validate ?? false,
-        opts?.dictionary?.nativeHandle,
-      );
+    if (raw === undefined || typeof raw === 'string') {
+      this.#native =
+        raw === undefined && opts?.order === undefined
+          ? new native.MessageWrap()
+          : new native.MessageWrap(
+              raw,
+              opts?.validate ?? false,
+              opts?.dictionary?.nativeHandle,
+              opts?.order,
+            );
     } else {
       // Adopt an existing native handle (bridge path).
       this.#native = raw;
@@ -132,13 +139,10 @@ export class Message {
   }
 
   /**
-   * Set a body field. Returns `this` for chaining.
-   *
-   * A tag set for the first time goes after every body field already present;
-   * a tag that is already set is overwritten where it is. Standard header and
+   * Set a body field. Returns `this` for chaining. Standard header and
    * trailer tags are routed to their section automatically.
    *
-   * @throws A `TypeError` unless `tag` is an integer in `1..100000`. Reads
+   * @throws A `TypeError` unless `tag` is a positive integer. Reads
    *   (`getField`, `hasField`, ...) accept any integer tag.
    */
   setField(tag: number, value: string | number): this {
@@ -152,15 +156,13 @@ export class Message {
   }
 
   /**
-   * Append one instance of a repeating group. The group's count field
-   * (`NoXxx`) is placed in the body at the point of the first `addGroup` call
-   * and QuickFIX keeps its value equal to the number of instances added. A
-   * header group such as `NoHops` is routed to the header, like `setField`.
+   * Append one instance of a repeating group. QuickFIX sets the group's count
+   * field (`NoXxx`) and keeps it equal to the number of instances added; the
+   * instances are written right after it. A header group such as `NoHops` is
+   * routed to the header, like `setField`.
    *
    * The group is copied: later changes to `group` do not affect this message,
    * so one {@link Group} object can be reused to build several instances.
-   *
-   * @throws An `Error` if `group` has no delimiter field set.
    */
   addGroup(group: Group): this {
     this.#native.addGroup(group.nativeHandle);
@@ -247,20 +249,20 @@ export class Message {
 /**
  * Create a message, optionally pre-populating body fields.
  *
- * Fields are set in the object's key order. JavaScript iterates integer-like
- * keys in ascending numeric order, so a plain object cannot express a
- * non-numeric field sequence; build the message with chained
- * {@link Message.setField} calls when the order matters.
- *
  * @param fields Map of tag → value to set on the message body.
+ * @param opts Optional {@link MessageOptions}, e.g. an explicit body `order`.
  *
  * @example
  * ```ts
  * const msg = createMessage({ [FIELD.MsgType]: MsgType.Logon, [FIELD.HeartBtInt]: 30 });
+ * const ordered = createMessage({ 55: 'AAPL', 38: 100 }, { order: [55, 38] });
  * ```
  */
-export function createMessage(fields?: Record<number, string | number>): Message {
-  const msg = new Message();
+export function createMessage(
+  fields?: Record<number, string | number>,
+  opts?: MessageOptions,
+): Message {
+  const msg = new Message(undefined, opts);
   if (fields) {
     for (const [tag, value] of Object.entries(fields)) {
       msg.setField(Number(tag), value);

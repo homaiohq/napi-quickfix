@@ -43,7 +43,12 @@ export interface NativeMessage {
 /** Constructor shape for the native `MessageWrap` class. */
 export interface NativeMessageConstructor {
   new (): NativeMessage;
-  new (raw: string, validate?: boolean, dictionary?: NativeDataDictionary): NativeMessage;
+  new (
+    raw: string | undefined,
+    validate?: boolean,
+    dictionary?: NativeDataDictionary,
+    order?: readonly number[],
+  ): NativeMessage;
 }
 
 /**

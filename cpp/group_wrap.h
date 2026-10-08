@@ -3,8 +3,6 @@
 
 #include <napi.h>
 
-#include <vector>
-
 #include "quickfix/FieldMap.h"
 #include "quickfix/Group.h"
 
@@ -17,17 +15,18 @@ namespace napi_quickfix {
 // Methods: getField / setField / hasField / addGroup / getGroup / groupCount /
 // getCountTag / getDelimiterTag / toString / toPretty.
 //
-// Field order on the wire: the delimiter tag always comes first (FIX requires
-// it to open every instance), then the tags of `order` in the given sequence,
-// then every other tag in the order it was set. Nothing is sorted numerically.
+// Field order is QuickFIX's: FIX::Group(field, delim) puts the delimiter
+// first and the rest in numeric order; FIX::Group(field, delim, order[]) puts
+// the listed tags in that sequence (the delimiter must lead it) and any other
+// tag after them, numerically.
 class GroupWrap : public Napi::ObjectWrap<GroupWrap> {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
 
   // Build a JS GroupWrap holding a COPY of an existing group instance (as
   // stored inside a message or a parent group). `countTag` is the NoXxx tag
-  // the instance lives under. The delimiter comes from the stored FIX::Group
-  // when QuickFIX parsed it with a dictionary, else from the first field.
+  // the instance lives under. Instances are stored as FIX::Group objects (by
+  // the parser and by our addGroup), so the delimiter is read from there.
   static Napi::Object NewInstance(Napi::Env env, int countTag,
                                   const FIX::FieldMap& instance);
 
@@ -39,10 +38,6 @@ class GroupWrap : public Napi::ObjectWrap<GroupWrap> {
   // Unwrap a JS value that must be a GroupWrap; throws Napi::TypeError if not.
   static GroupWrap* UnwrapArg(Napi::Env env, Napi::Value value,
                               const char* argName);
-
-  // Throw a JS Error unless the delimiter field is set: FIX needs it to open
-  // every instance, and getGroup recovers the delimiter from the first field.
-  void RequireDelimiter(Napi::Env env) const;
 
  private:
   static Napi::FunctionReference constructor_;
@@ -58,13 +53,7 @@ class GroupWrap : public Napi::ObjectWrap<GroupWrap> {
   Napi::Value ToString(const Napi::CallbackInfo& info);
   Napi::Value ToPretty(const Napi::CallbackInfo& info);
 
-  // Make sure `tag` has a slot in the wire order before it is set for the
-  // first time (see field_map_util.h). No-op if the tag is already present.
-  void EnsureTag(int tag);
-
   FIX::Group group_;
-  // Tags pinned by the constructor's `order` argument (delimiter first).
-  std::vector<int> pinned_;
 };
 
 }  // namespace napi_quickfix

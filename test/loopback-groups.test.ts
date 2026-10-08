@@ -102,7 +102,7 @@ function waitForEvent(
 
 describe('loopback integration: repeating groups and field order', () => {
   test(
-    'a NewOrderSingle with nested party groups crosses toApp and arrives in build order',
+    'a NewOrderSingle with nested party groups crosses toApp and arrives in the explicit order',
     { timeout: HANDSHAKE_TIMEOUT_MS + 6000 },
     async () => {
       const acceptorPort = await freePort();
@@ -195,9 +195,15 @@ TargetCompID=SERVER
         await ini.start();
         await Promise.all([accLogon, iniLogon]);
 
-        // Body fields deliberately out of numeric order; group fields too
-        // (dictionary order would be 448, 447, 452).
-        const order = createMessage()
+        // Explicit orders, deliberately not numeric and (for the party group)
+        // not the dictionary order 448, 447, 452. The toApp edit adds tag 58,
+        // which is not listed and so follows the listed tags.
+        const BODY_ORDER = [
+          FIELD.ClOrdID, FIELD.Symbol, FIELD.Side, FIELD.OrderQty, FIELD.OrdType,
+          FIELD.TransactTime, FIELD.NoPartyIDs,
+        ];
+        const PARTY_ORDER = [FIELD.PartyID, FIELD.PartyRole, FIELD.PartyIDSource, FIELD.NoPartySubIDs];
+        const order = createMessage(undefined, { order: BODY_ORDER })
           .setField(FIELD.MsgType, MsgType.NewOrderSingle)
           .setField(FIELD.ClOrdID, 'ord-1')
           .setField(FIELD.Symbol, 'AAPL')
@@ -206,7 +212,7 @@ TargetCompID=SERVER
           .setField(FIELD.OrdType, '2')
           .setField(FIELD.TransactTime, '20260101-00:00:00');
 
-        const trader = new Group(FIELD.NoPartyIDs, FIELD.PartyID)
+        const trader = new Group(FIELD.NoPartyIDs, FIELD.PartyID, PARTY_ORDER)
           .setField(FIELD.PartyID, 'TRADER-1')
           .setField(FIELD.PartyRole, 11)
           .setField(FIELD.PartyIDSource, 'D')
@@ -215,7 +221,7 @@ TargetCompID=SERVER
               .setField(FIELD.PartySubID, 'desk-7')
               .setField(FIELD.PartySubIDType, 1),
           );
-        const firm = new Group(FIELD.NoPartyIDs, FIELD.PartyID)
+        const firm = new Group(FIELD.NoPartyIDs, FIELD.PartyID, PARTY_ORDER)
           .setField(FIELD.PartyID, 'FIRM-1')
           .setField(FIELD.PartyRole, 1);
         order.addGroup(trader).addGroup(firm);
@@ -249,7 +255,7 @@ TargetCompID=SERVER
             `448=FIRM-1${SOH}452=1${SOH}` +
             `58=edited-in-toApp${SOH}10=\\d{3}${SOH}`,
         );
-        assert.match(stream, bodyPattern, 'wire bytes must keep build order, groups and the toApp edit');
+        assert.match(stream, bodyPattern, 'wire bytes must follow the explicit orders, keep groups and the toApp edit');
       } finally {
         await ini.stop().catch(() => {});
         await acc.stop().catch(() => {});
