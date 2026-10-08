@@ -164,9 +164,8 @@ void ApplicationBridge::FireAndForget(CallType type, const FIX::SessionID& id) {
   }
 }
 
-ApplicationBridge::Result ApplicationBridge::CallSync(CallType type,
-                                                      const FIX::SessionID& id,
-                                                      const std::string& raw) {
+ApplicationBridge::Result ApplicationBridge::CallSync(
+    CallType type, const FIX::SessionID& id, const FIX::Message& message) {
   // Bridge is releasing/aborting: never call into the TSFN (its internals may be
   // torn down during finalize -> calling would abort the process). Return an
   // empty pass-through result so the QuickFIX thread proceeds without mutation
@@ -182,7 +181,7 @@ ApplicationBridge::Result ApplicationBridge::CallSync(CallType type,
   auto* data = new CallData();
   data->type = type;
   data->sessionID = id;
-  data->rawMessage = raw;
+  data->message = message;  // deep copy, groups included
   data->hasMessage = true;
   data->channel = channel;  // shared: trampoline gets its own owning copy
 
@@ -221,22 +220,22 @@ void ApplicationBridge::onLogout(const FIX::SessionID& id) {
 
 void ApplicationBridge::toAdmin(FIX::Message& message,
                                 const FIX::SessionID& id) {
-  Result r = CallSync(CallType::kToAdmin, id, message.toString());
+  Result r = CallSync(CallType::kToAdmin, id, message);
   if (r.mutated) {
-    message.setString(r.editedMessage, false);
+    message = r.editedMessage;
   }
   // toAdmin doesn't throw in the FIX interface; ignore r.threw here.
 }
 
 void ApplicationBridge::toApp(FIX::Message& message, const FIX::SessionID& id)
     EXCEPT(FIX::DoNotSend) {
-  Result r = CallSync(CallType::kToApp, id, message.toString());
+  Result r = CallSync(CallType::kToApp, id, message);
   if (r.threw) {
     // toApp may throw DoNotSend.
     throw FIX::DoNotSend();
   }
   if (r.mutated) {
-    message.setString(r.editedMessage, false);
+    message = r.editedMessage;
   }
 }
 
@@ -244,7 +243,7 @@ void ApplicationBridge::fromAdmin(const FIX::Message& message,
                                   const FIX::SessionID& id)
     EXCEPT(FIX::FieldNotFound, FIX::IncorrectDataFormat, FIX::IncorrectTagValue,
            FIX::RejectLogon) {
-  Result r = CallSync(CallType::kFromAdmin, id, message.toString());
+  Result r = CallSync(CallType::kFromAdmin, id, message);
   if (r.threw) {
     if (r.errorName == "RejectLogon") throw FIX::RejectLogon(r.errorMessage);
     if (r.errorName == "IncorrectDataFormat") throw FIX::IncorrectDataFormat(0);
@@ -259,7 +258,7 @@ void ApplicationBridge::fromApp(const FIX::Message& message,
                                 const FIX::SessionID& id)
     EXCEPT(FIX::FieldNotFound, FIX::IncorrectDataFormat, FIX::IncorrectTagValue,
            FIX::UnsupportedMessageType) {
-  Result r = CallSync(CallType::kFromApp, id, message.toString());
+  Result r = CallSync(CallType::kFromApp, id, message);
   if (r.threw) {
     if (r.errorName == "UnsupportedMessageType")
       throw FIX::UnsupportedMessageType();
@@ -324,13 +323,9 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
   Napi::Object msgObj;
   bool haveMsg = false;
   if (data->hasMessage) {
-    FIX::Message msg;
-    try {
-      msg.setString(data->rawMessage, false);
-    } catch (...) {
-      // Leave msg default-constructed if parse fails; still hand it to JS.
-    }
-    msgObj = MessageWrap::NewInstance(env, msg);
+    // Wrap a copy of the structured message: no string round-trip, so the
+    // repeating groups the engine parsed stay intact for the handler.
+    msgObj = MessageWrap::NewInstance(env, data->message);
     haveMsg = true;
   }
 
@@ -370,7 +365,7 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
   if (isSync && IsMutating(data->type) && haveMsg && !guard.result.threw) {
     try {
       MessageWrap* w = Napi::ObjectWrap<MessageWrap>::Unwrap(msgObj);
-      guard.result.editedMessage = w->Message().toString();
+      guard.result.editedMessage = w->Message();
       guard.result.mutated = true;
     } catch (...) {
       guard.result.mutated = false;

@@ -9,6 +9,36 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
+### Added
+
+- Repeating groups. New `Group` class (one entry of a repeating group, built from
+  its count tag and delimiter, with an optional explicit field order) and group
+  methods on `Message` and `Group`: `addGroup`, `getGroup`, `replaceGroup`,
+  `removeGroup`, `hasGroup`, `groupCount`. Groups nest. Indices are 1-based as in
+  QuickFIX; `getGroup` returns a snapshot copy, so edits are written back with
+  `replaceGroup`.
+- Dictionary-aware parsing: `Message.parse(raw, { dictionary })` and the
+  `{ sessionDictionary, applicationDictionary }` pair parse repeating groups
+  structurally. A parse without a dictionary stays flat, as before.
+- `FieldMap` surface on `Message` (and `Group`): `isSetField`, `removeField`,
+  `getFieldIfSet`, `isEmpty`, `totalFields`, `clear`, `fields()` (plus
+  `headerFields()` / `trailerFields()` on `Message`) and `[Symbol.iterator]`.
+- `DataDictionary.validate(msg, bodyOnly?)`, and the introspection methods
+  `getVersion`, `getFieldName`, `getFieldTag`, `isField`, `isMsgType`.
+- Argument validation on the field and group methods: a tag passed to a setter
+  (and a `Group` count tag / delimiter / order entry) must be a positive integer,
+  a tag passed to a reader and a group index must be an integer. Anything else
+  throws a `TypeError` instead of being silently truncated (`1.5` → `1`,
+  `NaN` → `0`) or emitted on the wire (`setField(0, 'x')` → `0=x`).
+
+### Fixed
+
+- Messages handed to engine handlers (`fromApp`, `toApp`, ...) now keep the
+  repeating groups QuickFIX parsed with the session's dictionary, and groups added
+  to an outbound message in `toApp` / `toAdmin` reach the wire. The bridge used to
+  round-trip every message through its wire string without a dictionary, which
+  flattened them.
+
 ## [0.1.0] - 2026-10-08
 
 Initial release. Bundles **QuickFIX v1.16.0** (statically linked).
