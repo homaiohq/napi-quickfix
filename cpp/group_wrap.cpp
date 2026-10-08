@@ -67,8 +67,8 @@ FIX::Group GroupWrap::MakeGroup(const Napi::CallbackInfo& info) {
     throw Napi::TypeError::New(
         env, "new Group(field: number, delim: number, order?: number[])");
   }
-  const int field = info[0].As<Napi::Number>().Int32Value();
-  const int delim = info[1].As<Napi::Number>().Int32Value();
+  const int field = fieldmap::CoerceSetTag(env, info[0]);
+  const int delim = fieldmap::CoerceSetTag(env, info[1]);
 
   if (info.Length() < 3 || fieldmap::IsNullish(info[2])) {
     return FIX::Group(field, delim);
@@ -82,12 +82,12 @@ FIX::Group GroupWrap::MakeGroup(const Napi::CallbackInfo& info) {
   std::vector<int> order;
   order.reserve(arr.Length() + 1);
   for (uint32_t i = 0; i < arr.Length(); i++) {
-    Napi::Value v = arr.Get(i);
-    if (!v.IsNumber() || v.As<Napi::Number>().Int32Value() == 0) {
+    int tag;
+    if (!fieldmap::ToInteger(arr.Get(i), tag) || tag <= 0) {
       throw Napi::TypeError::New(
-          env, "order must contain only non-zero field tags");
+          env, "order must contain only positive integer field tags");
     }
-    order.push_back(v.As<Napi::Number>().Int32Value());
+    order.push_back(tag);
   }
   if (order.empty()) {
     return FIX::Group(field, delim);
