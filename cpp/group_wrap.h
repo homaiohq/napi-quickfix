@@ -3,6 +3,8 @@
 
 #include <napi.h>
 
+#include <memory>
+
 #include "quickfix/FieldMap.h"
 #include "quickfix/Group.h"
 
@@ -25,15 +27,15 @@ class GroupWrap : public Napi::ObjectWrap<GroupWrap> {
 
   // Build a JS GroupWrap holding a COPY of an existing group instance (as
   // stored inside a message or a parent group). `countTag` is the NoXxx tag
-  // the instance lives under. Instances are stored as FIX::Group objects (by
-  // the parser and by our addGroup), so the delimiter is read from there.
+  // the instance lives under. The copy is made once, straight into the new
+  // wrapper (see field_map_ops.h for where the delimiter comes from).
   static Napi::Object NewInstance(Napi::Env env, int countTag,
                                   const FIX::FieldMap& instance);
 
   explicit GroupWrap(const Napi::CallbackInfo& info);
 
-  FIX::Group& Group() { return group_; }
-  const FIX::Group& Group() const { return group_; }
+  FIX::Group& Group() { return *group_; }
+  const FIX::Group& Group() const { return *group_; }
 
   // Unwrap a JS value that must be a GroupWrap; throws Napi::TypeError if not.
   static GroupWrap* UnwrapArg(Napi::Env env, Napi::Value value,
@@ -53,7 +55,10 @@ class GroupWrap : public Napi::ObjectWrap<GroupWrap> {
   Napi::Value ToString(const Napi::CallbackInfo& info);
   Napi::Value ToPretty(const Napi::CallbackInfo& info);
 
-  FIX::Group group_;
+  // Owned by pointer: FIX::Group has no way to change its count/delimiter
+  // tags after construction, so NewInstance builds the clone first and the
+  // constructor adopts it.
+  std::unique_ptr<FIX::Group> group_;
 };
 
 }  // namespace napi_quickfix

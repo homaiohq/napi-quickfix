@@ -11,7 +11,8 @@ namespace napi_quickfix {
 //
 //   new MessageWrap()
 //   new MessageWrap(raw: string | undefined, validate?: boolean = false,
-//                   dictionary?: DataDictionaryWrap, order?: number[])
+//                   dictionary?: DataDictionaryWrap, order?: number[],
+//                   sessionDictionary?: DataDictionaryWrap)
 //
 // Methods: getField / setField / hasField / getHeaderField / setHeaderField /
 // getTrailerField / setTrailerField / addGroup / getGroup / groupCount /
@@ -21,6 +22,11 @@ namespace napi_quickfix {
 // given, which mirrors FIX::Message(hdrOrder, trlOrder, order) — listed tags
 // in that sequence, any other tag after them numerically. Header and trailer
 // keep the FIX layout. `order` also applies when `raw` is parsed.
+//
+// `dictionary` is the application dictionary and `sessionDictionary` the
+// session (header/trailer) one, as in FIX::Message::setString(raw, validate,
+// session, app); each defaults to the other, so a FIX 4.x dictionary alone
+// covers both and a FIXT 1.1 session passes both.
 class MessageWrap : public Napi::ObjectWrap<MessageWrap> {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);

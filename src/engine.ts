@@ -47,6 +47,17 @@ export interface EngineEvents {
   fromApp: [message: Message, sessionID: SessionID];
 }
 
+/** The native callback behind each engine event. */
+const EVENT_CALLBACKS: Readonly<Record<keyof EngineEvents, keyof NativeApplicationHandlers>> = {
+  create: 'onCreate',
+  logon: 'onLogon',
+  logout: 'onLogout',
+  toAdmin: 'toAdmin',
+  fromAdmin: 'fromAdmin',
+  toApp: 'toApp',
+  fromApp: 'fromApp',
+};
+
 /**
  * Base class for the FIX session engines.
  *
@@ -127,6 +138,32 @@ export abstract class Engine extends EventEmitter {
       store: options.store,
       log: options.log,
     });
+
+    // Every native callback above is registered so events can be emitted, but
+    // forwarding one costs the engine thread a message copy and a wait on the
+    // event loop. Keep a callback switched on only while someone listens: a
+    // user handler, or at least one event listener. `newListener` fires before
+    // the listener is added and `removeListener` after it is removed, so the
+    // switch is set before the first callback can reach a listener.
+    const callbackOf = (event: string | symbol): keyof NativeApplicationHandlers | undefined =>
+      typeof event === 'string' && event in EVENT_CALLBACKS
+        ? EVENT_CALLBACKS[event as keyof EngineEvents]
+        : undefined;
+    const sync = (event: string | symbol) => {
+      const callback = callbackOf(event);
+      if (callback === undefined) return;
+      const wanted = userHandlers[callback] !== undefined || this.listenerCount(event) > 0;
+      this.#native.setCallbackEnabled(callback, wanted);
+    };
+    for (const event of Object.keys(EVENT_CALLBACKS)) sync(event);
+    // The typed `on` overloads below only know EngineEvents; these two are
+    // EventEmitter's own.
+    const emitter: EventEmitter = this;
+    emitter.on('newListener', (event: string | symbol) => {
+      const callback = callbackOf(event);
+      if (callback !== undefined) this.#native.setCallbackEnabled(callback, true);
+    });
+    emitter.on('removeListener', sync);
   }
 
   /**

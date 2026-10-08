@@ -42,6 +42,12 @@ class ApplicationBridge : public FIX::Application {
     kFromAdmin,
     kFromApp,
   };
+  static constexpr int kCallTypeCount = 7;
+
+  // The JS handler property name of a CallType ("onCreate", "toApp", ...),
+  // and the reverse lookup; returns false for an unknown name.
+  static const char* HandlerName(CallType type);
+  static bool CallTypeFromName(const std::string& name, CallType& out);
 
   // Result returned from the JS trampoline for synchronous calls.
   struct Result {
@@ -89,9 +95,18 @@ class ApplicationBridge : public FIX::Application {
                                              ApplicationBridge::CallJs>;
 
   // Construct on the JS thread. `handlers` is the user's handlers object (may be
-  // empty/undefined). `env` is captured for control (Ref/Unref).
+  // empty/undefined). `env` is captured for control (Ref/Unref). Which of the
+  // seven callbacks have a handler function is noted here, once; see
+  // SetCallbackEnabled for changing that later.
   ApplicationBridge(Napi::Env env, Napi::Object handlers);
   ~ApplicationBridge() override;
+
+  // Whether a callback is forwarded to JS at all. A disabled callback returns
+  // pass-through on the QuickFIX thread without copying the message or
+  // waiting on the event loop, so a session that only handles `fromApp` pays
+  // nothing for its heartbeats and test requests. Starts as "handler function
+  // present" and may be flipped from the JS thread at any time (atomic).
+  void SetCallbackEnabled(CallType type, bool enabled);
 
   // TSFN lifecycle. Acquire is a no-op placeholder (the initial thread count is
   // 1 from New); Release drains, Abort force-stops. Ref/Unref control whether
@@ -136,6 +151,13 @@ class ApplicationBridge : public FIX::Application {
   // environment teardown the TSFN's internals may already be destroyed, and
   // calling into it aborts the process. Atomic so the cross-thread read is safe.
   std::atomic<bool> inactive_{false};
+
+  // Per-callback forwarding switch, indexed by CallType. Read on QuickFIX
+  // threads, written on the JS thread.
+  std::atomic<bool> enabled_[kCallTypeCount];
+  bool IsEnabled(CallType type) const {
+    return enabled_[static_cast<int>(type)].load(std::memory_order_acquire);
+  }
 
   // Wake all in-flight synchronous callers (used by Deactivate/Abort so a
   // network thread blocked in CallSync doesn't wait forever when the main loop

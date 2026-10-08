@@ -36,6 +36,7 @@ Napi::Object InitiatorWrap::Init(Napi::Env env, Napi::Object exports) {
           InstanceMethod("isLoggedOn", &InitiatorWrap::IsLoggedOn),
           InstanceMethod("ref", &InitiatorWrap::Ref),
           InstanceMethod("unref", &InitiatorWrap::Unref),
+          InstanceMethod("setCallbackEnabled", &InitiatorWrap::SetCallbackEnabled),
       });
   constructor_ = Napi::Persistent(func);
   constructor_.SuppressDestruct();
@@ -250,6 +251,10 @@ Napi::Value InitiatorWrap::Unref(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (bridge_) bridge_->Unref(env);
   return info.This();
+}
+
+Napi::Value InitiatorWrap::SetCallbackEnabled(const Napi::CallbackInfo& info) {
+  return SetCallbackEnabledImpl(info, bridge_.get());
 }
 
 }  // namespace napi_quickfix

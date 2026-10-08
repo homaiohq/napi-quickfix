@@ -13,6 +13,9 @@
   <field name="PossResend" required="N"/>
   <field name="SendingTime" required="Y"/>
   <field name="OrigSendingTime" required="N"/>
+  <!-- A user-defined header field: the engine stores it in the header, so
+       the wrapper must find it there although it is not a standard tag. -->
+  <field name="CustomHeaderTag" required="N"/>
  </header>
  <trailer>
   <field name="CheckSum" required="Y"/>
@@ -108,5 +111,6 @@
   <field number="554" name="Password" type="STRING"/>
   <field number="802" name="NoPartySubIDs" type="NUMINGROUP"/>
   <field number="803" name="PartySubIDType" type="INT"/>
+  <field number="5001" name="CustomHeaderTag" type="STRING"/>
  </fields>
 </fix>

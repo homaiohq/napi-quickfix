@@ -48,6 +48,7 @@ export interface NativeMessageConstructor {
     validate?: boolean,
     dictionary?: NativeDataDictionary,
     order?: readonly number[],
+    sessionDictionary?: NativeDataDictionary,
   ): NativeMessage;
 }
 
@@ -195,6 +196,12 @@ export interface NativeEngine {
   isLoggedOn(): boolean;
   ref(): void;
   unref(): void;
+  /**
+   * Whether the engine forwards `callback` to its handler at all. Off, the
+   * engine thread returns pass-through without copying the message or waiting
+   * on the event loop. Starts as "a handler function was given".
+   */
+  setCallbackEnabled(callback: keyof NativeApplicationHandlers, enabled: boolean): void;
 }
 
 /** Constructor shape for the native `InitiatorWrap` / `AcceptorWrap` classes. */

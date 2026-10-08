@@ -1,0 +1,34 @@
+<!-- A trimmed FIX 5.0 SP2 application dictionary: a NewOrderSingle with the
+     NoPartyIDs group. The header and trailer come from the session
+     dictionary (fixt11-session.xml), as for every FIX 5.x dictionary. -->
+<fix type="FIX" major="5" minor="0" servicepack="2">
+ <header/>
+ <trailer/>
+ <messages>
+  <message name="NewOrderSingle" msgtype="D" msgcat="app">
+   <field name="ClOrdID" required="Y"/>
+   <group name="NoPartyIDs" required="N">
+    <field name="PartyID" required="N"/>
+    <field name="PartyIDSource" required="N"/>
+    <field name="PartyRole" required="N"/>
+   </group>
+   <field name="Symbol" required="N"/>
+   <field name="Side" required="Y"/>
+   <field name="TransactTime" required="Y"/>
+   <field name="OrderQty" required="N"/>
+   <field name="OrdType" required="Y"/>
+  </message>
+ </messages>
+ <fields>
+  <field number="11" name="ClOrdID" type="STRING"/>
+  <field number="38" name="OrderQty" type="QTY"/>
+  <field number="40" name="OrdType" type="CHAR"/>
+  <field number="54" name="Side" type="CHAR"/>
+  <field number="55" name="Symbol" type="STRING"/>
+  <field number="60" name="TransactTime" type="UTCTIMESTAMP"/>
+  <field number="447" name="PartyIDSource" type="CHAR"/>
+  <field number="448" name="PartyID" type="STRING"/>
+  <field number="452" name="PartyRole" type="INT"/>
+  <field number="453" name="NoPartyIDs" type="NUMINGROUP"/>
+ </fields>
+</fix>

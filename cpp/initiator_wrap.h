@@ -19,7 +19,8 @@ namespace napi_quickfix {
 //     store: 'file' | 'memory'         (default 'file')
 //     log:   'screen' | 'file' | 'none' (default 'screen')
 //
-// Methods: start / stop(force?) / isLoggedOn / ref / unref.
+// Methods: start / stop(force?) / isLoggedOn / ref / unref /
+// setCallbackEnabled(name, enabled).
 class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap> {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -34,6 +35,7 @@ class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap> {
   Napi::Value IsLoggedOn(const Napi::CallbackInfo& info);
   Napi::Value Ref(const Napi::CallbackInfo& info);
   Napi::Value Unref(const Napi::CallbackInfo& info);
+  Napi::Value SetCallbackEnabled(const Napi::CallbackInfo& info);
 
   void Teardown(bool force);
 

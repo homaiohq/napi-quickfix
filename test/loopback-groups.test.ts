@@ -144,7 +144,7 @@ TargetCompID=SERVER
       // What the acceptor's fromApp handler observed on the parsed message.
       const received: {
         parties: number;
-        first: { id: string; role: string; source: string; subs: number; subId: string };
+        first: { id: string; role: string; source: string; subs: number; subId: string; subDelim: number };
         second: { id: string; role: string };
         text: string;
       }[] = [];
@@ -165,6 +165,9 @@ TargetCompID=SERVER
                 source: first.getField(FIELD.PartyIDSource),
                 subs: first.groupCount(FIELD.NoPartySubIDs),
                 subId: first.getGroup(1, FIELD.NoPartySubIDs).getField(FIELD.PartySubID),
+                // A nested instance read through the bridge's copy still
+                // reports its delimiter.
+                subDelim: first.getGroup(1, FIELD.NoPartySubIDs).delimiterTag,
               },
               second: { id: second.getField(FIELD.PartyID), role: second.getField(FIELD.PartyRole) },
               text: msg.hasField(FIELD.Text) ? msg.getField(FIELD.Text) : '',
@@ -240,7 +243,7 @@ TargetCompID=SERVER
         assert.equal(received.length, 1, 'acceptor fromApp should have received the order');
         assert.deepEqual(received[0], {
           parties: 2,
-          first: { id: 'TRADER-1', role: '11', source: 'D', subs: 1, subId: 'desk-7' },
+          first: { id: 'TRADER-1', role: '11', source: 'D', subs: 1, subId: 'desk-7', subDelim: FIELD.PartySubID },
           second: { id: 'FIRM-1', role: '1' },
           text: 'edited-in-toApp',
         });

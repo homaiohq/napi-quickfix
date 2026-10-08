@@ -49,7 +49,7 @@ export class Group {
    * @param delimiterTag The tag that opens every instance, e.g. `FIELD.PartyID`.
    * @param order Optional explicit field order, starting with
    *   `delimiterTag`. Tags not listed follow the listed ones numerically.
-   *   Tags must be integers in `1..100000`.
+   *   Tags must be distinct integers in `1..100000`.
    */
   constructor(countTag: number, delimiterTag: number, order?: readonly number[]);
   // Implementation signature only (not part of the public overloads): also
@@ -64,8 +64,12 @@ export class Group {
         throw new TypeError('new Group(countTag, delimiterTag, order?): delimiterTag is required');
       }
       this.#native = new native.GroupWrap(countTagOrHandle, delimiterTag, order);
-    } else {
+    } else if (countTagOrHandle instanceof native.GroupWrap) {
       this.#native = countTagOrHandle;
+    } else {
+      // A wrong-typed countTag from plain JS must fail here, not on the first
+      // method call of a Group wrapping something that is no native group.
+      throw new TypeError('new Group(countTag, delimiterTag, order?): countTag must be a number');
     }
   }
 
@@ -91,8 +95,8 @@ export class Group {
 
   /**
    * Read a field by tag.
-   * @throws A `QuickFixError` (`fixErrorName: 'FieldNotFound'`) if absent.
-   *   `tag` must be an integer (any value); a non-integer throws a `TypeError`.
+   * @throws A `QuickFixError` (`fixErrorName: 'FieldNotFound'`) if absent, a
+   *   `TypeError` unless `tag` is a positive integer.
    */
   getField(tag: number): string {
     return this.#native.getField(tag);

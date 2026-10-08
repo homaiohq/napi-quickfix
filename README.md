@@ -208,8 +208,8 @@ come from `@homaiohq/napi-quickfix`.
 ### Message
 
 ```ts
-new Message(raw?: string, opts?: { validate?: boolean; dictionary?: DataDictionary; order?: number[] });
-Message.parse(raw: string, opts?: { validate?: boolean; dictionary?: DataDictionary; order?: number[] }): Message;
+new Message(raw?: string, opts?: { validate?: boolean; dictionary?: DataDictionary; sessionDictionary?: DataDictionary; order?: number[] });
+Message.parse(raw: string, opts?: { validate?: boolean; dictionary?: DataDictionary; sessionDictionary?: DataDictionary; order?: number[] }): Message;
 
 message.setField(tag: number, value: string | number): this; // chainable, auto-routes header/trailer fields
 message.getField(tag: number): string;
@@ -225,7 +225,7 @@ message.toPretty(): string;   // human-readable
 message.toJSON(): { msgType?: string; raw: string };
 
 createMessage(fields?: Record<number, string | number>, opts?: { order?: number[] }): Message;
-parseMessage(raw: string, opts?: { validate?: boolean; dictionary?: DataDictionary; order?: number[] }): Message;
+parseMessage(raw: string, opts?: { validate?: boolean; dictionary?: DataDictionary; sessionDictionary?: DataDictionary; order?: number[] }): Message;
 ```
 
 Field values are accepted as `string | number` (numbers are stringified) and
@@ -250,15 +250,23 @@ const msg = createMessage(
 // ...|35=D|55=AAPL|38=100|11=ord-1|10=...|
 ```
 
-Tags passed to `setField` must be positive integers (a `TypeError` otherwise);
-reads accept any integer and report an absent tag as `FieldNotFound`. Tags in
-an `order` must lie in `1..100000`, since QuickFIX indexes an array by tag for
-ordered maps.
+Every accessor requires a positive integer tag (a `TypeError` otherwise, on
+reads as well as writes: QuickFIX indexes an array by tag for ordered maps);
+an absent tag is reported as `FieldNotFound`. Tags in an `order` must be
+distinct and lie in `1..100000`.
+
+`setField`, `getField` and `hasField` route a tag to its section: the standard
+header and trailer tags go there, as does any other tag the message already
+holds in its header or trailer (such as a custom header field declared by the
+session's dictionary), and everything else is a body field.
 
 Pass a `dictionary` when parsing a raw string that contains repeating groups:
 QuickFIX only recognises groups it can look up, and without one every repeated
-tag lands in the flat body (`groupCount` is then `0`). Sessions configured with
-`UseDataDictionary=Y` already hand `fromApp`/`fromAdmin` fully parsed groups.
+tag lands in the flat body (`groupCount` is then `0`). For a FIXT 1.1 / FIX 5.x
+message also pass the `sessionDictionary` (`FIXT11.xml`) that describes the
+header and trailer, as the engine uses the two side by side. Sessions
+configured with `UseDataDictionary=Y` already hand `fromApp`/`fromAdmin` fully
+parsed groups.
 
 ### Group
 

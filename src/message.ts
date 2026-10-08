@@ -11,7 +11,7 @@ export interface MessageOptions {
    * Explicit body field order, mirroring QuickFIX's
    * `FIX::Message(headerOrder, trailerOrder, order)`. Listed tags are written
    * in this sequence; any other tag follows them in numeric order. Without it
-   * the body sorts numerically, as in QuickFIX. Tags must be integers in
+   * the body sorts numerically, as in QuickFIX. Tags must be distinct integers in
    * `1..100000`.
    */
   order?: readonly number[];
@@ -31,8 +31,19 @@ export interface MessageParseOptions extends MessageOptions {
    * parser builds proper {@link Group} instances that {@link Message.getGroup}
    * can read and that `toString()` re-emits in wire order. Without it (the
    * default) every repeated tag lands in the flat body, as in QuickFIX.
+   *
+   * This is the *application* dictionary (`FIX44.xml`, `FIX50SP2.xml`, ...).
+   * A FIX 4.x dictionary also describes the header and trailer, so it is all
+   * a FIX 4.x message needs.
    */
   dictionary?: DataDictionary;
+  /**
+   * The *session* dictionary (`FIXT11.xml`) describing the header and trailer
+   * of a FIXT 1.1 / FIX 5.x message, as the engine uses it next to the
+   * application `dictionary` on such a session. Defaults to `dictionary`, and
+   * stands in for a missing `dictionary`.
+   */
+  sessionDictionary?: DataDictionary;
 }
 
 /** A structured, best-effort view of a parsed message returned by {@link Message.toJSON}. */
@@ -103,10 +114,13 @@ export class Message {
               opts?.validate ?? false,
               opts?.dictionary?.nativeHandle,
               opts?.order,
+              opts?.sessionDictionary?.nativeHandle,
             );
-    } else {
+    } else if (raw instanceof native.MessageWrap) {
       // Adopt an existing native handle (bridge path).
       this.#native = raw;
+    } else {
+      throw new TypeError('new Message(raw?, opts?): raw must be a string');
     }
   }
 
@@ -131,19 +145,26 @@ export class Message {
   }
 
   /**
-   * Read a body field by tag.
-   * @throws A `QuickFixError` (`fixErrorName: 'FieldNotFound'`) if absent.
+   * Read a field by tag, routed like {@link setField}: standard header and
+   * trailer tags come from their section, as does any other tag the message
+   * already holds there (a custom header field declared by the session's
+   * dictionary, for instance). Everything else is a body field.
+   *
+   * @throws A `QuickFixError` (`fixErrorName: 'FieldNotFound'`) if absent, a
+   *   `TypeError` unless `tag` is a positive integer.
    */
   getField(tag: number): string {
     return this.#native.getField(tag);
   }
 
   /**
-   * Set a body field. Returns `this` for chaining. Standard header and
-   * trailer tags are routed to their section automatically.
+   * Set a field. Returns `this` for chaining. Standard header and trailer
+   * tags (`MsgType`, `SenderCompID`, `CheckSum`, ...) are routed to their
+   * section automatically, and so is any other tag the message already holds
+   * in its header or trailer; the rest goes to the body.
    *
-   * @throws A `TypeError` unless `tag` is a positive integer. Reads
-   *   (`getField`, `hasField`, ...) accept any integer tag.
+   * @throws A `TypeError` unless `tag` is a positive integer (every accessor
+   *   requires that).
    */
   setField(tag: number, value: string | number): this {
     this.#native.setField(tag, String(value));

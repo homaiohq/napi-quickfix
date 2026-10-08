@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "errors.h"
+#include "field_map_ops.h"
 #include "message_wrap.h"
 #include "quickfix/Message.h"
 #include "quickfix/Session.h"
@@ -78,8 +79,10 @@ static Napi::Value SendToTarget(const Napi::CallbackInfo& info) {
 
   // Copy the message and session id by value on the JS thread so the worker
   // never touches JS-owned objects.
+  FIX::Message copy;
+  CopyMessage(copy, msg->Message());  // group instances keep their delimiters
   auto* worker =
-      new SendToTargetWorker(env, msg->Message(), id->SessionID());
+      new SendToTargetWorker(env, std::move(copy), id->SessionID());
   Napi::Promise promise = worker->Promise();
   worker->Queue();
   return promise;

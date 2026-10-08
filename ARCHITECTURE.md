@@ -140,6 +140,10 @@ sequenceDiagram
 - The message crosses the bridge as a **deep copy of the `FIX::Message`** in both directions, never as a wire
   string. A string re-parse would need the session's data dictionary to rebuild repeating groups, and would re-sort
   the body numerically; the copy keeps groups and the sender's field order byte-for-byte.
+- Each of the seven callbacks has a **forwarding switch** (an atomic read on the QuickFIX thread). While it is off
+  the callback returns pass-through immediately: no copy, no `BlockingCall`, no wait. The TS `Engine` keeps a
+  switch on only while a user handler or at least one event listener exists for it (wired through
+  `newListener`/`removeListener`), so a session that only handles `fromApp` pays nothing for its heartbeats.
 
 ### Field order
 
@@ -148,8 +152,15 @@ for a message body, `FIX::Message(hdrOrder, trlOrder, order)` for an explicit or
 `FIX::Group(field, delim)` (delimiter first, then numeric) or `FIX::Group(field, delim, order[])`. The wrappers
 expose exactly that through the `order` option of `Message` and the third `Group` constructor argument
 (`cpp/field_map_util.h` turns the JS array into a `message_order`). Tags not listed in an explicit order sort after
-the listed ones, numerically. Group instances are stored as `FIX::Group` objects (via `addGroupPtr`), the same way
-QuickFIX's parser stores them, so `getGroup` can read the delimiter back.
+the listed ones, numerically.
+
+`FieldMap::operator=` re-creates nested group instances as plain `FieldMap`s, slicing off `FIX::Group`'s
+delimiter; QuickFIX's parser stores instances the same sliced way. Every copy the wrapper makes (`addGroup`,
+`getGroup`, the bridge, `sendToTarget`) therefore goes through `cpp/field_map_ops.h`, which clones a `FIX::Group`
+instance as a `FIX::Group`, recursively, so a delimiter set through this API survives any number of copies.
+`getGroup` reads the delimiter from the `FIX::Group` when the instance is one, else from the instance's first
+field: a parsed instance always starts with its delimiter on the wire. `field_map_ops.h` also holds the field and
+group method bodies that `MessageWrap` and `GroupWrap` share.
 
 ---
 

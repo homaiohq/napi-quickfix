@@ -106,22 +106,52 @@ describe('Message body field order', () => {
     assert.equal(msg.hasField(FIELD.Text), false);
   });
 
-  test('tag validation: sets need a positive integer, reads accept any integer', () => {
+  test('tag validation: every accessor needs a positive integer', () => {
+    // QuickFIX's ordered sorter indexes an array by tag, so a non-positive
+    // tag must be refused on reads too, not just on writes.
     const msg = createMessage();
     assert.throws(() => msg.setField(0, 'x'), TypeError);
     assert.throws(() => msg.setField(1.5, 'x'), TypeError);
     assert.throws(() => msg.setHeaderField(-1, 'x'), TypeError);
-    assert.throws(() => msg.getField(0), isFieldNotFound);
-    assert.throws(() => msg.getField(2000000), isFieldNotFound);
-    assert.equal(msg.hasField(-5), false);
+    assert.throws(() => msg.getField(0), TypeError);
+    assert.throws(() => msg.getField(-1), TypeError);
+    assert.throws(() => msg.hasField(-5), TypeError);
     assert.throws(() => msg.getField(1.5), TypeError);
+    assert.throws(() => msg.getField(2000000), isFieldNotFound);
+    assert.throws(() => msg.groupCount(0), TypeError);
+    assert.throws(() => msg.getGroup(1, -1), TypeError);
+    const g = new Group(FIELD.NoPartyIDs, FIELD.PartyID);
+    assert.throws(() => g.getField(-1), TypeError);
+    assert.throws(() => g.hasField(0), TypeError);
   });
 
-  test('order validation: integers in 1..100000, no non-arrays', () => {
+  test('tag validation: NaN, infinities and out-of-int32 values are rejected before any cast', () => {
+    const msg = createMessage();
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 1e10, -1e10, 2 ** 31]) {
+      assert.throws(() => msg.getField(bad), TypeError, `getField(${bad})`);
+      assert.throws(() => msg.hasField(bad), TypeError, `hasField(${bad})`);
+      assert.throws(() => msg.setField(bad, 'x'), TypeError, `setField(${bad})`);
+      assert.throws(() => msg.getGroup(bad, FIELD.NoPartyIDs), TypeError, `getGroup(${bad})`);
+      assert.throws(() => createMessage(undefined, { order: [bad] }), TypeError, `order [${bad}]`);
+    }
+  });
+
+  test('order validation: distinct integers in 1..100000, no non-arrays', () => {
     assert.throws(() => createMessage(undefined, { order: [0] }), TypeError);
     assert.throws(() => createMessage(undefined, { order: [100001] }), TypeError);
     assert.throws(() => createMessage(undefined, { order: [1.5] }), TypeError);
     assert.throws(() => createMessage(undefined, { order: 'x' as unknown as number[] }), TypeError);
+    // QuickFIX would silently keep the last occurrence; that is refused
+    // rather than guessed.
+    assert.throws(() => createMessage(undefined, { order: [55, 38, 55, 40] }), /lists tag 55 more than once/);
+    assert.throws(
+      () => new Group(FIELD.NoPartyIDs, FIELD.PartyID, [FIELD.PartyID, FIELD.PartyRole, FIELD.PartyID]),
+      /lists tag 448 more than once/,
+    );
+  });
+
+  test('a stray non-string raw argument is a TypeError, not an adopted handle', () => {
+    assert.throws(() => new Message(123 as unknown as string), TypeError);
   });
 
   test('a parsed message keeps repeated flat tags (group parsed without a dictionary)', () => {
@@ -176,6 +206,12 @@ describe('Group', () => {
     assert.throws(() => g.getField(FIELD.PartyID), isFieldNotFound);
     assert.equal(g.hasField(FIELD.PartyID), false);
   });
+
+  test('a wrong-typed countTag fails at construction, not on the first method call', () => {
+    assert.throws(() => new Group('453' as unknown as number, FIELD.PartyID), TypeError);
+    assert.throws(() => new Group(undefined as unknown as number, FIELD.PartyID), TypeError);
+    assert.throws(() => new Group({} as unknown as number, FIELD.PartyID), TypeError);
+  });
 });
 
 describe('Message repeating groups', () => {
@@ -228,6 +264,28 @@ describe('Message repeating groups', () => {
     assert.equal(copy.delimiterTag, FIELD.PartyID);
     copy.setField(FIELD.PartyID, 'A');
     assert.equal(copy.toString(), `448=A${SOH}452=1${SOH}`);
+  });
+
+  test('a nested group keeps its delimiter through every copy, even when the delimiter is not set', () => {
+    // FieldMap's own copy slices nested instances to plain FieldMaps; the
+    // wrapper's copies must not, or the delimiter would be guessed from the
+    // first field (803 here) after the first addGroup/getGroup.
+    const sub = new Group(FIELD.NoPartySubIDs, FIELD.PartySubID).setField(FIELD.PartySubIDType, 1);
+    const emptySub = new Group(FIELD.NoPartySubIDs, FIELD.PartySubID);
+    const party = new Group(FIELD.NoPartyIDs, FIELD.PartyID).setField(FIELD.PartyID, 'A').addGroup(sub).addGroup(emptySub);
+    const msg = createMessage().addGroup(party).addGroup(party);
+
+    for (const n of [1, 2]) {
+      const copy = msg.getGroup(n, FIELD.NoPartyIDs);
+      assert.equal(copy.groupCount(FIELD.NoPartySubIDs), 2);
+      assert.equal(copy.getGroup(1, FIELD.NoPartySubIDs).delimiterTag, FIELD.PartySubID);
+      assert.equal(copy.getGroup(2, FIELD.NoPartySubIDs).delimiterTag, FIELD.PartySubID);
+    }
+    // Two levels of group-to-group copies, then a message-level one.
+    const outer = new Group(FIELD.NoHops, FIELD.HopCompID).addGroup(party);
+    const again = createMessage().addGroup(outer).getGroup(1, FIELD.NoHops).getGroup(1, FIELD.NoPartyIDs);
+    assert.equal(again.getGroup(2, FIELD.NoPartySubIDs).delimiterTag, FIELD.PartySubID);
+    assert.equal(again.getGroup(1, FIELD.NoPartySubIDs).getField(FIELD.PartySubIDType), '1');
   });
 
   test('getGroup returns a copy; editing it does not touch the message', () => {
@@ -335,5 +393,72 @@ describe('Message.parse with a dictionary', () => {
       () => Message.parse(wire(), { dictionary: { nativeHandle: {} } as unknown as DataDictionary }),
       TypeError,
     );
+    assert.throws(
+      () => Message.parse(wire(), { sessionDictionary: { nativeHandle: {} } as unknown as DataDictionary }),
+      TypeError,
+    );
+  });
+
+  test('a custom header field declared by the dictionary is found where the parser put it', () => {
+    // The engine parses with the session dictionary, which places tag 5001
+    // in the header; the wrapper's static header list does not know it.
+    const dictionary = DataDictionary.fromFile(DICT_PATH);
+    const raw = wire().replace(`${SOH}35=D${SOH}`, `${SOH}35=D${SOH}5001=hdr${SOH}`);
+    const parsed = Message.parse(raw, { dictionary });
+    assert.equal(parsed.getHeaderField(5001), 'hdr');
+    assert.equal(parsed.hasField(5001), true);
+    assert.equal(parsed.getField(5001), 'hdr');
+    // Setting it updates the header entry instead of adding a body duplicate.
+    parsed.setField(5001, 'edited');
+    assert.equal(parsed.getHeaderField(5001), 'edited');
+    assert.equal((parsed.toString().match(/5001=/g) ?? []).length, 1);
+    // Still in the header: after the standard header tags, before the body.
+    assert.match(parsed.toString(), new RegExp(`56=T${SOH}5001=edited${SOH}11=ord-1${SOH}`));
+    dictionary.validate(parsed);
+    // A tag that is nowhere yet still goes to the body.
+    assert.equal(parsed.hasField(5002), false);
+    parsed.setField(5002, 'body');
+    assert.match(parsed.toString(), new RegExp(`${SOH}5002=body${SOH}10=`));
+  });
+
+  test('a FIXT 1.1 message parses with a session and an application dictionary, like the engine', () => {
+    const sessionDictionary = DataDictionary.fromFile(
+      fileURLToPath(new URL('./fixtures/fixt11-session.xml', import.meta.url)),
+    );
+    const dictionary = DataDictionary.fromFile(
+      fileURLToPath(new URL('./fixtures/fix50-groups.xml', import.meta.url)),
+    );
+    const raw = createMessage()
+      .setField(FIELD.BeginString, 'FIXT.1.1')
+      .setField(FIELD.MsgType, MsgType.NewOrderSingle)
+      .setField(1128, '9')
+      .setField(FIELD.SenderCompID, 'S')
+      .setField(FIELD.TargetCompID, 'T')
+      .setField(FIELD.MsgSeqNum, 1)
+      .setField(FIELD.SendingTime, '20260101-00:00:00')
+      // ApplExtID is a FIXT header field QuickFIX's static header list does
+      // not know: only the session dictionary can place it in the header.
+      .setHeaderField(1156, '7')
+      .setField(FIELD.ClOrdID, 'ord-1')
+      .setField(FIELD.Side, '1')
+      .setField(FIELD.TransactTime, '20260101-00:00:00')
+      .setField(FIELD.OrdType, '2')
+      .addGroup(new Group(FIELD.NoPartyIDs, FIELD.PartyID).setField(FIELD.PartyID, 'A').setField(FIELD.PartyRole, 1))
+      .addGroup(new Group(FIELD.NoPartyIDs, FIELD.PartyID).setField(FIELD.PartyID, 'B'))
+      .toString();
+
+    const parsed = Message.parse(raw, { sessionDictionary, dictionary });
+    assert.equal(parsed.getHeaderField(1128), '9');
+    assert.equal(parsed.getHeaderField(1156), '7');
+    assert.equal(parsed.getField(1156), '7');
+    assert.equal(parsed.groupCount(FIELD.NoPartyIDs), 2);
+    assert.equal(parsed.getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyRole), '1');
+    assert.equal(parsed.getGroup(2, FIELD.NoPartyIDs).getField(FIELD.PartyID), 'B');
+
+    // The application dictionary alone has no header section, so the FIXT
+    // header field falls into the body.
+    const appOnly = Message.parse(raw, { dictionary });
+    assert.throws(() => appOnly.getHeaderField(1156), isFieldNotFound);
+    assert.equal(appOnly.getField(1156), '7');
   });
 });

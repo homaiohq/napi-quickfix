@@ -30,6 +30,7 @@ class AcceptorWrap : public Napi::ObjectWrap<AcceptorWrap> {
   Napi::Value IsLoggedOn(const Napi::CallbackInfo& info);
   Napi::Value Ref(const Napi::CallbackInfo& info);
   Napi::Value Unref(const Napi::CallbackInfo& info);
+  Napi::Value SetCallbackEnabled(const Napi::CallbackInfo& info);
 
   void Teardown(bool force);
 

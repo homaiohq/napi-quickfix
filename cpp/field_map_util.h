@@ -12,6 +12,7 @@
 
 #include <napi.h>
 
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -25,25 +26,28 @@ namespace napi_quickfix {
 // exceed a few tens of thousands.
 constexpr int kMaxOrderTag = 100000;
 
-// Coerce a JS arg to a FIX tag: any int32 integer. Unknown tags surface as
-// FieldNotFound from QuickFIX on reads, as in the C++ API.
-inline int CoerceTag(Napi::Env env, Napi::Value v) {
+// Coerce a JS number to an int32. The finiteness and range checks run BEFORE
+// the cast: converting NaN, an infinity or a value outside int range to int
+// is undefined behaviour in C++, so the cast must never see them.
+inline int CoerceInt32(Napi::Env env, Napi::Value v, const char* what) {
   if (!v.IsNumber()) {
-    throw Napi::TypeError::New(env, "field tag must be a number");
+    throw Napi::TypeError::New(env, std::string(what) + " must be a number");
   }
   const double d = v.As<Napi::Number>().DoubleValue();
-  if (d != static_cast<double>(static_cast<int>(d)) || d < -2147483648.0 ||
-      d > 2147483647.0) {
-    throw Napi::TypeError::New(env, "field tag must be an integer");
+  if (!std::isfinite(d) || d < -2147483648.0 || d > 2147483647.0 ||
+      d != std::trunc(d)) {
+    throw Napi::TypeError::New(env, std::string(what) + " must be an integer");
   }
   return static_cast<int>(d);
 }
 
-// Coerce a JS arg to a tag being SET. Like CoerceTag but positive: QuickFIX's
-// ordered sorter indexes its array by tag, so a non-positive tag must never
-// enter a map that may carry an explicit order.
-inline int CoerceSetTag(Napi::Env env, Napi::Value v) {
-  const int tag = CoerceTag(env, v);
+// Coerce a JS arg to a FIX tag: a positive integer, on reads as well as on
+// writes. QuickFIX's ordered sorter (`group_order::compare`) indexes a flat
+// array by tag with no lower-bound check, so a non-positive tag must never
+// reach a lookup on a map that may carry an explicit order. An unknown
+// positive tag surfaces as FieldNotFound from QuickFIX, as in the C++ API.
+inline int CoerceTag(Napi::Env env, Napi::Value v) {
+  const int tag = CoerceInt32(env, v, "field tag");
   if (tag < 1) {
     throw Napi::TypeError::New(env, "field tag must be a positive integer");
   }
@@ -51,17 +55,10 @@ inline int CoerceSetTag(Napi::Env env, Napi::Value v) {
 }
 
 // Coerce a JS arg to a 1-based group instance index. Must be an integer; an
-// out-of-range value is left to QuickFIX, which reports FieldNotFound.
+// out-of-range value is left to QuickFIX, which reports FieldNotFound (its
+// group lookup goes through a std::map, not the sorter).
 inline int CoerceGroupIndex(Napi::Env env, Napi::Value v) {
-  if (!v.IsNumber()) {
-    throw Napi::TypeError::New(env, "group index must be a number");
-  }
-  const double d = v.As<Napi::Number>().DoubleValue();
-  if (d != static_cast<double>(static_cast<int>(d)) || d < -2147483648.0 ||
-      d > 2147483647.0) {
-    throw Napi::TypeError::New(env, "group index must be an integer");
-  }
-  return static_cast<int>(d);
+  return CoerceInt32(env, v, "group index");
 }
 
 // Coerce a JS arg to a FIX field value string. Accepts string or number
@@ -72,7 +69,8 @@ inline std::string CoerceValue(Napi::Env env, Napi::Value v) {
   }
   if (v.IsNumber()) {
     double d = v.As<Napi::Number>().DoubleValue();
-    if (d == static_cast<double>(static_cast<long long>(d))) {
+    if (std::isfinite(d) && d >= -9007199254740992.0 &&
+        d <= 9007199254740992.0 && d == std::trunc(d)) {
       return std::to_string(static_cast<long long>(d));
     }
     return std::to_string(d);
@@ -81,7 +79,9 @@ inline std::string CoerceValue(Napi::Env env, Napi::Value v) {
 }
 
 // Coerce an optional JS `order` argument (undefined/null = none) to a list of
-// distinct tags in [1, kMaxOrderTag]. Throws TypeError otherwise.
+// distinct tags in [1, kMaxOrderTag]. A repeated tag is a TypeError: QuickFIX's
+// own setOrder would silently keep the LAST occurrence, which is almost
+// certainly not what the caller meant, so neither semantics is guessed.
 inline std::vector<int> CoerceOrder(Napi::Env env, Napi::Value v,
                                     const char* argName) {
   std::vector<int> order;
@@ -94,17 +94,20 @@ inline std::vector<int> CoerceOrder(Napi::Env env, Napi::Value v,
   }
   Napi::Array arr = v.As<Napi::Array>();
   for (uint32_t i = 0; i < arr.Length(); i++) {
-    const int tag = CoerceTag(env, arr.Get(i));
+    const int tag = CoerceInt32(env, arr.Get(i), "field tag");
     if (tag < 1 || tag > kMaxOrderTag) {
       throw Napi::TypeError::New(
           env, std::string(argName) + " tags must be integers between 1 and " +
                    std::to_string(kMaxOrderTag));
     }
-    bool seen = false;
     for (int t : order) {
-      if (t == tag) seen = true;
+      if (t == tag) {
+        throw Napi::TypeError::New(
+            env, std::string(argName) + " lists tag " + std::to_string(tag) +
+                     " more than once");
+      }
     }
-    if (!seen) order.push_back(tag);
+    order.push_back(tag);
   }
   return order;
 }

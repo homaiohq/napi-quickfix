@@ -4,37 +4,13 @@
 #include <string>
 #include <utility>
 
+#include "field_map_ops.h"
 #include "message_wrap.h"
 #include "session_id_wrap.h"
 
 namespace napi_quickfix {
 
 namespace {
-
-// Map a CallType to the JS handler property name.
-const char* HandlerName(ApplicationBridge::CallType type) {
-  switch (type) {
-    case ApplicationBridge::CallType::kOnCreate: return "onCreate";
-    case ApplicationBridge::CallType::kOnLogon: return "onLogon";
-    case ApplicationBridge::CallType::kOnLogout: return "onLogout";
-    case ApplicationBridge::CallType::kToAdmin: return "toAdmin";
-    case ApplicationBridge::CallType::kToApp: return "toApp";
-    case ApplicationBridge::CallType::kFromAdmin: return "fromAdmin";
-    case ApplicationBridge::CallType::kFromApp: return "fromApp";
-  }
-  return "";
-}
-
-bool IsMessageBearing(ApplicationBridge::CallType type) {
-  switch (type) {
-    case ApplicationBridge::CallType::kOnCreate:
-    case ApplicationBridge::CallType::kOnLogon:
-    case ApplicationBridge::CallType::kOnLogout:
-      return false;
-    default:
-      return true;
-  }
-}
 
 // Mutating (outbound) callbacks: the JS handler may edit the message.
 bool IsMutating(ApplicationBridge::CallType type) {
@@ -44,9 +20,42 @@ bool IsMutating(ApplicationBridge::CallType type) {
 
 }  // namespace
 
+const char* ApplicationBridge::HandlerName(CallType type) {
+  switch (type) {
+    case CallType::kOnCreate: return "onCreate";
+    case CallType::kOnLogon: return "onLogon";
+    case CallType::kOnLogout: return "onLogout";
+    case CallType::kToAdmin: return "toAdmin";
+    case CallType::kToApp: return "toApp";
+    case CallType::kFromAdmin: return "fromAdmin";
+    case CallType::kFromApp: return "fromApp";
+  }
+  return "";
+}
+
+bool ApplicationBridge::CallTypeFromName(const std::string& name,
+                                         CallType& out) {
+  for (int i = 0; i < kCallTypeCount; i++) {
+    const auto type = static_cast<CallType>(i);
+    if (name == HandlerName(type)) {
+      out = type;
+      return true;
+    }
+  }
+  return false;
+}
+
 ApplicationBridge::ApplicationBridge(Napi::Env env, Napi::Object handlers) {
   if (!handlers.IsEmpty() && handlers.IsObject()) {
     handlers_ = Napi::Persistent(handlers);
+  }
+  // Forward only the callbacks that have a handler function. The names are
+  // fixed, so this is decided here rather than on every callback.
+  for (int i = 0; i < kCallTypeCount; i++) {
+    const auto type = static_cast<CallType>(i);
+    const bool present = !handlers_.IsEmpty() &&
+                         handlers.Get(HandlerName(type)).IsFunction();
+    enabled_[i].store(present, std::memory_order_release);
   }
 
   // Create the TSFN. No JS callback (the trampoline is the CallJs template
@@ -94,6 +103,10 @@ void ApplicationBridge::Abort() {
     released_ = true;
     tsfn_.Abort();
   }
+}
+
+void ApplicationBridge::SetCallbackEnabled(CallType type, bool enabled) {
+  enabled_[static_cast<int>(type)].store(enabled, std::memory_order_release);
 }
 
 void ApplicationBridge::Deactivate() {
@@ -150,7 +163,8 @@ void ApplicationBridge::Unref(Napi::Env env) {
 void ApplicationBridge::FireAndForget(CallType type, const FIX::SessionID& id) {
   // Bridge is releasing/aborting (possibly during finalize where the TSFN is
   // being destroyed): don't touch the TSFN. Fire-and-forget just drops.
-  if (inactive_.load(std::memory_order_acquire)) {
+  // Nothing registered for this callback: nothing to deliver.
+  if (inactive_.load(std::memory_order_acquire) || !IsEnabled(type)) {
     return;
   }
   auto* data = new CallData();
@@ -170,8 +184,9 @@ ApplicationBridge::Result ApplicationBridge::CallSync(CallType type,
   // Bridge is releasing/aborting: never call into the TSFN (its internals may be
   // torn down during finalize -> calling would abort the process). Return an
   // empty pass-through result so the QuickFIX thread proceeds without mutation
-  // or thrown exception.
-  if (inactive_.load(std::memory_order_acquire)) {
+  // or thrown exception. Same when nothing is registered for this callback:
+  // no copy, no round trip.
+  if (inactive_.load(std::memory_order_acquire) || !IsEnabled(type)) {
     Result r;
     return r;
   }
@@ -182,7 +197,8 @@ ApplicationBridge::Result ApplicationBridge::CallSync(CallType type,
   auto* data = new CallData();
   data->type = type;
   data->sessionID = id;
-  data->message = message;  // deep copy: fields, groups and field order
+  // Deep copy: fields, groups (keeping their delimiters) and field order.
+  CopyMessage(data->message, message);
   data->hasMessage = true;
   data->channel = channel;  // shared: trampoline gets its own owning copy
 
@@ -320,6 +336,12 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
     }
   }
 
+  if (handler.IsEmpty()) {
+    // No handler for this callback (the forwarding switch is normally off in
+    // that case, but the handlers object is the authority): pass-through.
+    return;
+  }
+
   // Build the JS arguments: (message?, sessionID).
   Napi::Object sessionIdObj = SessionIDWrap::NewInstance(env, data->sessionID);
 
@@ -330,11 +352,6 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
     // with the session dictionary and the sender's body order stay intact.
     msgObj = MessageWrap::NewInstance(env, std::move(data->message));
     haveMsg = true;
-  }
-
-  if (handler.IsEmpty()) {
-    // No handler for this callback: pass-through (no mutation, no throw).
-    return;
   }
 
   try {
@@ -368,7 +385,9 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
   if (isSync && IsMutating(data->type) && haveMsg && !guard.result.threw) {
     try {
       MessageWrap* w = Napi::ObjectWrap<MessageWrap>::Unwrap(msgObj);
-      guard.result.editedMessage = w->Message();  // copy: JS may keep using its object
+      // Copy: JS may keep using its object. Group instances stay typed so
+      // the engine serialises exactly what the handler built.
+      CopyMessage(guard.result.editedMessage, w->Message());
       guard.result.mutated = true;
     } catch (...) {
       guard.result.mutated = false;

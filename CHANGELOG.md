@@ -22,7 +22,13 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   are written in that sequence, any other tag after them numerically. Without it the
   body sorts numerically, as before.
 - `Message.parse` / `new Message(raw, opts)` accept a `dictionary` option so repeating
-  groups in a raw string are parsed as groups instead of flat repeated tags.
+  groups in a raw string are parsed as groups instead of flat repeated tags, and a
+  `sessionDictionary` option for FIXT 1.1 / FIX 5.x strings, whose header and trailer
+  live in a separate dictionary (`FIXT11.xml`) as the engine uses it.
+- The engine only forwards a callback to JS while a handler or an event listener
+  exists for it. Without one the QuickFIX thread returns pass-through immediately,
+  without copying the message or waiting on the event loop, so a session that only
+  handles `fromApp` pays nothing for its heartbeats and test requests.
 
 ### Changed
 
@@ -31,9 +37,18 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   therefore parsed as groups: a tag that lives inside a group (e.g. `PartyID` on an
   ExecutionReport) is read with `getGroup`, and `getField` on it throws
   `FieldNotFound` where the flat re-parse used to return the last occurrence.
-- Tags passed to any accessor must be integers (`TypeError` otherwise); set paths and
-  the `Group` constructor additionally require them to be positive. Tags in an `order`
-  must lie in `1..100000`.
+- Tags passed to any accessor, reads included, must be positive integers (`TypeError`
+  otherwise): QuickFIX's ordered sorter indexes an array by tag, so a negative tag
+  looked up on a map with an explicit order read out of bounds. Tags in an `order` must
+  be distinct and lie in `1..100000`; a repeated tag is a `TypeError` instead of
+  silently keeping one occurrence.
+- `getField` / `setField` / `hasField` also find a non-standard tag that the message
+  already holds in its header or trailer, such as a custom header field declared by
+  the session's dictionary. Before, such a field was parsed into the header by the
+  engine but looked up in the body by the wrapper.
+- `new Group(countTag, ...)` and `new Message(raw)` throw a `TypeError` for a
+  wrong-typed first argument instead of adopting it as a native handle and failing on
+  the first method call.
 
 ### Fixed
 
@@ -41,6 +56,10 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   instead of wire strings. With a `toApp`/`toAdmin` handler registered, an outbound
   message was re-parsed from its string without the session dictionary, which flattened
   every repeating group and re-sorted the body before it was sent.
+- A nested group's delimiter survives every copy. QuickFIX's `FieldMap` copy slices
+  nested instances to plain field maps, so `getGroup` on a copied group (after
+  `addGroup`, inside a handler, or after `sendToTarget`) guessed the delimiter from
+  the first field; the wrapper now clones instances as `FIX::Group` objects.
 - CMake re-scans `cpp/*.cpp` on every build (`CONFIGURE_DEPENDS`), so a new source file
   is linked without a manual reconfigure.
 
