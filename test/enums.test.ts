@@ -6,6 +6,28 @@ import { FIELD, MsgType, Side, enums } from '../dist/esm/index.js';
 describe('enums', () => {
   test('FIELD maps names to tag numbers', () => {
     assert.equal(FIELD.MsgType, 35);
+    assert.equal(FIELD.Username, 553);
+    assert.equal(FIELD.Password, 554);
+  });
+
+  test('FIELD covers the full QuickFIX FixFieldNumbers.h table', () => {
+    // v1.16.0 declares 6107 names; a future QuickFIX may add more, never fewer.
+    const names = Object.keys(FIELD);
+    assert.ok(names.length >= 6107, `expected >= 6107 field names, got ${names.length}`);
+    // Aliases: several tags carry more than one name across FIX versions.
+    assert.equal(FIELD.NoUsernames, 809);
+    assert.equal(FIELD.EncryptedPassword, 1402);
+    for (const name of names) {
+      assert.equal(typeof FIELD[name as keyof typeof FIELD], 'number');
+    }
+  });
+
+  test('FIELD values are typed as literals', () => {
+    // Type-level: a literal `554`, not `number`.
+    const tag: 554 = FIELD.Password;
+    assert.equal(tag, 554);
+    // @ts-expect-error — a misspelt field name is a compile error.
+    assert.equal(FIELD.Pasword, undefined);
   });
 
   test('MsgType values match the FIX spec', () => {

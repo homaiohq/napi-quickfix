@@ -26,7 +26,7 @@ export type { QuickFixError } from './native.js';
 
 // --- Enums / constants ----------------------------------------------------
 export { enums, FIELD, MsgType, Side } from './enums.js';
-export type { Enums, EnumGroup } from './enums.js';
+export type { Enums, EnumGroup, FieldName } from './enums.js';
 
 /**
  * Send a message to the target session identified by `sessionID`.

@@ -9,6 +9,27 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
+### Added
+
+- `FIELD` now covers every field in the bundled QuickFIX (generated from
+  `FixFieldNumbers.h`, 6000+ names) instead of a hand-picked subset of 28. Entries
+  are typed as number literals, so `FIELD.Password` is `554` and a misspelt name is
+  a compile error. New `FieldName` type export.
+- `@homaiohq/napi-quickfix/fields` subpath export: the `FIELD` table without loading
+  the native addon. The package declares `sideEffects`, so bundlers can drop it.
+- `yarn gen:fields` / `yarn gen:fields:check` regenerate and verify the table.
+
+### Changed
+
+- `FIELD` is a literal-typed object rather than `Record<string, number>`; indexing it
+  with an arbitrary `string` is now a type error. `enums.FIELD` moved from the native
+  addon to the generated table.
+
+### Fixed
+
+- The README `toAdmin` example used `FIELD.Username` / `FIELD.Password`, which were
+  `undefined` at runtime; both now resolve.
+
 ## [0.1.0] - Unreleased
 
 Initial release.

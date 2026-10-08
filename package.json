@@ -22,8 +22,22 @@
         "default": "./dist/cjs/index.js"
       }
     },
+    "./fields": {
+      "import": {
+        "types": "./dist/esm/generated/fields.d.ts",
+        "default": "./dist/esm/generated/fields.js"
+      },
+      "require": {
+        "types": "./dist/cjs/generated/fields.d.ts",
+        "default": "./dist/cjs/generated/fields.js"
+      }
+    },
     "./package.json": "./package.json"
   },
+  "sideEffects": [
+    "./dist/*/native.js",
+    "./dist/*/load-native.cjs"
+  ],
   "files": [
     "dist/",
     "prebuilds/",
@@ -38,8 +52,11 @@
     "build:ts:cjs": "tsc -p tsconfig.cjs.json",
     "build:ts:copy": "node -e \"const fs=require('node:fs');for(const d of ['dist/esm','dist/cjs']){fs.mkdirSync(d,{recursive:true});fs.copyFileSync('src/load-native.cjs',d+'/load-native.cjs');}fs.writeFileSync('dist/cjs/package.json',JSON.stringify({type:'commonjs'})+'\\n');\"",
     "build:ts": "yarn build:ts:esm && yarn build:ts:cjs && yarn build:ts:copy",
+    "gen:fields": "node scripts/gen-fields.mjs",
+    "gen:fields:check": "node scripts/gen-fields.mjs --check",
     "build": "yarn build:native && yarn build:ts",
     "test": "node --test --import tsx test/*.test.ts",
+    "typecheck": "tsc -p test/tsconfig.json",
     "prebuild": "node scripts/prebuild.mjs",
     "install": "node-gyp-build || cmake-js compile --CDCMAKE_BUILD_TYPE=Release --CDCMAKE_POLICY_VERSION_MINIMUM=3.5",
     "clean": "node -e \"const fs=require('node:fs');for(const d of ['dist','build']){fs.rmSync(d,{recursive:true,force:true});}\""

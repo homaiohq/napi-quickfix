@@ -299,10 +299,23 @@ Recognized kinds: `'DoNotSend'`, `'RejectLogon'`, `'UnsupportedMessageType'`,
 sendToTarget(message: Message, sessionID: SessionID): boolean;
 version(): string;               // engine / addon version string
 
-FIELD    // field-name -> tag number, e.g. FIELD.MsgType === 35
+FIELD    // field-name -> tag number, e.g. FIELD.MsgType === 35, FIELD.Password === 554
 MsgType  // MsgType values, e.g. MsgType.Logon === 'A'
 Side     // Side values, e.g. Side.Buy === '1'
 enums    // the full frozen tree of FIX constants
+```
+
+`FIELD` is generated from the bundled QuickFIX's `FixFieldNumbers.h`, so it has every
+`FIX::FIELD::*` name the engine knows (6000+). Values are literal types: `FIELD.Password`
+is typed `554`, and a misspelt field name is a compile error. `FieldName` is the union of
+all field names.
+
+The table is also exposed as a subpath export that does **not** load the native addon,
+for tooling that only needs tag numbers (log parsers, test helpers, bundles for platforms
+without a prebuild):
+
+```ts
+import { FIELD } from '@homaiohq/napi-quickfix/fields';
 ```
 
 ### Errors

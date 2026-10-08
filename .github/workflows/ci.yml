@@ -85,9 +85,19 @@ jobs:
       - name: Build
         run: yarn build
 
+      # The typed FIELD table (src/generated/fields.ts) is checked in; verify it still
+      # matches the FixFieldNumbers.h that FetchContent just fetched at the pinned tag.
+      - name: Check generated FIELD table
+        run: yarn gen:fields:check
+
       # Runs node --test with tsx; requires the native + TS build above.
       - name: Test
         run: yarn test
+
+      # tsx strips types without checking them, so type-level assertions in the
+      # tests (literal FIELD tags, @ts-expect-error) only bite here.
+      - name: Type-check tests
+        run: yarn typecheck
 
   # ---------------------------------------------------------------------------
   # Linux / musl (Alpine) build + test.
@@ -174,3 +184,6 @@ jobs:
 
       - name: Test
         run: yarn test
+
+      - name: Type-check tests
+        run: yarn typecheck
