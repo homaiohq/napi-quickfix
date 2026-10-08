@@ -9,34 +9,20 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
-### Added
+## [0.1.0] - 2026-10-08
 
-- `FIELD` now covers every field in the bundled QuickFIX (generated from
-  `FixFieldNumbers.h`, 6000+ names) instead of a hand-picked subset of 28. Entries
-  are typed as number literals, so `FIELD.Password` is `554` and a misspelt name is
-  a compile error. New `FieldName` type export.
+Initial release. Bundles **QuickFIX v1.16.0** (statically linked).
+
+- Node-API (N-API v9) C++ binding for the QuickFIX FIX-protocol engine: the session
+  engine (`Initiator` / `Acceptor` with synchronous application handlers) and the pure
+  layer (`Message`, `SessionSettings`, `DataDictionary`, `SessionID`).
+- Prebuilt binaries for Linux x64 (glibc and musl/Alpine), macOS x64 + arm64, and
+  Windows x64; other platforms build from source at install time.
+- `FIELD` covers every field in the bundled QuickFIX (generated from
+  `FixFieldNumbers.h`, 6000+ names), typed as number literals so a misspelt name is a
+  compile error. `FieldName` type export.
 - `@homaiohq/napi-quickfix/fields` subpath export: the `FIELD` table without loading
   the native addon. The package declares `sideEffects`, so bundlers can drop it.
-- `yarn gen:fields` / `yarn gen:fields:check` regenerate and verify the table.
-
-### Changed
-
-- `FIELD` is a literal-typed object rather than `Record<string, number>`; indexing it
-  with an arbitrary `string` is now a type error. `enums.FIELD` moved from the native
-  addon to the generated table.
-
-### Fixed
-
-- The README `toAdmin` example used `FIELD.Username` / `FIELD.Password`, which were
-  `undefined` at runtime; both now resolve.
-
-## [0.1.0] - Unreleased
-
-Initial release.
-
-- Node-API (N-API v9) C++ binding for the QuickFIX FIX-protocol engine.
-- Prebuilt binaries for Linux, macOS, and Windows (x64, arm64).
-- Bundles **QuickFIX v1.16.0** (statically linked).
 - Sub-second timestamp resolution is platform-dependent: microseconds on Linux
   (glibc **and** musl) and macOS, milliseconds on Windows, where QuickFIX has no
   microsecond clock available. A `TimestampPrecision=6` session on Windows therefore
