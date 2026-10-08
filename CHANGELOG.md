@@ -25,6 +25,11 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   `headerFields()` / `trailerFields()` on `Message`) and `[Symbol.iterator]`.
 - `DataDictionary.validate(msg, bodyOnly?)`, and the introspection methods
   `getVersion`, `getFieldName`, `getFieldTag`, `isField`, `isMsgType`.
+- Argument validation on the field and group methods: a tag passed to a setter
+  (and a `Group` count tag / delimiter / order entry) must be a positive integer,
+  a tag passed to a reader and a group index must be an integer. Anything else
+  throws a `TypeError` instead of being silently truncated (`1.5` → `1`,
+  `NaN` → `0`) or emitted on the wire (`setField(0, 'x')` → `0=x`).
 
 ### Fixed
 

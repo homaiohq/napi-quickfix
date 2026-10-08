@@ -223,6 +223,7 @@ message.fields(): [tag: number, value: string][];   // body fields in wire order
 message.headerFields(); message.trailerFields();    // same shape
 message.isEmpty(): boolean;  message.totalFields(): number;  message.clear(): this;
 
+// Tags must be integers (positive for setters) and group indices integers: anything else throws a TypeError.
 // Repeating groups (indices are 1-based, as in QuickFIX)
 message.addGroup(group: Group): this;               // appends a copy, maintains the count field
 message.getGroup(index: number, tag: number): Group; // snapshot copy; throws FieldNotFound if absent

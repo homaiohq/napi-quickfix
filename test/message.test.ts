@@ -193,6 +193,22 @@ describe('Message field-map API', () => {
     assert.equal(msg.isSetField(FIELD.MsgType), false, 'header removal is routed too');
   });
 
+  test('tag validation: sets need a positive integer, reads accept any integer', () => {
+    const msg = createMessage();
+    assert.throws(() => msg.setField(0, 'x'), TypeError);
+    assert.throws(() => msg.setField(1.5, 'x'), TypeError);
+    assert.throws(() => msg.setHeaderField(-1, 'x'), TypeError);
+    assert.throws(() => msg.setTrailerField(Number.NaN, 'x'), TypeError);
+    assert.equal(msg.isEmpty(), true);
+    assert.deepEqual(msg.headerFields(), []);
+
+    assert.throws(() => msg.getField(0), isFieldNotFound);
+    assert.throws(() => msg.getField(2000000), isFieldNotFound);
+    assert.equal(msg.isSetField(-5), false);
+    assert.throws(() => msg.getField(1.5), TypeError);
+    assert.throws(() => msg.getHeaderField('35' as unknown as number), TypeError);
+  });
+
   test('isEmpty / totalFields / fields / iteration / headerFields / trailerFields / clear', () => {
     const msg = createMessage();
     assert.equal(msg.isEmpty(), true);
@@ -251,6 +267,31 @@ describe('Message repeating groups', () => {
     assert.equal(msg.isSetField(FIELD.NoPartyIDs), false, 'the count field goes with the last entry');
   });
 
+  test('header groups (NoHops) route to the header, like header fields', () => {
+    const hop = (id: string) => new Group(FIELD.NoHops, FIELD.HopCompID).setField(FIELD.HopCompID, id);
+    const msg = newOrderSingle().addGroup(hop('HOP-1')).addGroup(hop('HOP-2'));
+    assert.equal(msg.groupCount(FIELD.NoHops), 2);
+    assert.equal(msg.hasGroup(FIELD.NoHops), true);
+    assert.equal(msg.getHeaderField(FIELD.NoHops), '2', 'the count field lives in the header');
+    assert.equal(msg.getField(FIELD.NoHops), '2', 'and auto-routes');
+    assert.equal(msg.getGroup(2, FIELD.NoHops).getField(FIELD.HopCompID), 'HOP-2');
+    assert.deepEqual(msg.fields().map(([tag]) => tag).includes(FIELD.NoHops), false, 'not a body field');
+    assert.ok(
+      msg.toString().includes(`${SOH}56=T${SOH}627=2${SOH}628=HOP-1${SOH}628=HOP-2${SOH}11=order-1${SOH}`),
+      `expected the hops after the header fields, got ${msg.toPretty()}`,
+    );
+    msg.removeGroup(FIELD.NoHops);
+    assert.equal(msg.isSetField(FIELD.NoHops), false);
+  });
+
+  test('addGroup / replaceGroup reject anything that is not a Group', () => {
+    const msg = newOrderSingle().addGroup(party('A', 1));
+    assert.throws(() => msg.addGroup({} as unknown as Group), TypeError);
+    assert.throws(() => msg.addGroup({ field: 453, delim: 448 } as unknown as Group), TypeError);
+    assert.throws(() => msg.replaceGroup(1, {} as unknown as Group), TypeError);
+    assert.equal(msg.groupCount(FIELD.NoPartyIDs), 1);
+  });
+
   test('getGroup on a missing group throws QuickFixError FieldNotFound', () => {
     const msg = newOrderSingle();
     assert.throws(() => msg.getGroup(1, FIELD.NoPartyIDs), isFieldNotFound, 'no such group');
@@ -294,6 +335,44 @@ describe('Message repeating groups', () => {
     assert.equal(parsed.getField(FIELD.Symbol), 'AAPL', 'plain fields still readable');
   });
 
+  test('parse with a dictionary re-emits entries in dictionary order, whatever the wire order', () => {
+    const dd = loadFix44Mini();
+    // Built with an explicit order that puts PartyRole before PartyIDSource,
+    // the opposite of the dictionary (448, 447, 452, then the sub group).
+    const raw = newOrderSingle()
+      .addGroup(
+        new Group(FIELD.NoPartyIDs, FIELD.PartyID, [448, 452, 447])
+          .setField(FIELD.PartyID, 'A')
+          .setField(FIELD.PartyRole, 1)
+          .setField(FIELD.PartyIDSource, 'D')
+          .addGroup(new Group(FIELD.NoPartySubIDs, FIELD.PartySubID).setField(FIELD.PartySubID, 'sub')),
+      )
+      .addGroup(new Group(FIELD.NoPartyIDs, FIELD.PartyID).setField(FIELD.PartyID, 'B'))
+      .toString();
+    assert.ok(raw.includes(`448=A${SOH}452=1${SOH}447=D${SOH}802=1${SOH}`), 'the wire has the custom order');
+
+    const parsed = Message.parse(raw, { dictionary: dd });
+    assert.ok(
+      parsed.toString().includes(`${SOH}453=2${SOH}448=A${SOH}447=D${SOH}452=1${SOH}802=1${SOH}523=sub${SOH}448=B${SOH}10=`),
+      `expected dictionary order, got ${parsed.toPretty()}`,
+    );
+    assert.deepEqual(parsed.getGroup(1, FIELD.NoPartyIDs).fields(), [
+      [448, 'A'],
+      [447, 'D'],
+      [452, '1'],
+      [802, '1'],
+    ]);
+
+    // A snapshot of a parsed entry keeps the dictionary order for fields added
+    // afterwards, so it can be edited and written back without reordering.
+    const b = parsed.getGroup(2, FIELD.NoPartyIDs).setField(FIELD.PartyRole, 7).setField(FIELD.PartyIDSource, 'D');
+    assert.equal(b.delim, FIELD.PartyID);
+    assert.equal(b.toString(), `448=B${SOH}447=D${SOH}452=7${SOH}`);
+    parsed.replaceGroup(2, b);
+    assert.ok(parsed.toString().includes(`448=B${SOH}447=D${SOH}452=7${SOH}10=`));
+    assert.doesNotThrow(() => dd.validate(parsed));
+  });
+
   test('parse with a session/application dictionary pair (and validate: true)', () => {
     const dd = loadFix44Mini();
     const raw = newOrderSingle().addGroup(party('A', 1)).toString();
@@ -315,5 +394,17 @@ describe('Message repeating groups', () => {
     assert.equal(flat.isSetField(FIELD.PartyID), true, 'group fields are plain body fields');
     assert.equal(flat.getField(FIELD.Symbol), 'AAPL');
     assert.throws(() => flat.getGroup(1, FIELD.NoPartyIDs), isFieldNotFound);
+
+    // The repeated tags are all kept (QuickFIX keeps duplicates on a flat
+    // parse) and survive an edit + re-serialisation, sorted by tag number.
+    const tags = flat.fields().map(([tag]) => tag);
+    assert.deepEqual(
+      tags.filter((t) => t === FIELD.PartyID),
+      [448, 448],
+      'both PartyIDs are there',
+    );
+    assert.equal(flat.totalFields(), 5 + 1 + 6, 'the same number of fields as the structured message');
+    const out = flat.setField(FIELD.Text, 'hi').toString();
+    assert.ok(out.includes(`447=D${SOH}448=A${SOH}448=B${SOH}452=1${SOH}452=11${SOH}453=2${SOH}`), `got ${flat.toPretty()}`);
   });
 });

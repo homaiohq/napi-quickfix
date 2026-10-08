@@ -302,6 +302,7 @@ TargetCompID=GRP-SERVER
       interface Seen {
         partyCount: number;
         parties: { id: string; role: string; subIDs: string[] }[];
+        text: string | undefined;
         raw: string;
       }
       const snapshot = (msg: Message): Seen => {
@@ -315,7 +316,7 @@ TargetCompID=GRP-SERVER
           }
           parties.push({ id: p.getField(FIELD.PartyID), role: p.getField(FIELD.PartyRole), subIDs });
         }
-        return { partyCount, parties, raw: msg.toString() };
+        return { partyCount, parties, text: msg.getFieldIfSet(FIELD.Text), raw: msg.toString() };
       };
 
       // The acceptor's handler and event see the inbound message with groups.
@@ -334,7 +335,8 @@ TargetCompID=GRP-SERVER
       acc.on('fromApp', (msg) => eventSeen.push(snapshot(msg)));
 
       // The initiator's toApp sees the OUTBOUND message with groups and may
-      // mutate it: a party added here must reach the acceptor.
+      // mutate it: a party added here and a plain field set here must both
+      // reach the acceptor.
       const outbound: Seen[] = [];
       const ini = new Initiator({
         settings: SessionSettings.fromString(initiatorCfg),
@@ -343,7 +345,7 @@ TargetCompID=GRP-SERVER
         handlers: {
           toApp(msg) {
             outbound.push(snapshot(msg));
-            msg.addGroup(party('ADDED-IN-TOAPP', 3));
+            msg.addGroup(party('ADDED-IN-TOAPP', 3)).setField(FIELD.Text, 'edited-in-toApp');
           },
         },
       });
@@ -380,18 +382,21 @@ TargetCompID=GRP-SERVER
         }
         assert.equal(received.length, 1, 'acceptor fromApp should have received the order');
 
-        // Outbound: toApp saw the two parties we built, structurally.
+        // Outbound: toApp saw the two parties we built, structurally, and no
+        // Text yet.
         assert.equal(outbound.length, 1);
         assert.equal(outbound[0].partyCount, 2);
         assert.deepEqual(
           outbound[0].parties.map((p) => p.id),
           ['TRADER-1', 'FIRM-7'],
         );
+        assert.equal(outbound[0].text, undefined);
 
         // Inbound: the acceptor sees all three parties (two built + one added
         // in toApp), each with its fields and the nested sub-ID group.
         const seen = received[0];
         assert.equal(seen.partyCount, 3);
+        assert.equal(seen.text, 'edited-in-toApp', 'the plain-field edit in toApp reached the wire too');
         assert.deepEqual(seen.parties, [
           { id: 'TRADER-1', role: '11', subIDs: [] },
           { id: 'FIRM-7', role: '1', subIDs: ['desk-7'] },

@@ -18,6 +18,7 @@
 #include <napi.h>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -33,20 +34,53 @@ namespace fieldmap {
 
 inline bool IsNullish(Napi::Value v) { return v.IsUndefined() || v.IsNull(); }
 
-inline int CoerceTag(Napi::Env env, Napi::Value v) {
+// A JS number that is an integer within int range (no NaN, no fraction), as
+// an int. Int32Value() would silently truncate 1.5 to 1 and NaN to 0.
+inline bool ToInteger(Napi::Value v, int& out) {
   if (!v.IsNumber()) {
-    throw Napi::TypeError::New(env, "field tag must be a number");
+    return false;
   }
-  return v.As<Napi::Number>().Int32Value();
+  const double d = v.As<Napi::Number>().DoubleValue();
+  if (!(d >= std::numeric_limits<int>::min() &&
+        d <= std::numeric_limits<int>::max())) {
+    return false;  // NaN, infinities and out-of-range values all land here
+  }
+  const int i = static_cast<int>(d);
+  if (static_cast<double>(i) != d) {
+    return false;
+  }
+  out = i;
+  return true;
 }
 
-// Group index (1-based). Range errors are left to QuickFIX, which throws
-// FieldNotFound for an index that does not exist.
-inline int CoerceIndex(Napi::Env env, Napi::Value v) {
-  if (!v.IsNumber()) {
-    throw Napi::TypeError::New(env, "group index must be a number");
+// A field tag for reads (getField, isSetField, ...): any integer. A tag that
+// no message can hold (0, negative) simply reads as absent / FieldNotFound.
+inline int CoerceTag(Napi::Env env, Napi::Value v) {
+  int tag;
+  if (!ToInteger(v, tag)) {
+    throw Napi::TypeError::New(env, "field tag must be an integer");
   }
-  return v.As<Napi::Number>().Int32Value();
+  return tag;
+}
+
+// A field tag for writes (setField): a positive integer, since QuickFIX would
+// happily emit "0=x" or "-1=x" on the wire.
+inline int CoerceSetTag(Napi::Env env, Napi::Value v) {
+  int tag;
+  if (!ToInteger(v, tag) || tag <= 0) {
+    throw Napi::TypeError::New(env, "field tag must be a positive integer");
+  }
+  return tag;
+}
+
+// Group index (1-based): an integer. Range errors are left to QuickFIX, which
+// throws FieldNotFound for an index that does not exist.
+inline int CoerceIndex(Napi::Env env, Napi::Value v) {
+  int index;
+  if (!ToInteger(v, index)) {
+    throw Napi::TypeError::New(env, "group index must be an integer");
+  }
+  return index;
 }
 
 // Coerce a JS arg to a FIX field value string. Accepts string or number
@@ -67,11 +101,12 @@ inline std::string CoerceValue(Napi::Env env, Napi::Value v) {
 
 // --- group snapshots --------------------------------------------------------
 
-// The delimiter of a stored group entry. QuickFIX stores entries as plain
-// FieldMaps (addGroup copies and slices), so the delimiter is recovered from
-// the entry itself: the dynamic type when it survived (entries QuickFIX parsed
-// with a dictionary are FIX::Group), otherwise the first field — which is the
-// delimiter by definition, since every group order sorts it first.
+// The delimiter of a stored group entry. Entries are stored as FIX::Group
+// (both the ones QuickFIX parses with a dictionary and the ones AddGroup below
+// stores), so the dynamic type normally carries it. The fallback covers a
+// plain-FieldMap entry (e.g. one QuickFIX copied with FieldMap::addGroup):
+// its first field, which is the delimiter by definition since every group
+// order sorts it first.
 inline int DelimOf(const FIX::FieldMap& stored) {
   if (const auto* g = dynamic_cast<const FIX::Group*>(&stored)) {
     return g->delim();
@@ -116,7 +151,7 @@ Napi::Value GetField(const Napi::CallbackInfo& info, Select select) {
 template <class Select>
 Napi::Value SetField(const Napi::CallbackInfo& info, Select select) {
   Napi::Env env = info.Env();
-  int tag = CoerceTag(env, info[0]);
+  int tag = CoerceSetTag(env, info[0]);
   std::string value = CoerceValue(env, info[1]);
   NQ_TRY(env) {
     select(tag).setField(tag, value);
@@ -160,14 +195,16 @@ Napi::Value GetFieldIfSet(const Napi::CallbackInfo& info, Select select) {
 // --- repeating-group ops (tag-routed) ---------------------------------------
 
 // addGroup(group: Group): appends a COPY of `group` under its own count tag and
-// bumps the count field.
+// bumps the count field. FieldMap::addGroup would slice the copy to a plain
+// FieldMap; storing a FIX::Group keeps the delimiter (see DelimOf). The map
+// takes ownership of the pointer.
 template <class Select>
 Napi::Value AddGroup(const Napi::CallbackInfo& info, Select select) {
   Napi::Env env = info.Env();
   GroupWrap* group = GroupWrap::UnwrapArg(env, info[0], "group");
   NQ_TRY(env) {
     int tag = group->Group().field();
-    select(tag).addGroup(tag, group->Group());
+    select(tag).addGroupPtr(tag, new FIX::Group(group->Group()), true);
   } NQ_CATCH(env)
   return env.Undefined();
 }
@@ -205,18 +242,34 @@ Napi::Value ReplaceGroup(const Napi::CallbackInfo& info, Select select) {
   return env.Undefined();
 }
 
+// The `(tag)` / `(index, tag)` argument shapes of removeGroup and hasGroup.
+// Coercion happens outside NQ_TRY so a TypeError stays a TypeError (NQ_CATCH
+// would translate it into a plain Error).
+struct IndexAndTag {
+  bool hasIndex;
+  int index;
+  int tag;
+};
+
+inline IndexAndTag CoerceIndexAndTag(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 2 || IsNullish(info[1])) {
+    return {false, 0, CoerceTag(env, info[0])};
+  }
+  int index = CoerceIndex(env, info[0]);
+  return {true, index, CoerceTag(env, info[1])};
+}
+
 // removeGroup(tag) | removeGroup(index, tag). No-op when absent (as QuickFIX).
 template <class Select>
 Napi::Value RemoveGroup(const Napi::CallbackInfo& info, Select select) {
   Napi::Env env = info.Env();
+  const IndexAndTag args = CoerceIndexAndTag(info);
   NQ_TRY(env) {
-    if (info.Length() < 2 || IsNullish(info[1])) {
-      int tag = CoerceTag(env, info[0]);
-      select(tag).removeGroup(tag);
+    if (args.hasIndex) {
+      select(args.tag).removeGroup(args.index, args.tag);
     } else {
-      int index = CoerceIndex(env, info[0]);
-      int tag = CoerceTag(env, info[1]);
-      select(tag).removeGroup(index, tag);
+      select(args.tag).removeGroup(args.tag);
     }
   } NQ_CATCH(env)
   return env.Undefined();
@@ -226,14 +279,11 @@ Napi::Value RemoveGroup(const Napi::CallbackInfo& info, Select select) {
 template <class Select>
 Napi::Value HasGroup(const Napi::CallbackInfo& info, Select select) {
   Napi::Env env = info.Env();
+  const IndexAndTag args = CoerceIndexAndTag(info);
   NQ_TRY(env) {
-    if (info.Length() < 2 || IsNullish(info[1])) {
-      int tag = CoerceTag(env, info[0]);
-      return Napi::Boolean::New(env, select(tag).hasGroup(tag));
-    }
-    int index = CoerceIndex(env, info[0]);
-    int tag = CoerceTag(env, info[1]);
-    return Napi::Boolean::New(env, select(tag).hasGroup(index, tag));
+    const FIX::FieldMap& map = select(args.tag);
+    return Napi::Boolean::New(
+        env, args.hasIndex ? map.hasGroup(args.index, args.tag) : map.hasGroup(args.tag));
   } NQ_CATCH(env)
 }
 
