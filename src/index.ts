@@ -25,8 +25,11 @@ export type { ApplicationHandlers, FixRejectKind } from './application.js';
 export type { QuickFixError } from './native.js';
 
 // --- Enums / constants ----------------------------------------------------
-export { enums, FIELD, MsgType, Side } from './enums.js';
-export type { Enums, EnumGroup, FieldName } from './enums.js';
+// Every other value group (ExecType, OrdStatus, SecurityType, ...) is reachable
+// as `enums.<Field>` / `VALUES.<Field>`, or by name from the
+// `@homaiohq/napi-quickfix/values` subpath, which keeps this namespace small.
+export { enums, FIELD, VALUES, MsgType, Side, OrdType, TimeInForce } from './enums.js';
+export type { Enums, EnumGroup, FieldName, ValueGroups, ValueGroupName } from './enums.js';
 
 /**
  * Send a message to the target session identified by `sessionID`.

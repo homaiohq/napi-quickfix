@@ -40,6 +40,16 @@
         "default": "./dist/cjs/generated/fields.js"
       }
     },
+    "./values": {
+      "import": {
+        "types": "./dist/esm/generated/values.d.ts",
+        "default": "./dist/esm/generated/values.js"
+      },
+      "require": {
+        "types": "./dist/cjs/generated/values.d.ts",
+        "default": "./dist/cjs/generated/values.js"
+      }
+    },
     "./package.json": "./package.json"
   },
   "sideEffects": [
@@ -62,6 +72,8 @@
     "build:ts": "yarn build:ts:esm && yarn build:ts:cjs && yarn build:ts:copy",
     "gen:fields": "node scripts/gen-fields.mjs",
     "gen:fields:check": "node scripts/gen-fields.mjs --check",
+    "gen:values": "node scripts/gen-values.mjs",
+    "gen:values:check": "node scripts/gen-values.mjs --check",
     "build": "yarn build:native && yarn build:ts",
     "test": "node --test --import tsx test/*.test.ts",
     "typecheck": "tsc -p test/tsconfig.json",

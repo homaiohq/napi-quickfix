@@ -28,6 +28,10 @@ included.
 - **Ergonomic, safe API** — chainable message building with automatic
   header/trailer field routing, typed rejections, and C++ exceptions surfaced as
   JavaScript `Error`s.
+- **Every FIX constant, typed** — `FIELD` (tag numbers) and one value group per
+  field (`MsgType`, `Side`, `ExecType`, `OrdStatus`, ... 690 groups) are
+  generated from the bundled QuickFIX headers with literal types, frozen, and
+  importable without loading the native addon.
 
 ## Install
 
@@ -307,10 +311,13 @@ Recognized kinds: `'DoNotSend'`, `'RejectLogon'`, `'UnsupportedMessageType'`,
 sendToTarget(message: Message, sessionID: SessionID): boolean;
 version(): string;               // engine / addon version string
 
-FIELD    // field-name -> tag number, e.g. FIELD.MsgType === 35, FIELD.Password === 554
-MsgType  // MsgType values, e.g. MsgType.Logon === 'A'
-Side     // Side values, e.g. Side.Buy === '1'
-enums    // the full frozen tree of FIX constants
+FIELD        // field-name -> tag number, e.g. FIELD.MsgType === 35, FIELD.Password === 554
+MsgType      // MsgType values, e.g. MsgType.Logon === 'A'
+Side         // Side values, e.g. Side.Buy === '1'
+OrdType      // e.g. OrdType.Limit === '2'
+TimeInForce  // e.g. TimeInForce.Day === '0'
+VALUES       // every value group keyed by field name, e.g. VALUES.ExecType.Fill === '2'
+enums        // the full frozen tree: every value group plus FIELD
 ```
 
 `FIELD` is generated from the bundled QuickFIX's `FixFieldNumbers.h`, so it has every
@@ -318,12 +325,25 @@ enums    // the full frozen tree of FIX constants
 is typed `554`, and a misspelt field name is a compile error. `FieldName` is the union of
 all field names.
 
-The table is also exposed as a subpath export that does **not** load the native addon,
-for tooling that only needs tag numbers (log parsers, test helpers, bundles for platforms
-without a prebuild):
+The value groups are generated the same way from `FixValues.h`: one frozen object per
+field (690 groups, 5700+ values), each value a string because FIX is string-on-the-wire
+(`EncryptMethod.None === '0'`, not `0`). Names derive from QuickFIX's
+`FIX::<Field>_<VALUE>` constants with the SCREAMING_SNAKE suffix turned into PascalCase —
+`Side_SELL_SHORT` → `Side.SellShort`, `ExecType_DONE_FOR_DAY` → `ExecType.DoneForDay` —
+while `MsgType`, whose upstream names already mirror message names, is kept verbatim
+(`MsgType.NewOrderSingle`, `MsgType.IOI`). The exact rule is documented in
+`scripts/gen-values.mjs`. Values are literal types too (`Side.Buy` is typed `'1'`), and
+`ValueGroupName` is the union of all group names.
+
+The root entry exports `MsgType`, `Side`, `OrdType` and `TimeInForce` by name and every
+group through `VALUES` / `enums`. Both tables are also exposed as subpath exports that
+do **not** load the native addon, for tooling that only needs the constants (log
+parsers, test helpers, bundles for platforms without a prebuild); each group is a named
+export there, so bundlers keep only the groups you import:
 
 ```ts
 import { FIELD } from '@homaiohq/napi-quickfix/fields';
+import { ExecType, OrdStatus, SecurityType } from '@homaiohq/napi-quickfix/values';
 ```
 
 ### Errors

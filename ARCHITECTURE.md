@@ -231,9 +231,10 @@ musl entries and link musl objects into a glibc addon.
 | Area | Files |
 | --- | --- |
 | Public TS API | `src/index.ts`, `message.ts`, `session-id.ts`, `session-settings.ts`, `data-dictionary.ts`, `enums.ts` |
+| Generated FIX constants | `scripts/gen-fields.mjs` → `src/generated/fields.ts` (`FIELD`), `scripts/gen-values.mjs` → `src/generated/values.ts` (value groups, `VALUES`) — both from the QuickFIX headers at the pinned tag |
 | Engine + handlers | `src/engine.ts`, `initiator.ts`, `acceptor.ts`, `application.ts` |
 | Native loader | `src/native.ts`, `src/load-native.cjs` |
-| Addon entry / wraps | `cpp/addon.cpp`, `cpp/*_wrap.{h,cpp}`, `cpp/session_static.cpp`, `cpp/enums.cpp` |
+| Addon entry / wraps | `cpp/addon.cpp`, `cpp/*_wrap.{h,cpp}`, `cpp/session_static.cpp` |
 | Bridge / async / errors | `cpp/application_bridge.{h,cpp}`, `cpp/engine_workers.h`, `cpp/errors.h` |
 | Build / dist | `CMakeLists.txt`, `scripts/prebuild.mjs`, `tsconfig.*.json`, `package.json` |
 | Tests | `test/*.test.ts` |

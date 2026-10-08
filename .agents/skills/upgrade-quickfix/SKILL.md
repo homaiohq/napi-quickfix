@@ -89,17 +89,24 @@ Watch the configure step: it should log a git checkout of the **new** tag. If
 the fetch itself fails (bad tag, network), fix that before anything else — the
 tag may not exist or you normalized it wrong.
 
-Once the fetch has landed, regenerate the typed `FIELD` table from the new
-sources and rebuild the TypeScript so the checked-in file tracks the pin:
+Once the fetch has landed, regenerate the typed `FIELD` table and the value
+groups (`MsgType`, `Side`, `ExecType`, ... plus the `VALUES` tree) from the new
+sources and rebuild the TypeScript so the checked-in files track the pin:
 
 ```bash
 yarn gen:fields   # reads build/_deps/quickfix-src/src/C++/FixFieldNumbers.h
+yarn gen:values   # reads build/_deps/quickfix-src/src/C++/FixValues.h
 yarn build:ts
 ```
 
-Inspect `git diff src/generated/fields.ts`. Added names are a feature; a
-**removed or renumbered** name is a breaking change for consumers (they lose a
-`FIELD.X` they may be using) — note it for the Phase 6 classification.
+Inspect `git diff src/generated/fields.ts src/generated/values.ts`. Added names
+are a feature; a **removed or renumbered** field, or a **removed or re-valued**
+value constant, is a breaking change for consumers (they lose a `FIELD.X` or
+`Side.X` they may be using) — note it for the Phase 6 classification. If
+`gen:values` aborts, a new upstream name defeated the naming rule documented at
+the top of `scripts/gen-values.mjs` (a key collision after PascalCase
+conversion, or an invalid identifier); extend the rule deliberately rather than
+hand-editing the generated file.
 
 ## Phase 4 — Fix C++ bridge breakage
 
@@ -213,7 +220,8 @@ Keep the changelog wording and the commit subject consistent. Then summarize:
 
 - QuickFIX: old → new version.
 - Build: clean/failed, and if failed why.
-- `FIELD` table: regenerated; count of names added / removed (removed = breaking).
+- `FIELD` table and value groups: regenerated; count of names added / removed
+  in each (removed = breaking).
 - Tests: pass/fail counts, naming any failures and how you resolved them.
 - C++ bridge changes: file-by-file, each flagged as behavior-preserving or
   behavior-changing.

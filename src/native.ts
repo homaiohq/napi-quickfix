@@ -170,19 +170,17 @@ export interface NativeEngineConstructor {
 }
 
 /**
- * The nested FIX-constants object exported by the addon, e.g.
- * `enums.MsgType.Logon`, `enums.Side.Buy`. Field tags (`FIELD`) are not exported
- * by the addon; they are generated on the TS side (`src/generated/fields.ts`).
+ * The full surface of the native addon exported by `load-native.cjs`.
+ *
+ * FIX constants are not exported by the addon: field tags (`FIELD`) and value
+ * groups (`MsgType`, `Side`, ...) are generated on the TS side from the
+ * QuickFIX headers (`src/generated/fields.ts`, `src/generated/values.ts`).
  */
-export type NativeEnums = Readonly<Record<string, Readonly<Record<string, number | string>>>>;
-
-/** The full surface of the native addon exported by `load-native.cjs`. */
 export interface NativeModule {
   version(): string;
   quickfixParseMsgType(raw: string): string;
   /** Runs off the main thread; resolves `true` if accepted for sending. */
   sendToTarget(message: NativeMessage, sessionID: NativeSessionID): Promise<boolean>;
-  enums: NativeEnums;
 
   MessageWrap: NativeMessageConstructor;
   SessionIDWrap: NativeSessionIDConstructor;
