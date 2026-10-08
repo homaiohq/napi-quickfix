@@ -219,7 +219,9 @@ function render(groups, tag) {
     '// scripts/gen-values.mjs.',
     '//',
     '// Also available as `@homaiohq/napi-quickfix/values`, which does not load the',
-    '// native addon. @__PURE__ lets bundlers drop any group nothing imports.',
+    '// native addon. In the ESM build @__PURE__ lets bundlers drop any group nothing',
+    '// imports; tsc strips the annotation from the CJS build, so `require` consumers',
+    '// get every group.',
     '',
   ];
   for (const { group, members } of groups) {

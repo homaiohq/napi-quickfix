@@ -219,11 +219,19 @@ describe('enums', () => {
       assert.equal(status, 0, `${label}: ${stderr}`);
       assert.deepEqual(JSON.parse(stdout), [], `${label}: native loader was loaded`);
     }
-    // And the built modules carry no import at all, so a bundler cannot pull it in
-    // either.
+    // And the built modules carry no import at all (static, dynamic or `require`), so
+    // a bundler cannot pull it in either. Comment lines are skipped: the generated
+    // banner may legitimately mention `import` in prose.
     for (const built of ['dist/esm/generated/values.js', 'dist/cjs/generated/values.js']) {
-      const js = readFileSync(join(packageRoot, built), 'utf8');
-      assert.doesNotMatch(js, /^\s*(import\b|export\s.*\sfrom\s)|\brequire\(/m, built);
+      const code = readFileSync(join(packageRoot, built), 'utf8')
+        .split('\n')
+        .filter((line) => !/^\s*(\/\/|\/?\*)/.test(line))
+        .join('\n');
+      assert.doesNotMatch(
+        code,
+        /^\s*(import\b|export\s.*\sfrom\s)|\bimport\s*\(|\brequire\s*\(/m,
+        built,
+      );
     }
   });
 

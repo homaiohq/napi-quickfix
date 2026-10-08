@@ -19,7 +19,7 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   lower-casing every word, acronyms included (`SecurityIDSource_ISIN_NUMBER` →
   `SecurityIDSource.IsinNumber`); `MsgType` names are kept verbatim.
 - `@homaiohq/napi-quickfix/values` subpath export: every value group by name, without
-  loading the native addon and tree-shakeable per group.
+  loading the native addon and, in the ESM build, tree-shakeable per group.
 - `OrdType`, `TimeInForce` and `VALUES` as named root exports; `enums` now carries every
   value group next to `FIELD`.
 - `yarn gen:values` / `yarn gen:values:check` regenerate and verify the table, like

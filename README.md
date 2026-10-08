@@ -342,7 +342,9 @@ The root entry exports `MsgType`, `Side`, `OrdType` and `TimeInForce` by name an
 group through `VALUES` / `enums`. Both tables are also exposed as subpath exports that
 do **not** load the native addon, for tooling that only needs the constants (log
 parsers, test helpers, bundles for platforms without a prebuild); each group is a named
-export there, so bundlers keep only the groups you import:
+export there, so bundlers resolving the ESM build keep only the groups you import (the
+CJS build is not tree-shakeable: tsc drops the `@__PURE__` annotations when it emits
+CommonJS):
 
 ```ts
 import { FIELD } from '@homaiohq/napi-quickfix/fields';
