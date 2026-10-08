@@ -3,40 +3,19 @@
 #include <algorithm>
 #include <string>
 
+#include <utility>
+#include <vector>
+
+#include "data_dictionary_wrap.h"
 #include "errors.h"
+#include "field_map_util.h"
+#include "group_wrap.h"
 #include "quickfix/FieldNumbers.h"
+#include "quickfix/MessageSorters.h"
 
 namespace napi_quickfix {
 
 Napi::FunctionReference MessageWrap::constructor_;
-
-namespace {
-
-// Coerce a JS arg to a FIX field value string. Accepts string or number
-// (numbers are stringified without trailing ".0"). Throws TypeError otherwise.
-std::string CoerceValue(Napi::Env env, Napi::Value v) {
-  if (v.IsString()) {
-    return v.As<Napi::String>().Utf8Value();
-  }
-  if (v.IsNumber()) {
-    double d = v.As<Napi::Number>().DoubleValue();
-    // Integers -> plain integer string; otherwise a plain double string.
-    if (d == static_cast<double>(static_cast<long long>(d))) {
-      return std::to_string(static_cast<long long>(d));
-    }
-    return std::to_string(d);
-  }
-  throw Napi::TypeError::New(env, "field value must be a string or number");
-}
-
-int CoerceTag(Napi::Env env, Napi::Value v) {
-  if (!v.IsNumber()) {
-    throw Napi::TypeError::New(env, "field tag must be a number");
-  }
-  return v.As<Napi::Number>().Int32Value();
-}
-
-}  // namespace
 
 Napi::Object MessageWrap::Init(Napi::Env env, Napi::Object exports) {
   Napi::Function func = DefineClass(
@@ -44,6 +23,10 @@ Napi::Object MessageWrap::Init(Napi::Env env, Napi::Object exports) {
       {
           InstanceMethod("getField", &MessageWrap::GetField),
           InstanceMethod("setField", &MessageWrap::SetField),
+          InstanceMethod("hasField", &MessageWrap::HasField),
+          InstanceMethod("addGroup", &MessageWrap::AddGroup),
+          InstanceMethod("getGroup", &MessageWrap::GetGroup),
+          InstanceMethod("groupCount", &MessageWrap::GroupCount),
           InstanceMethod("getHeaderField", &MessageWrap::GetHeaderField),
           InstanceMethod("setHeaderField", &MessageWrap::SetHeaderField),
           InstanceMethod("getTrailerField", &MessageWrap::GetTrailerField),
@@ -60,11 +43,12 @@ Napi::Object MessageWrap::Init(Napi::Env env, Napi::Object exports) {
   return exports;
 }
 
-Napi::Object MessageWrap::NewInstance(Napi::Env env, const FIX::Message& msg) {
-  // Construct an empty MessageWrap then overwrite its FIX::Message with a copy.
+Napi::Object MessageWrap::NewInstance(Napi::Env env, FIX::Message msg) {
+  // Construct an empty MessageWrap then move the FIX::Message in. Callers
+  // that still need their message pass a copy; the bridge moves.
   Napi::Object obj = constructor_.New({});
   MessageWrap* wrap = Napi::ObjectWrap<MessageWrap>::Unwrap(obj);
-  wrap->message_ = msg;
+  wrap->message_ = std::move(msg);
   return obj;
 }
 
@@ -87,16 +71,56 @@ MessageWrap::MessageWrap(const Napi::CallbackInfo& info)
   }
   if (!info[0].IsString()) {
     throw Napi::TypeError::New(
-        env, "new Message(raw: string, validate?: boolean)");
+        env,
+        "new Message(raw: string, validate?: boolean, dictionary?: DataDictionary)");
   }
   const std::string raw = info[0].As<Napi::String>().Utf8Value();
   bool validate = false;
   if (info.Length() >= 2 && !info[1].IsUndefined() && !info[1].IsNull()) {
     validate = info[1].ToBoolean().Value();
   }
+  // With a dictionary QuickFIX recognises repeating groups while parsing, so
+  // they are reachable through getGroup and survive re-serialisation. Without
+  // one every repeated tag lands in the flat body (QuickFIX behaviour).
+  const FIX::DataDictionary* dictionary = nullptr;
+  if (info.Length() >= 3 && !info[2].IsUndefined() && !info[2].IsNull()) {
+    dictionary =
+        &DataDictionaryWrap::UnwrapArg(env, info[2], "dictionary")->Dictionary();
+  }
   NQ_TRY(env) {
-    message_.setString(raw, validate);
+    if (dictionary) {
+      message_.setString(raw, validate, dictionary);
+    } else {
+      message_.setString(raw, validate);
+    }
   } NQ_CATCH(env)
+}
+
+void MessageWrap::EnsureBodyTag(int tag) {
+  if (message_.isSetField(tag)) {
+    return;
+  }
+  int badTag = 0;
+  if (!CanReorder(message_) || !message_.hasValidStructure(badTag)) {
+    // Out-of-range or repeated tags, or a structurally invalid parse: leave
+    // QuickFIX to insert the field under the message's existing order rather
+    // than rebuilding (which would corrupt memory, lose duplicates, or drop
+    // the invalid-structure flag).
+    return;
+  }
+  std::vector<int> order = CurrentTagOrder(message_);
+  order.push_back(tag);
+  FIX::Message fresh(FIX::message_order(FIX::message_order::header),
+                     FIX::message_order(FIX::message_order::trailer),
+                     MakeOrder(order));
+  fresh.clear();  // the order-taking constructor leaves m_tag uninitialised
+  fresh.getHeader() = message_.getHeader();
+  fresh.getTrailer() = message_.getTrailer();
+  CopyContents(message_, static_cast<FIX::FieldMap&>(fresh));
+  // QuickFIX's move-assignment does not free the group instances it replaces;
+  // clear() does.
+  message_.clear();
+  message_ = std::move(fresh);
 }
 
 Napi::Value MessageWrap::GetField(const Napi::CallbackInfo& info) {
@@ -116,7 +140,7 @@ Napi::Value MessageWrap::GetField(const Napi::CallbackInfo& info) {
 
 Napi::Value MessageWrap::SetField(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  int tag = CoerceTag(env, info[0]);
+  int tag = CoerceSetTag(env, info[0]);
   std::string value = CoerceValue(env, info[1]);
   NQ_TRY(env) {
     if (FIX::Message::isHeaderField(tag)) {
@@ -124,10 +148,64 @@ Napi::Value MessageWrap::SetField(const Napi::CallbackInfo& info) {
     } else if (FIX::Message::isTrailerField(tag)) {
       message_.getTrailer().setField(tag, value);
     } else {
+      EnsureBodyTag(tag);
       message_.setField(tag, value);
     }
   } NQ_CATCH(env)
   return env.Undefined();
+}
+
+Napi::Value MessageWrap::HasField(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  int tag = CoerceTag(env, info[0]);
+  const bool set = FIX::Message::isHeaderField(tag)
+                       ? message_.getHeader().isSetField(tag)
+                   : FIX::Message::isTrailerField(tag)
+                       ? message_.getTrailer().isSetField(tag)
+                       : message_.isSetField(tag);
+  return Napi::Boolean::New(env, set);
+}
+
+// Route a group's count tag to the section it belongs to, like setField does
+// for plain fields (NoHops lives in the header, everything else in the body).
+static FIX::FieldMap& SectionFor(FIX::Message& message, int countTag) {
+  if (FIX::Message::isHeaderField(countTag)) return message.getHeader();
+  if (FIX::Message::isTrailerField(countTag)) return message.getTrailer();
+  return message;
+}
+
+Napi::Value MessageWrap::AddGroup(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  GroupWrap* group = GroupWrap::UnwrapArg(env, info[0], "group");
+  group->RequireDelimiter(env);
+  const int countTag = group->Group().field();
+  NQ_TRY(env) {
+    if (&SectionFor(message_, countTag) == &message_) {
+      // The NoXxx count field takes the next slot in the wire order; QuickFIX
+      // then maintains its value as instances are added.
+      EnsureBodyTag(countTag);
+    }
+    SectionFor(message_, countTag).addGroup(countTag, group->Group());
+  } NQ_CATCH(env)
+  return env.Undefined();
+}
+
+Napi::Value MessageWrap::GetGroup(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const int num = CoerceGroupIndex(env, info[0]);
+  const int countTag = CoerceTag(env, info[1]);
+  NQ_TRY(env) {
+    const FIX::FieldMap& instance =
+        SectionFor(message_, countTag).getGroupRef(num, countTag);
+    return GroupWrap::NewInstance(env, countTag, instance);
+  } NQ_CATCH(env)
+}
+
+Napi::Value MessageWrap::GroupCount(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const int countTag = CoerceTag(env, info[0]);
+  return Napi::Number::New(
+      env, static_cast<double>(SectionFor(message_, countTag).groupCount(countTag)));
 }
 
 Napi::Value MessageWrap::GetHeaderField(const Napi::CallbackInfo& info) {
@@ -141,7 +219,7 @@ Napi::Value MessageWrap::GetHeaderField(const Napi::CallbackInfo& info) {
 
 Napi::Value MessageWrap::SetHeaderField(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  int tag = CoerceTag(env, info[0]);
+  int tag = CoerceSetTag(env, info[0]);
   std::string value = CoerceValue(env, info[1]);
   NQ_TRY(env) {
     message_.getHeader().setField(tag, value);
@@ -160,7 +238,7 @@ Napi::Value MessageWrap::GetTrailerField(const Napi::CallbackInfo& info) {
 
 Napi::Value MessageWrap::SetTrailerField(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  int tag = CoerceTag(env, info[0]);
+  int tag = CoerceSetTag(env, info[0]);
   std::string value = CoerceValue(env, info[1]);
   NQ_TRY(env) {
     message_.getTrailer().setField(tag, value);

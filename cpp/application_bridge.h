@@ -46,7 +46,10 @@ class ApplicationBridge : public FIX::Application {
   // Result returned from the JS trampoline for synchronous calls.
   struct Result {
     // For mutating callbacks (toAdmin/toApp), the (possibly edited) message.
-    std::string editedMessage;
+    // Carried as a FIX::Message (deep copy, thread-safe) rather than a wire
+    // string: re-parsing a string without the session dictionary would flatten
+    // repeating groups and re-sort the body numerically.
+    FIX::Message editedMessage;
     bool mutated = false;
     // If the JS handler threw, the FIX exception class name to re-throw
     // (e.g. "DoNotSend", "RejectLogon", "UnsupportedMessageType") and message.
@@ -71,7 +74,7 @@ class ApplicationBridge : public FIX::Application {
   struct CallData {
     CallType type;
     FIX::SessionID sessionID;  // copied by value — safe across threads
-    std::string rawMessage;    // serialized message for message-bearing calls
+    FIX::Message message;      // deep copy, for message-bearing calls
     bool hasMessage = false;
     // For synchronous calls only: shared reply channel (null for fire-and-forget).
     std::shared_ptr<SyncChannel> channel;
@@ -122,7 +125,7 @@ class ApplicationBridge : public FIX::Application {
   // Runs a synchronous call and returns the Result (throwing FIX exception is
   // handled by the caller-side override, which inspects Result).
   Result CallSync(CallType type, const FIX::SessionID& id,
-                  const std::string& raw);
+                  const FIX::Message& message);
 
   Napi::ObjectReference handlers_;
   TSFN tsfn_;

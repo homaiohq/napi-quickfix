@@ -21,6 +21,11 @@ class DataDictionaryWrap : public Napi::ObjectWrap<DataDictionaryWrap> {
   FIX::DataDictionary& Dictionary() { return dict_; }
   const FIX::DataDictionary& Dictionary() const { return dict_; }
 
+  // Unwrap a JS value that must be a DataDictionaryWrap; throws
+  // Napi::TypeError if not.
+  static DataDictionaryWrap* UnwrapArg(Napi::Env env, Napi::Value value,
+                                       const char* argName);
+
  private:
   static Napi::FunctionReference constructor_;
 

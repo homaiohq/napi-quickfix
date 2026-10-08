@@ -85,7 +85,7 @@ string(REPLACE "\n" "" NODE_ADDON_API_DIR ${NODE_ADDON_API_DIR})
 # ---------------------------------------------------------------------------
 # The native addon.
 # ---------------------------------------------------------------------------
-file(GLOB ADDON_SOURCES "${CMAKE_SOURCE_DIR}/cpp/*.cpp")
+file(GLOB ADDON_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/cpp/*.cpp")
 
 add_library(napi_quickfix SHARED ${ADDON_SOURCES} ${CMAKE_JS_SRC})
 set_target_properties(napi_quickfix PROPERTIES PREFIX "" SUFFIX ".node")

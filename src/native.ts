@@ -26,10 +26,15 @@ import nativeModule from './load-native.cjs';
 export interface NativeMessage {
   getField(tag: number): string;
   setField(tag: number, value: string): void;
+  hasField(tag: number): boolean;
   getHeaderField(tag: number): string;
   setHeaderField(tag: number, value: string): void;
   getTrailerField(tag: number): string;
   setTrailerField(tag: number, value: string): void;
+  addGroup(group: NativeGroup): void;
+  /** `index` is 1-based (QuickFIX convention). Throws `FieldNotFound` if absent. */
+  getGroup(index: number, countTag: number): NativeGroup;
+  groupCount(countTag: number): number;
   getMsgType(): string;
   toString(): string;
   toPretty(): string;
@@ -38,7 +43,30 @@ export interface NativeMessage {
 /** Constructor shape for the native `MessageWrap` class. */
 export interface NativeMessageConstructor {
   new (): NativeMessage;
-  new (raw: string, validate?: boolean): NativeMessage;
+  new (raw: string, validate?: boolean, dictionary?: NativeDataDictionary): NativeMessage;
+}
+
+/**
+ * Native `FIX::Group` wrapper: one instance of a repeating group. Field values
+ * cross the boundary as strings, like {@link NativeMessage}.
+ */
+export interface NativeGroup {
+  getField(tag: number): string;
+  setField(tag: number, value: string): void;
+  hasField(tag: number): boolean;
+  addGroup(group: NativeGroup): void;
+  /** `index` is 1-based (QuickFIX convention). Throws `FieldNotFound` if absent. */
+  getGroup(index: number, countTag: number): NativeGroup;
+  groupCount(countTag: number): number;
+  getCountTag(): number;
+  getDelimiterTag(): number;
+  toString(): string;
+  toPretty(): string;
+}
+
+/** Constructor shape for the native `GroupWrap` class. */
+export interface NativeGroupConstructor {
+  new (countTag: number, delimiterTag: number, order?: readonly number[]): NativeGroup;
 }
 
 /** Native `FIX::SessionID` wrapper. */
@@ -185,6 +213,7 @@ export interface NativeModule {
   enums: NativeEnums;
 
   MessageWrap: NativeMessageConstructor;
+  GroupWrap: NativeGroupConstructor;
   SessionIDWrap: NativeSessionIDConstructor;
   SessionSettingsWrap: NativeSessionSettingsConstructor;
   DataDictionaryWrap: NativeDataDictionaryConstructor;

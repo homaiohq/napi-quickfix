@@ -26,6 +26,17 @@ Napi::Object DataDictionaryWrap::Init(Napi::Env env, Napi::Object exports) {
   return exports;
 }
 
+DataDictionaryWrap* DataDictionaryWrap::UnwrapArg(Napi::Env env,
+                                                  Napi::Value value,
+                                                  const char* argName) {
+  if (!value.IsObject() ||
+      !value.As<Napi::Object>().InstanceOf(constructor_.Value())) {
+    throw Napi::TypeError::New(
+        env, std::string(argName) + " must be a DataDictionary instance");
+  }
+  return Napi::ObjectWrap<DataDictionaryWrap>::Unwrap(value.As<Napi::Object>());
+}
+
 // Constructor is internal: (kind: "string"|"file", payload: string).
 DataDictionaryWrap::DataDictionaryWrap(const Napi::CallbackInfo& info)
     : Napi::ObjectWrap<DataDictionaryWrap>(info) {

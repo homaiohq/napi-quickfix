@@ -26,8 +26,10 @@ included.
   synchronous application handlers) *and* the pure layer (`Message`,
   `SessionSettings`, `DataDictionary`, `SessionID`).
 - **Ergonomic, safe API** — chainable message building with automatic
-  header/trailer field routing, typed rejections, and C++ exceptions surfaced as
-  JavaScript `Error`s.
+  header/trailer field routing, repeating groups (`Group`), typed rejections,
+  and C++ exceptions surfaced as JavaScript `Error`s.
+- **Your field order, on the wire** — body and group fields are sent in the
+  order you set them; the library never sorts them numerically.
 
 ## Install
 
@@ -206,20 +208,24 @@ come from `@homaiohq/napi-quickfix`.
 ### Message
 
 ```ts
-new Message(raw?: string, opts?: { validate?: boolean });
-Message.parse(raw: string, opts?: { validate?: boolean }): Message;
+new Message(raw?: string, opts?: { validate?: boolean; dictionary?: DataDictionary });
+Message.parse(raw: string, opts?: { validate?: boolean; dictionary?: DataDictionary }): Message;
 
 message.setField(tag: number, value: string | number): this; // chainable, auto-routes header/trailer fields
 message.getField(tag: number): string;
+message.hasField(tag: number): boolean;
 message.setHeaderField(tag, value): this;   message.getHeaderField(tag): string;
 message.setTrailerField(tag, value): this;  message.getTrailerField(tag): string;
+message.addGroup(group: Group): this;       // append one instance of a repeating group
+message.getGroup(index: number, countTag: number): Group; // 1-based; throws FieldNotFound
+message.groupCount(countTag: number): number;
 message.getMsgType(): string;
 message.toString(): string;   // raw SOH-delimited wire string
 message.toPretty(): string;   // human-readable
 message.toJSON(): { msgType?: string; raw: string };
 
 createMessage(fields?: Record<number, string | number>): Message;
-parseMessage(raw: string, opts?: { validate?: boolean }): Message;
+parseMessage(raw: string, opts?: { validate?: boolean; dictionary?: DataDictionary }): Message;
 ```
 
 Field values are accepted as `string | number` (numbers are stringified) and
@@ -227,6 +233,69 @@ always returned as `string`. Header/trailer fields such as `MsgType`,
 `BeginString`, and `CheckSum` are **automatically routed** to the correct
 section by `setField`, so you rarely need `setHeaderField`/`setTrailerField`
 directly.
+
+**Field order.** Body fields are written in the order you first set them, and
+setting a tag again overwrites it in place. Nothing is sorted numerically, so
+a counterparty that needs one tag before another gets exactly the sequence you
+built. The header keeps the layout FIX requires (`8`, `9`, `35` first) and the
+trailer ends with `10`. Two cases keep QuickFIX's own order instead:
+
+- Messages that come out of a parse (`Message.parse`, inbound engine
+  callbacks) carry the numeric parse order, with groups in the dictionary's
+  field order; a field you set on one afterwards is appended after the
+  existing fields.
+- **Resends.** On a ResendRequest the engine rebuilds the stored messages from
+  the message store, so PossDup copies go out in numeric (or dictionary) order
+  rather than the order the original was built in.
+
+Tags passed to `setField` must be integers in `1..100000` (a `TypeError`
+otherwise); reads accept any integer and report an absent tag as
+`FieldNotFound`.
+
+Pass a `dictionary` when parsing a raw string that contains repeating groups:
+QuickFIX only recognises groups it can look up, and without one every repeated
+tag lands in the flat body (`groupCount` is then `0`). Sessions configured with
+`UseDataDictionary=Y` already hand `fromApp`/`fromAdmin` fully parsed groups.
+
+### Group
+
+```ts
+new Group(countTag: number, delimiterTag: number, order?: readonly number[]);
+
+group.countTag; group.delimiterTag;
+group.setField(tag, value): this;  group.getField(tag): string;  group.hasField(tag): boolean;
+group.addGroup(group: Group): this;                   // nested repeating group
+group.getGroup(index: number, countTag: number): Group;  group.groupCount(countTag): number;
+group.toString(): string;  group.toPretty(): string;  // this instance's fields, in wire order
+```
+
+A repeating group is a count field (`NoXxx`) followed by that many instances,
+each opened by the same delimiter tag. Build a `Group`, set its fields, and
+`addGroup` it to a message, or to a parent group for nesting. `addGroup`
+**copies** the instance, so one object can be reused for several instances,
+and throws if the delimiter field is not set. Fields go on the wire in the
+order you set them, with two exceptions FIX itself imposes: the delimiter
+always comes first, and tags listed in `order` keep that sequence no matter
+when they are set. Header groups such as `NoHops` are routed to the header.
+
+```ts
+import { Group, createMessage, FIELD, MsgType } from '@homaiohq/napi-quickfix';
+
+const order = createMessage()
+  .setField(FIELD.MsgType, MsgType.NewOrderSingle)
+  .setField(FIELD.ClOrdID, 'ord-1')
+  .setField(FIELD.Symbol, 'AAPL');
+
+const party = new Group(FIELD.NoPartyIDs, FIELD.PartyID);
+party.setField(FIELD.PartyID, 'TRADER-1').setField(FIELD.PartyRole, 11);
+order.addGroup(party);
+party.setField(FIELD.PartyID, 'FIRM-1').setField(FIELD.PartyRole, 1);
+order.addGroup(party);
+
+order.toPretty();
+// ...|35=D|11=ord-1|55=AAPL|453=2|448=TRADER-1|452=11|448=FIRM-1|452=1|10=...|
+order.getGroup(2, FIELD.NoPartyIDs).getField(FIELD.PartyID); // 'FIRM-1'
+```
 
 ### SessionID
 

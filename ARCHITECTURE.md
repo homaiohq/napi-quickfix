@@ -125,18 +125,33 @@ sequenceDiagram
 
   Note over QF,JS: synchronous mutate / throw (toAdmin / toApp / fromAdmin / fromApp)
   QF->>BR: toApp(message, sessionID)
-  BR->>TSFN: BlockingCall + SyncChannel(wait)
+  BR->>TSFN: BlockingCall + SyncChannel(wait), deep copy of FIX::Message
   TSFN-->>JS: CallJs trampoline (wrap Message + SessionID)
   JS->>H: handler(msg, sid)
   H-->>JS: mutate msg / throw FixReject
-  JS-->>BR: fulfill SyncChannel (edited raw / error)
-  BR->>QF: re-parse msg or throw FIX exception
+  JS-->>BR: fulfill SyncChannel (edited FIX::Message / error)
+  BR->>QF: assign edited message back or throw FIX exception
 ```
 
 - **Fire-and-forget** callbacks never block the QuickFIX thread.
 - **Synchronous** callbacks (which may mutate the outbound message or throw to reject) use a `BlockingCall` plus a
   shared `SyncChannel` (mutex + condition variable). An RAII guard **always** fulfils the channel — even if the JS
   handler throws — so the QuickFIX thread can never deadlock waiting on it.
+- The message crosses the bridge as a **deep copy of the `FIX::Message`** in both directions, never as a wire
+  string. A string re-parse would need the session's data dictionary to rebuild repeating groups, and would re-sort
+  the body numerically; the copy keeps groups and the sender's field order byte-for-byte.
+
+### Field order
+
+QuickFIX sorts every `FieldMap` with a `message_order` fixed at construction (numeric for a body, dictionary order
+for a group). `MessageWrap` and `GroupWrap` keep **insertion order** instead: before a new tag is set they rebuild
+the map with a `group`-mode order listing the existing tags in their current sequence plus the new one
+(`cpp/field_map_util.h`). Existing tags are overwritten in place. A `Group` always puts its delimiter first and
+honours an optional pinned order given at construction. Messages produced by a parse keep QuickFIX's parse order.
+The rebuild is skipped, leaving QuickFIX's own insertion, when the map cannot be expressed as a tag-keyed order:
+a tag outside `1..100000` (the order array is indexed by tag, so a parsed negative or huge tag would write out of
+bounds or allocate gigabytes), a repeated flat tag (a group parsed without a dictionary; duplicates would collapse),
+or a parse flagged as structurally invalid.
 
 ---
 

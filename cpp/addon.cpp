@@ -13,6 +13,7 @@
 
 #include "acceptor_wrap.h"
 #include "data_dictionary_wrap.h"
+#include "group_wrap.h"
 #include "initiator_wrap.h"
 #include "message_wrap.h"
 #include "session_id_wrap.h"
@@ -60,6 +61,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
               Napi::Function::New(env, QuickfixParseMsgType, "quickfixParseMsgType"));
 
   MessageWrap::Init(env, exports);
+  GroupWrap::Init(env, exports);
   SessionIDWrap::Init(env, exports);
   SessionSettingsWrap::Init(env, exports);
   DataDictionaryWrap::Init(env, exports);

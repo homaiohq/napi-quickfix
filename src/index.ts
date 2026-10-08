@@ -11,6 +11,7 @@ import type { SessionID } from './session-id.js';
 // --- Pure layer -----------------------------------------------------------
 export { Message, createMessage, parseMessage } from './message.js';
 export type { MessageParseOptions, MessageJSON } from './message.js';
+export { Group } from './group.js';
 export { SessionID } from './session-id.js';
 export { SessionSettings } from './session-settings.js';
 export { DataDictionary } from './data-dictionary.js';
