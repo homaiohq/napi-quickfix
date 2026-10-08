@@ -169,7 +169,8 @@ export abstract class Engine extends EventEmitter {
    * With no argument: `true` if **any** of this engine's sessions is logged on.
    * With a {@link SessionID}: `true` only if that session belongs to this engine
    * and is logged on (`false`, not an error, for a foreign id). Always `false`
-   * before {@link Engine.start} and after {@link Engine.stop}.
+   * before {@link Engine.start} and once {@link Engine.stop} has settled; while
+   * a graceful stop is still in progress it reports the live state.
    */
   isLoggedOn(sessionID?: SessionID): boolean {
     return this.#native.isLoggedOn(sessionID?.nativeHandle);
@@ -188,8 +189,9 @@ export abstract class Engine extends EventEmitter {
    * A handle on one of this engine's sessions.
    *
    * @returns The {@link Session}, or `undefined` if `sessionID` is not one of
-   *   this engine's sessions or the engine has been stopped (stopping destroys
-   *   its sessions).
+   *   this engine's sessions or {@link Engine.stop} has settled (that destroys
+   *   its sessions). While a stop is still in progress the sessions are alive,
+   *   so a `'logout'` listener can still read e.g. the final sequence numbers.
    *
    * @example
    * ```ts

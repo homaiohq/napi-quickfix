@@ -197,6 +197,20 @@ as `stop()` settles (all network threads are joined by then) rather than waiting
 `Session` handle fail deterministically after `stop()`, and lets a new engine reuse the same `SessionID`s
 immediately instead of hitting a "Duplicate Session" `ConfigError`.
 
+That eager destruction races with the worker-thread operations above, which hold a raw `FIX::Session*` between
+`lookupSession` and the end of the operation. `session_op_gate.h` closes the race with a process-wide gate:
+`SessionOpWorker` / `SendToTargetWorker` hold a `SessionOpGate::OpScope` for their whole `Execute()`, and the
+engine's stop worker — on its **own** libuv thread, after `stop()` has joined the network threads — calls
+`SessionOpGate::Freeze()`, which blocks new operations and waits for the in-flight ones to drain. Only then does
+`OnOK` destroy the engine on the JS thread and `Unfreeze()`. Waiting on the worker thread rather than in `OnOK`
+matters: an in-flight `reset()` may be blocked in a `toAdmin` `BlockingCall`, which needs the JS loop free. A
+never-started engine takes the same async path on `stop()`, since its sessions are registered from construction.
+The wrap destructor also freezes before destroying the engine, but only after `Teardown()` has deactivated the
+bridge, so no in-flight operation can be waiting on the (blocked) JS thread.
+
+Until `stop()` settles the engine is alive on the JS thread, so `engine.getSession()` / `engine.isLoggedOn(id)`
+keep answering during a graceful stop (a `'logout'` listener can still read the final sequence numbers).
+
 ---
 
 ## 6. Handlers vs. events

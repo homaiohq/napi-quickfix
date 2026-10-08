@@ -10,6 +10,7 @@
 #include "quickfix/Session.h"
 #include "quickfix/SessionID.h"
 #include "session_id_wrap.h"
+#include "session_op_gate.h"
 #include "session_wrap.h"
 
 namespace napi_quickfix {
@@ -29,6 +30,10 @@ namespace {
 // Two upstream overloads are supported: by explicit SessionID, or by qualifier
 // (QuickFIX then resolves the session from the message's own header fields:
 // BeginString / SenderCompID / TargetCompID).
+//
+// Session::sendToTarget looks the session up in the process-wide registry and
+// uses the raw pointer, so Execute() runs under a SessionOpGate::OpScope to
+// keep the owning engine alive until the send has returned.
 class SendToTargetWorker : public Napi::AsyncWorker {
  public:
   SendToTargetWorker(Napi::Env env, FIX::Message message, FIX::SessionID id)
@@ -49,6 +54,7 @@ class SendToTargetWorker : public Napi::AsyncWorker {
 
   // Worker thread. NO Napi/JS access.
   void Execute() override {
+    SessionOpGate::OpScope inflight;
     try {
       result_ = byId_ ? FIX::Session::sendToTarget(message_, id_)
                       : FIX::Session::sendToTarget(message_, qualifier_);

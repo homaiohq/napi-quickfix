@@ -242,6 +242,7 @@ export class Session {
   getLogonTimeout(): number {
     return this.#native.getLogonTimeout();
   }
+  /** @throws {RangeError} if `seconds` is not an integer in the int32 range. */
   setLogonTimeout(seconds: number): void {
     this.#native.setLogonTimeout(seconds);
   }
@@ -250,6 +251,7 @@ export class Session {
   getLogoutTimeout(): number {
     return this.#native.getLogoutTimeout();
   }
+  /** @throws {RangeError} if `seconds` is not an integer in the int32 range. */
   setLogoutTimeout(seconds: number): void {
     this.#native.setLogoutTimeout(seconds);
   }
@@ -258,6 +260,7 @@ export class Session {
   getMaxLatency(): number {
     return this.#native.getMaxLatency();
   }
+  /** @throws {RangeError} if `seconds` is not an integer in the int32 range. */
   setMaxLatency(seconds: number): void {
     this.#native.setMaxLatency(seconds);
   }

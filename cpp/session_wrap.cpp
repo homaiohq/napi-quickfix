@@ -3,6 +3,7 @@
 #include <cmath>
 #include <ctime>
 #include <functional>
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -162,6 +163,10 @@ Napi::Value SessionWrap::BoolSet(const Napi::CallbackInfo& info, Fn fn,
   } NQ_CATCH(env)
 }
 
+// The FIX::Session setters take a plain `int`; a double outside its range is
+// undefined behaviour to cast (and on x86-64 lands on INT_MIN, which would e.g.
+// make a MaxLatency reject every inbound message). Bound it here and report
+// a RangeError, matching SeqNumSet / SetTimestampPrecision.
 template <typename Fn>
 Napi::Value SessionWrap::IntSet(const Napi::CallbackInfo& info, Fn fn,
                                 const char* name) {
@@ -170,9 +175,12 @@ Napi::Value SessionWrap::IntSet(const Napi::CallbackInfo& info, Fn fn,
     throw Napi::TypeError::New(env, std::string(name) + "(value: number)");
   }
   const double raw = info[0].As<Napi::Number>().DoubleValue();
-  if (!std::isfinite(raw) || std::floor(raw) != raw) {
-    throw Napi::TypeError::New(env,
-                               std::string(name) + ": value must be an integer");
+  constexpr double kIntMin = static_cast<double>(std::numeric_limits<int>::min());
+  constexpr double kIntMax = static_cast<double>(std::numeric_limits<int>::max());
+  if (!std::isfinite(raw) || std::floor(raw) != raw || raw < kIntMin ||
+      raw > kIntMax) {
+    throw Napi::RangeError::New(
+        env, std::string(name) + ": value must be an integer in the int32 range");
   }
   NQ_TRY(env) {
     (Resolve().*fn)(static_cast<int>(raw));

@@ -10,6 +10,7 @@
 #include "quickfix/Exceptions.h"
 #include "quickfix/Session.h"
 #include "quickfix/SessionID.h"
+#include "session_op_gate.h"
 
 namespace napi_quickfix {
 
@@ -99,7 +100,9 @@ class EngineOpWorker : public Napi::AsyncWorker {
 //
 // Lifetime: FIX::Session objects are owned by the engine and looked up by value
 // (FIX::SessionID) on the WORKER thread, never cached. A missing session is
-// surfaced as a QuickFixError with fixErrorName 'SessionNotFound'.
+// surfaced as a QuickFixError with fixErrorName 'SessionNotFound'. The lookup
+// and the operation run under a SessionOpGate::OpScope so the owning engine
+// cannot be destroyed (by stop() settling) while the raw pointer is in use.
 class SessionOpWorker : public Napi::AsyncWorker {
  public:
   SessionOpWorker(Napi::Env env, FIX::SessionID id,
@@ -113,6 +116,7 @@ class SessionOpWorker : public Napi::AsyncWorker {
 
   // Worker thread. NO Napi/JS access.
   void Execute() override {
+    SessionOpGate::OpScope inflight;
     try {
       FIX::Session* session = FIX::Session::lookupSession(id_);
       if (session == nullptr) {

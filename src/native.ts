@@ -250,7 +250,7 @@ export interface NativeEngine {
   isLoggedOn(sessionID?: NativeSessionID): boolean;
   /** The SessionIDs this engine was configured with (stable across stop()). */
   getSessions(): NativeSessionID[];
-  /** `undefined` if the id is not one of this engine's sessions or it is stopped. */
+  /** `undefined` if the id is not one of this engine's sessions or stop() has settled. */
   getSession(sessionID: NativeSessionID): NativeSession | undefined;
   ref(): void;
   unref(): void;

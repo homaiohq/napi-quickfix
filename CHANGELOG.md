@@ -71,6 +71,15 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   handles fail deterministically with `SessionNotFound` after `stop()`, and that a new
   `Initiator`/`Acceptor` configured with the same `SessionID`s can be created right after
   stopping the old one (previously a `ConfigError` "Duplicate Session" until GC ran).
+  A session operation still in flight when `stop()` is called (`reset()`,
+  `sendToTarget()`, ...) always completes before the sessions are destroyed, and
+  `engine.getSession()` / `engine.isLoggedOn(id)` keep answering until `stop()` settles
+  (e.g. from a `'logout'` listener fired by a graceful stop). `stop()` on a never-started
+  engine is now asynchronous like every other `stop()`.
+- `Session` int option setters (`setLogonTimeout`, `setLogoutTimeout`, `setMaxLatency`)
+  throw `RangeError` for a non-integer or a value outside the int32 range, consistent
+  with `setNextSenderMsgSeqNum` / `setTimestampPrecision` (previously `TypeError` for a
+  non-integer and undefined behaviour for an out-of-range value).
 
 ## [0.1.0] - 2026-10-08
 

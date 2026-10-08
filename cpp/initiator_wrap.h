@@ -41,6 +41,8 @@ class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap> {
   Napi::Value Unref(const Napi::CallbackInfo& info);
 
   void Teardown(bool force);
+  // Destroy the FIX engine under SessionOpGate::Freeze(); destructor only.
+  void DestroyEngine();
 
   // Declaration order matters: members destruct in REVERSE order, so the
   // initiator (declared last) is destroyed FIRST, before the factories and

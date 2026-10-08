@@ -36,6 +36,8 @@ class AcceptorWrap : public Napi::ObjectWrap<AcceptorWrap> {
   Napi::Value Unref(const Napi::CallbackInfo& info);
 
   void Teardown(bool force);
+  // Destroy the FIX engine under SessionOpGate::Freeze(); destructor only.
+  void DestroyEngine();
 
   // Destruct order: acceptor first (declared last), then log, store, bridge.
   std::unique_ptr<ApplicationBridge> bridge_;

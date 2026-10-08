@@ -287,7 +287,13 @@ describe('Session control over a loopback (in-process)', () => {
         iniSession.setTimestampPrecision(6);
         assert.throws(() => iniSession!.setTimestampPrecision(10), RangeError);
         assert.throws(() => iniSession!.setTimestampPrecision(-1), RangeError);
-        assert.throws(() => iniSession!.setLogonTimeout(1.5), TypeError);
+        // Int options: non-integers and values outside int32 are RangeErrors
+        // (QuickFIX takes a plain `int`), non-numbers are TypeErrors.
+        assert.throws(() => iniSession!.setLogonTimeout(1.5), RangeError);
+        assert.throws(() => iniSession!.setMaxLatency(2 ** 40), RangeError);
+        assert.throws(() => iniSession!.setLogoutTimeout(-(2 ** 31) - 1), RangeError);
+        assert.throws(() => iniSession!.setMaxLatency(Number.NaN), RangeError);
+        assert.throws(() => (iniSession as any).setLogonTimeout('5'), TypeError);
         assert.throws(() => (iniSession as any).setResetOnLogon('yes'), TypeError);
       } finally {
         await ini.stop().catch(() => {});
@@ -317,6 +323,92 @@ describe('Session control over a loopback (in-process)', () => {
       await assert.rejects(() => accSession!.refresh(), isSessionNotFound);
     },
   );
+
+  test('getSession / isLoggedOn stay live while a graceful stop() is in progress', { timeout: 30_000 }, async () => {
+    const port = await freePort();
+    const acc = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
+    const ini = new Initiator({ settings: SessionSettings.fromString(initiatorCfg(port)), store: 'memory', log: 'none' });
+    try {
+      const logons = Promise.all([
+        waitForEvent(acc, 'logon', 'acceptor logon', HANDSHAKE_TIMEOUT_MS),
+        waitForEvent(ini, 'logon', 'initiator logon', HANDSHAKE_TIMEOUT_MS),
+      ]);
+      await acc.start();
+      await ini.start();
+      await logons;
+
+      // A 'logout' listener fired by the graceful stop can still reach the
+      // session (the engine is destroyed only once stop() settles).
+      let seqNumAtLogout: number | undefined;
+      ini.once('logout', (id) => {
+        seqNumAtLogout = ini.getSession(id)?.getExpectedSenderNum();
+      });
+
+      const stopping = ini.stop();
+      // Synchronously after calling stop(): still alive and logged on.
+      assert.ok(ini.getSession(INI_ID), 'getSession() answers while stop() is in progress');
+      assert.equal(ini.isLoggedOn(INI_ID), true, 'isLoggedOn(id) answers while stop() is in progress');
+      assert.equal(ini.isLoggedOn(), true);
+      await stopping;
+
+      assert.equal(typeof seqNumAtLogout, 'number', "the 'logout' listener could read the final seq num");
+      assert.equal(ini.getSession(INI_ID), undefined, 'gone once stop() has settled');
+      assert.equal(ini.isLoggedOn(INI_ID), false);
+      assert.equal(ini.isLoggedOn(), false);
+    } finally {
+      await ini.stop().catch(() => {});
+      await acc.stop().catch(() => {});
+    }
+  });
+
+  test('stop() while session operations are in flight neither crashes nor hangs', { timeout: 30_000 }, async () => {
+    const port = await freePort();
+    const acc = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
+    const ini = new Initiator({ settings: SessionSettings.fromString(initiatorCfg(port)), store: 'memory', log: 'none' });
+    const settles = (p: Promise<unknown>) => p.then(() => 'resolved', (e) => (isSessionNotFound(e), 'rejected'));
+    try {
+      const logons = Promise.all([
+        waitForEvent(acc, 'logon', 'acceptor logon', HANDSHAKE_TIMEOUT_MS),
+        waitForEvent(ini, 'logon', 'initiator logon', HANDSHAKE_TIMEOUT_MS),
+      ]);
+      await acc.start();
+      await ini.start();
+      await logons;
+      const iniSession = lookupSession(INI_ID)!;
+      const accSession = lookupSession(ACC_ID)!;
+
+      // Queue async session ops and a send, then stop WITHOUT awaiting them.
+      // The engine must outlive the ops (they hold raw FIX::Session pointers on
+      // a worker thread); each op then either completes or, if it had not yet
+      // resolved its session when the engine went away, rejects SessionNotFound.
+      const pending = [
+        settles(iniSession.reset()),
+        settles(iniSession.disconnect()),
+        settles(iniSession.refresh()),
+        settles(sendToTarget(newOrder(), INI_ID)),
+        settles(accSession.logout('stopping')),
+      ];
+      await ini.stop();
+      await acc.stop();
+      const outcomes = await Promise.all(pending);
+      assert.equal(outcomes.length, 5);
+      assert.equal(lookupSession(INI_ID), undefined);
+      assert.equal(lookupSession(ACC_ID), undefined);
+    } finally {
+      await ini.stop().catch(() => {});
+      await acc.stop().catch(() => {});
+    }
+
+    // Same race against a never-started engine: its sessions exist from
+    // construction, so a session op can be in flight when stop() destroys them.
+    const idle = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
+    const idleSession = lookupSession(ACC_ID);
+    assert.ok(idleSession);
+    const idleOps = [settles(idleSession.reset()), settles(idleSession.refresh())];
+    await idle.stop();
+    assert.equal((await Promise.all(idleOps)).length, 2);
+    assert.equal(lookupSession(ACC_ID), undefined);
+  });
 
   test('a stopped engine releases its SessionIDs for a new engine', { timeout: 20_000 }, async () => {
     const port = await freePort();
