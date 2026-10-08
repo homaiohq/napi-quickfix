@@ -331,7 +331,10 @@ field (690 groups, 5700+ values), each value a string because FIX is string-on-t
 `FIX::<Field>_<VALUE>` constants with the SCREAMING_SNAKE suffix turned into PascalCase —
 `Side_SELL_SHORT` → `Side.SellShort`, `ExecType_DONE_FOR_DAY` → `ExecType.DoneForDay` —
 while `MsgType`, whose upstream names already mirror message names, is kept verbatim
-(`MsgType.NewOrderSingle`, `MsgType.IOI`). The exact rule is documented in
+(`MsgType.NewOrderSingle`, `MsgType.IOI`). Every word is lower-cased, acronyms included
+(`SecurityIDSource_ISIN_NUMBER` → `SecurityIDSource.IsinNumber`, `MDEntryType_VWAP` →
+`MDEntryType.Vwap`): the upstream names carry no acronym information, so there is no
+allowlist to maintain and the keys are stable. The exact rule is documented in
 `scripts/gen-values.mjs`. Values are literal types too (`Side.Buy` is typed `'1'`), and
 `ValueGroupName` is the union of all group names.
 

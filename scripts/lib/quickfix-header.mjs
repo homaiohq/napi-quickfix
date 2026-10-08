@@ -2,7 +2,9 @@
 // at the pinned tag and write (or `--check`) a generated TypeScript file.
 //
 // Source resolution, in order:
-//   1. `--from <path>`                      an explicit copy of the header
+//   1. `--from <path>`                      an explicit copy of the header; its version
+//                                           is checked against the pin when the path is
+//                                           inside a QuickFIX git checkout, else assumed
 //   2. build/_deps/quickfix-src/src/C++/    the sources CMake FetchContent fetched,
 //                                           only if that checkout is at the pinned tag
 //   3. raw.githubusercontent.com            at the GIT_TAG pinned in CMakeLists.txt
@@ -23,9 +25,10 @@ export function parseArgs(argv = process.argv.slice(2)) {
   let fromPath;
   if (fromIdx >= 0) {
     fromPath = argv[fromIdx + 1];
-    // A `--from` without its path must not quietly fall through to the FetchContent
-    // checkout or GitHub: the operator meant to pin the header to a local copy.
-    if (fromPath === undefined || fromPath.startsWith('--')) {
+    // A `--from` without its path (missing, empty — e.g. an unset shell variable — or
+    // another flag) must not quietly fall through to the FetchContent checkout or
+    // GitHub: the operator meant to pin the header to a local copy.
+    if (!fromPath || fromPath.startsWith('--')) {
       throw new Error('--from requires a path argument');
     }
   }
@@ -39,10 +42,11 @@ export function pinnedTag() {
   return m[1];
 }
 
-// Tag of the FetchContent checkout, or undefined if it cannot be determined.
-function checkoutTag(dir) {
+// Trimmed stdout of `git -C <dir> <args>`, or undefined if git fails (not a checkout,
+// no exact tag, ...).
+function gitOutput(dir, args) {
   try {
-    return execFileSync('git', ['-C', dir, 'describe', '--tags', '--exact-match'], {
+    return execFileSync('git', ['-C', dir, ...args], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
@@ -51,11 +55,42 @@ function checkoutTag(dir) {
   }
 }
 
+// Tag of a git checkout, or undefined if it cannot be determined.
+function checkoutTag(dir) {
+  return gitOutput(dir, ['describe', '--tags', '--exact-match']);
+}
+
+// The generated banner is stamped with the pinned tag, so a `--from` header must hold
+// that version. When the file sits inside a QuickFIX git checkout, compare the
+// checkout's tag with the pin and abort on a mismatch; otherwise there is nothing to
+// compare against, so say so instead of letting the banner claim a version nobody
+// verified.
+function verifyFromTag(file, headerName, tag) {
+  const top = gitOutput(dirname(file), ['rev-parse', '--show-toplevel']);
+  const isQuickfix = top !== undefined && existsSync(join(top, 'src', 'C++', headerName));
+  const fromTag = isQuickfix ? checkoutTag(top) : undefined;
+  if (fromTag === undefined) {
+    console.warn(
+      `--from: cannot tell which QuickFIX version ${file} belongs to; ` +
+        `the generated file will claim the pinned ${tag}`,
+    );
+    return;
+  }
+  if (fromTag !== tag) {
+    throw new Error(
+      `--from: ${file} is from QuickFIX ${fromTag} but CMakeLists.txt pins ${tag}; ` +
+        'move GIT_TAG first so the generated file is stamped with the version it holds',
+    );
+  }
+}
+
 // Load `src/C++/<headerName>` of the pinned QuickFIX: `{ text, origin, tag }`.
 export async function loadHeader(headerName, { fromPath } = {}) {
   const tag = pinnedTag();
   if (fromPath) {
-    return { text: readFileSync(resolve(fromPath), 'utf8'), origin: fromPath, tag };
+    const file = resolve(fromPath);
+    verifyFromTag(file, headerName, tag);
+    return { text: readFileSync(file, 'utf8'), origin: fromPath, tag };
   }
   const fetched = join(FETCHED_DIR, 'src', 'C++', headerName);
   if (existsSync(fetched)) {

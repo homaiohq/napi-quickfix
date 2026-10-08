@@ -8,7 +8,8 @@
 // value is a string (FIX is string-on-the-wire), whatever its C++ declaration.
 //
 // Names derive from `FIX::<Field>_<VALUE>`: SCREAMING_SNAKE suffixes become
-// PascalCase (`Side_SELL_SHORT` → `Side.SellShort`), already mixed-case ones
+// PascalCase with every word lower-cased, acronyms included (`Side_SELL_SHORT`
+// → `Side.SellShort`, `ISIN_NUMBER` → `IsinNumber`), already mixed-case ones
 // (`MsgType_NewOrderSingle`, `MsgType_IOI`) are kept verbatim, and a key that
 // would start with a digit gets a leading underscore. The full rule lives in
 // scripts/gen-values.mjs.

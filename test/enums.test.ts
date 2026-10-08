@@ -21,6 +21,9 @@ import {
   SecurityType,
   EncryptMethod,
   PossDupFlag,
+  SecurityIDSource,
+  MDEntryType,
+  ApplVerID,
   Side as SideFromValues,
   VALUES as ValuesFromSubpath,
 } from '@homaiohq/napi-quickfix/values';
@@ -112,6 +115,12 @@ describe('enums', () => {
     assert.equal(OrdStatus.PartiallyFilled, '1');
     assert.equal(SecurityType.CommonStock, 'CS');
     assert.equal(SecurityType.BankersAcceptance, 'BA');
+    // Acronyms and version tokens are lower-cased like any other word. This is the
+    // permanent rule (see scripts/gen-values.mjs), and these keys are public API.
+    assert.equal(SecurityIDSource.IsinNumber, '4');
+    assert.equal(SecurityIDSource.Cusip, '1');
+    assert.equal(MDEntryType.Vwap, '9');
+    assert.equal(ApplVerID.Fix50Sp2, '9');
     // MsgType is already mixed-case upstream and is kept verbatim, all-caps included.
     assert.equal(MsgType.IOI, '6');
     assert.equal(MsgType.XMLnonFIX, 'n');

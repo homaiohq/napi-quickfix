@@ -19,6 +19,14 @@
 //      split on `_`, lower-case each word, upper-case its first character, join.
 //      `Side_SELL_SHORT` → `SellShort`, `OrdType_LIMIT` → `Limit`,
 //      `EncryptMethod_NONE_OTHER` → `NoneOther`, `YieldType_..._OF32NDS` → `...Of32nds`.
+//      Every word is lower-cased wholesale, acronyms and version tokens included:
+//      `SecurityIDSource_ISIN_NUMBER` → `IsinNumber`, `MDEntryType_VWAP` → `Vwap`,
+//      `ApplVerID_FIX50_SP2` → `Fix50Sp2`. This is deliberate and permanent, not an
+//      oversight to fix later: SCREAMING_SNAKE carries no acronym information, the
+//      header's vocabulary holds hundreds of candidates (ISO, ISIN, CUSIP, VWAP,
+//      LIBOR, OTC, BIC, FX, ...), and any allowlist would be subjective, never
+//      complete, and would make every key hinge on it. Keys are literal types, so
+//      renaming one is a breaking change under VERSIONING.md.
 //      Leading, trailing and repeated underscores are ignored. A lowercase letter in
 //      such a suffix aborts the generator unless the name is listed in
 //      PASCAL_CASE_EXCEPTIONS, so a new mixed-case upstream name is handled
@@ -145,8 +153,16 @@ function groupValues(decls) {
     groups.get(group).push({ suffix, value });
   }
 
+  // Both allowlists must match the header exactly, so a renamed upstream constant or a
+  // misspelt entry is reported here instead of living on as a dead (or useless) entry.
   for (const group of VERBATIM_GROUPS) {
     if (!groups.has(group)) throw new Error(`verbatim group ${group} is missing upstream`);
+  }
+  const names = new Set(decls.map(({ name }) => name));
+  for (const name of PASCAL_CASE_EXCEPTIONS) {
+    if (!names.has(name)) {
+      throw new Error(`PASCAL_CASE_EXCEPTIONS entry ${name} does not match any upstream value`);
+    }
   }
 
   const out = [];
@@ -196,7 +212,8 @@ function render(groups, tag) {
     '// value is a string (FIX is string-on-the-wire), whatever its C++ declaration.',
     '//',
     '// Names derive from `FIX::<Field>_<VALUE>`: SCREAMING_SNAKE suffixes become',
-    '// PascalCase (`Side_SELL_SHORT` → `Side.SellShort`), already mixed-case ones',
+    '// PascalCase with every word lower-cased, acronyms included (`Side_SELL_SHORT`',
+    '// → `Side.SellShort`, `ISIN_NUMBER` → `IsinNumber`), already mixed-case ones',
     '// (`MsgType_NewOrderSingle`, `MsgType_IOI`) are kept verbatim, and a key that',
     '// would start with a digit gets a leading underscore. The full rule lives in',
     '// scripts/gen-values.mjs.',

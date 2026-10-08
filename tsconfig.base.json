@@ -2,8 +2,11 @@
   "compilerOptions": {
     "strict": true,
     "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
+    // No source / declaration maps: `src/` is not published (package.json "files"),
+    // so nothing could resolve them, and they roughly doubled the footprint of the
+    // generated tables (src/generated/*) in dist/.
+    "declarationMap": false,
+    "sourceMap": false,
     "rootDir": "src",
     "target": "ES2022",
     "lib": ["ES2022"],

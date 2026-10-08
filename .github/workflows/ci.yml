@@ -88,12 +88,15 @@ jobs:
       # The typed FIELD table (src/generated/fields.ts) and the value groups
       # (src/generated/values.ts) are checked in; verify they still match the
       # FixFieldNumbers.h / FixValues.h that FetchContent just fetched at the pinned tag.
-      # The generated files are platform-independent, so one matrix entry is enough.
+      # The generated files are platform-independent, so one matrix entry is enough:
+      # the first one (ubuntu-latest with the oldest Node). Keyed on the matrix index
+      # rather than on literal os / node values so that editing the matrix (dropping
+      # an EOL Node line, say) cannot silently disable these checks.
       - name: Check generated FIELD table
-        if: matrix.os == 'ubuntu-latest' && matrix.node-version == '22'
+        if: strategy.job-index == 0
         run: yarn gen:fields:check
       - name: Check generated value groups
-        if: matrix.os == 'ubuntu-latest' && matrix.node-version == '22'
+        if: strategy.job-index == 0
         run: yarn gen:values:check
 
       # Runs node --test with tsx; requires the native + TS build above.
