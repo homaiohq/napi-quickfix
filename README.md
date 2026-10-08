@@ -1,6 +1,6 @@
 # @homaiohq/napi-quickfix
 
-[![CI](https://github.com/homaio/napi-quickfix/actions/workflows/ci.yml/badge.svg)](https://github.com/homaio/napi-quickfix/actions/workflows/ci.yml)
+[![CI](https://github.com/homaiohq/napi-quickfix/actions/workflows/ci.yml/badge.svg)](https://github.com/homaiohq/napi-quickfix/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/@homaiohq/napi-quickfix.svg)](https://www.npmjs.com/package/@homaiohq/napi-quickfix)
 [![Node.js](https://img.shields.io/node/v/@homaiohq/napi-quickfix.svg)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
