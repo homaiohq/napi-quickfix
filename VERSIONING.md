@@ -124,8 +124,11 @@ The `version` field in `package.json` is the single source of truth. The release
    changed).
 3. Commit, then tag `vX.Y.Z` and push the tag.
 4. Pushing the tag triggers `.github/workflows/release.yml`, which builds the
-   multi-platform prebuilds and publishes to npm with provenance. A guard step fails the
-   release if `package.json` and the tag disagree.
+   multi-platform prebuilds and publishes to npm via OIDC Trusted Publishing with
+   automatic provenance (no npm token; see
+   [CONTRIBUTING.md](./CONTRIBUTING.md#release-automation-npm-trusted-publishing)).
+   A guard job fails the release before any prebuild runs if `package.json` and the tag
+   disagree.
 
 ## Promotion to 1.0.0
 

@@ -35,7 +35,7 @@ jobs:
       # Runners ship a CMake + compiler already, but pinning via get-cmake keeps
       # the toolchain version consistent across the matrix.
       - name: Set up CMake
-        uses: lukka/get-cmake@latest
+        uses: lukka/get-cmake@a89e43e22a96abafcd7a62db652a65ecd33052c9 # v4.4.4
 
       - name: Set up Node.js
         uses: actions/setup-node@v7

@@ -1,6 +1,6 @@
 # @homaiohq/napi-quickfix
 
-[![CI](https://github.com/homaio/napi-quickfix/actions/workflows/ci.yml/badge.svg)](https://github.com/homaio/napi-quickfix/actions/workflows/ci.yml)
+[![CI](https://github.com/homaiohq/napi-quickfix/actions/workflows/ci.yml/badge.svg)](https://github.com/homaiohq/napi-quickfix/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/@homaiohq/napi-quickfix.svg)](https://www.npmjs.com/package/@homaiohq/napi-quickfix)
 [![Node.js](https://img.shields.io/node/v/@homaiohq/napi-quickfix.svg)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
@@ -58,6 +58,14 @@ falls back to building from source, which requires:
 
 QuickFIX itself is fetched at build time via CMake `FetchContent` (pinned to
 `v1.16.0`) — nothing is vendored or committed to this repository.
+
+Releases are published from GitHub Actions via npm Trusted Publishing with
+[provenance](https://docs.npmjs.com/generating-provenance-statements), so you can
+check that an installed version was built from this repository:
+
+```sh
+npm audit signatures
+```
 
 ## Quick start
 
