@@ -8,14 +8,20 @@
 // glibc/musl consumers each pick the right binary.
 import { execFileSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
 
-const cmakeJs = process.platform === 'win32' ? 'cmake-js.cmd' : 'cmake-js';
+// Run cmake-js's JS entry point with the current Node binary rather than the
+// `cmake-js` / `cmake-js.cmd` shim from PATH. On Windows the shim is a batch
+// file, and Node refuses to spawn .cmd/.bat files without a shell (EINVAL,
+// CVE-2024-27980 hardening). Resolving the bin script avoids both the shell and
+// any dependence on PATH.
+const cmakeJsBin = createRequire(import.meta.url).resolve('cmake-js/bin/cmake-js');
 
 console.log('> building Release binary with cmake-js');
 execFileSync(
-  cmakeJs,
-  ['compile', '--CDCMAKE_BUILD_TYPE=Release', '--CDCMAKE_POLICY_VERSION_MINIMUM=3.5'],
+  process.execPath,
+  [cmakeJsBin, 'compile', '--CDCMAKE_BUILD_TYPE=Release', '--CDCMAKE_POLICY_VERSION_MINIMUM=3.5'],
   { stdio: 'inherit', cwd: process.cwd() },
 );
 
