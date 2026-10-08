@@ -136,7 +136,9 @@ const fields = parseFields(text);
 const output = render(fields, tag);
 
 if (check) {
-  const current = existsSync(OUT) ? readFileSync(OUT, 'utf8') : '';
+  // Compare with line endings normalised: a Windows checkout with core.autocrlf
+  // hands us CRLF while the generator renders LF.
+  const current = existsSync(OUT) ? readFileSync(OUT, 'utf8').replace(/\r\n/g, '\n') : '';
   if (current !== output) {
     console.error(`${OUT} is stale (source: ${origin}); run \`yarn gen:fields\``);
     process.exit(1);
