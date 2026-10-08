@@ -323,6 +323,11 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
 
   Napi::Object msgObj;
   bool haveMsg = false;
+  // The message as JS first sees it. Comparing against it after the handler
+  // tells a real edit apart from a pass-through. The re-parse above has no
+  // dictionary and flattens repeating groups, so writing an unedited message
+  // back would reorder its groups on the wire.
+  std::string beforeHandler;
   if (data->hasMessage) {
     FIX::Message msg;
     try {
@@ -330,6 +335,7 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
     } catch (...) {
       // Leave msg default-constructed if parse fails; still hand it to JS.
     }
+    beforeHandler = msg.toString();
     msgObj = MessageWrap::NewInstance(env, msg);
     haveMsg = true;
   }
@@ -370,8 +376,11 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
   if (isSync && IsMutating(data->type) && haveMsg && !guard.result.threw) {
     try {
       MessageWrap* w = Napi::ObjectWrap<MessageWrap>::Unwrap(msgObj);
-      guard.result.editedMessage = w->Message().toString();
-      guard.result.mutated = true;
+      std::string after = w->Message().toString();
+      if (after != beforeHandler) {
+        guard.result.editedMessage = std::move(after);
+        guard.result.mutated = true;
+      }
     } catch (...) {
       guard.result.mutated = false;
     }

@@ -9,6 +9,23 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
+### Added
+
+- `Message.addGroup(countTag, entry)` appends one repeating-group entry, for example
+  `NoMDEntryTypes` or `NoRelatedSym` on a MarketDataRequest. Entry fields keep the
+  given order and QuickFIX sets the count tag. Before this, `setField` overwrote a
+  repeated tag and the body was sorted by tag number, so a valid group could not be
+  sent. Nested groups are not supported yet, and a `toApp`/`toAdmin` handler that
+  edits a message still flattens its groups.
+
+### Fixed
+
+- Outbound application messages were always re-parsed after `toApp`, even with no
+  `toApp` handler or one that only read the message. The re-parse has no data
+  dictionary, so it sorted the body by tag number and broke repeating groups on the
+  wire (TT rejected a MarketDataRequest with "Tag55/Symbol missing/misplaced"). The
+  bridge now writes a message back only when a `toApp`/`toAdmin` handler changed it.
+
 ## [0.1.0] - Unreleased
 
 Initial release.

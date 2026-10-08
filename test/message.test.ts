@@ -144,3 +144,65 @@ describe('Message', () => {
     assert.ok(json.raw.includes(SOH));
   });
 });
+
+describe('Message.addGroup', () => {
+  // Body section of the wire string, '|'-delimited, without 8/9/35/10.
+  const body = (msg: Message) =>
+    msg
+      .toString()
+      .split(SOH)
+      .filter((f) => f && !/^(8|9|35|10)=/.test(f))
+      .join('|');
+
+  test('keeps every entry and writes them after the count tag, in the given order', () => {
+    const msg = new Message()
+      .setField(FIELD.MsgType, MsgType.MarketDataRequest ?? 'V')
+      .setField(262, 'md-1')
+      .setField(263, '1')
+      .addGroup(267, [[269, '0']])
+      .addGroup(267, [[269, '1']])
+      .addGroup(146, [
+        [55, 'SEME'],
+        [48, 'DE000A1DKQ99'],
+        [22, '4'],
+      ]);
+
+    // 55/48/22 follow 146 in insertion order, not sorted by tag number.
+    assert.equal(
+      body(msg),
+      '146=1|55=SEME|48=DE000A1DKQ99|22=4|262=md-1|263=1|267=2|269=0|269=1',
+    );
+  });
+
+  test('sets the count tag to the number of entries added', () => {
+    const msg = new Message()
+      .addGroup(146, [[55, 'A']])
+      .addGroup(146, [[55, 'B']])
+      .addGroup(146, [[55, 'C']]);
+    assert.equal(msg.getField(146), '3');
+    assert.equal(body(msg), '146=3|55=A|55=B|55=C');
+  });
+
+  test('is chainable and coerces numeric values', () => {
+    const msg = new Message();
+    const ret = msg.addGroup(267, [[269, 2]]);
+    assert.equal(ret, msg);
+    assert.equal(body(msg), '267=1|269=2');
+  });
+
+  test('keeps working alongside setField on the same message', () => {
+    const msg = new Message().addGroup(146, [[55, 'A']]).setField(55, 'TOP');
+    assert.equal(msg.getField(55), 'TOP');
+    assert.equal(body(msg), '55=TOP|146=1|55=A');
+  });
+
+  test('rejects malformed entries with a TypeError', () => {
+    const msg = new Message();
+    assert.throws(() => msg.addGroup(146, []), TypeError);
+    assert.throws(() => msg.addGroup(146, [[55, 'A'], [55, 'B']]), TypeError);
+    // @ts-expect-error -- deliberately not a [tag, value] pair
+    assert.throws(() => msg.addGroup(146, [[55]]), TypeError);
+    // @ts-expect-error -- deliberately not an array
+    assert.throws(() => msg.addGroup(146, 'nope'), TypeError);
+  });
+});

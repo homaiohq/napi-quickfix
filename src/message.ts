@@ -102,6 +102,33 @@ export class Message {
   }
 
   /**
+   * Append one entry to a repeating group. Call once per entry.
+   *
+   * Fields are written in the order given, and the first tag is the group's
+   * delimiter. QuickFIX sets the count tag (`countTag`) to the number of
+   * entries added so far. Unlike {@link setField}, this keeps every entry and
+   * writes them right after the count tag on the wire.
+   *
+   * Entries are a list of `[tag, value]` pairs rather than an object, because
+   * JS iterates integer object keys in ascending order and would reorder them.
+   *
+   * Nested groups are not supported.
+   *
+   * @example
+   * ```ts
+   * // NoMDEntryTypes (267) with MDEntryType (269) bid and ask, then
+   * // NoRelatedSym (146) with Symbol (55) and SecurityExchange (207).
+   * msg.addGroup(267, [[269, '0']])
+   *    .addGroup(267, [[269, '1']])
+   *    .addGroup(146, [[55, 'ESZ6'], [207, 'CME']]);
+   * ```
+   */
+  addGroup(countTag: number, entry: ReadonlyArray<readonly [number, string | number]>): this {
+    this.#native.addGroup(countTag, entry);
+    return this;
+  }
+
+  /**
    * Read a header field by tag.
    * @throws A `QuickFixError` (`fixError: 'FieldNotFound'`) if absent.
    */

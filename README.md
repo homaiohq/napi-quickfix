@@ -85,6 +85,17 @@ const order = new Message()
 console.log(order.getMsgType()); // 'D'
 console.log(order.toPretty());
 
+// Repeating groups: setField overwrites a repeated tag, so add one group entry
+// per addGroup call. Fields keep the given order (the first is the delimiter)
+// and the count tag is set for you.
+const mdRequest = new Message()
+  .setField(FIELD.MsgType, 'V') // MarketDataRequest
+  .setField(262, 'md-1') // MDReqID
+  .setField(263, '1') // SubscriptionRequestType: snapshot + updates
+  .addGroup(267, [[269, '0']]) // NoMDEntryTypes / MDEntryType: bid
+  .addGroup(267, [[269, '1']]) // ask
+  .addGroup(146, [[FIELD.Symbol, 'AAPL']]); // NoRelatedSym
+
 // Parse a raw FIX wire string back into a Message.
 const parsed = Message.parse(order.toString());
 

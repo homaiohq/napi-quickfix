@@ -12,7 +12,7 @@ namespace napi_quickfix {
 //   new MessageWrap()
 //   new MessageWrap(raw: string, validate?: boolean = false)
 //
-// Methods: getField / setField / getHeaderField / setHeaderField /
+// Methods: getField / setField / addGroup / getHeaderField / setHeaderField /
 // getTrailerField / setTrailerField / toString / toPretty / getMsgType.
 class MessageWrap : public Napi::ObjectWrap<MessageWrap> {
  public:
@@ -37,6 +37,7 @@ class MessageWrap : public Napi::ObjectWrap<MessageWrap> {
 
   Napi::Value GetField(const Napi::CallbackInfo& info);
   Napi::Value SetField(const Napi::CallbackInfo& info);
+  Napi::Value AddGroup(const Napi::CallbackInfo& info);
   Napi::Value GetHeaderField(const Napi::CallbackInfo& info);
   Napi::Value SetHeaderField(const Napi::CallbackInfo& info);
   Napi::Value GetTrailerField(const Napi::CallbackInfo& info);

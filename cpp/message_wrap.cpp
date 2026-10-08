@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "errors.h"
 #include "quickfix/FieldNumbers.h"
@@ -44,6 +46,7 @@ Napi::Object MessageWrap::Init(Napi::Env env, Napi::Object exports) {
       {
           InstanceMethod("getField", &MessageWrap::GetField),
           InstanceMethod("setField", &MessageWrap::SetField),
+          InstanceMethod("addGroup", &MessageWrap::AddGroup),
           InstanceMethod("getHeaderField", &MessageWrap::GetHeaderField),
           InstanceMethod("setHeaderField", &MessageWrap::SetHeaderField),
           InstanceMethod("getTrailerField", &MessageWrap::GetTrailerField),
@@ -126,6 +129,48 @@ Napi::Value MessageWrap::SetField(const Napi::CallbackInfo& info) {
     } else {
       message_.setField(tag, value);
     }
+  } NQ_CATCH(env)
+  return env.Undefined();
+}
+
+// addGroup(countTag, entry: [tag, value][]): appends one repeating-group entry
+// to the body. Fields keep the given order (the first tag is the delimiter)
+// and QuickFIX sets the count tag to the number of entries.
+Napi::Value MessageWrap::AddGroup(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  int countTag = CoerceTag(env, info[0]);
+  if (!info[1].IsArray()) {
+    throw Napi::TypeError::New(env, "group entry must be an array of [tag, value] pairs");
+  }
+  Napi::Array entry = info[1].As<Napi::Array>();
+  if (entry.Length() == 0) {
+    throw Napi::TypeError::New(env, "group entry must contain at least one field");
+  }
+  std::vector<std::pair<int, std::string>> fields;
+  std::vector<int> order;
+  for (uint32_t i = 0; i < entry.Length(); i++) {
+    Napi::Value item = entry.Get(i);
+    if (!item.IsArray() || item.As<Napi::Array>().Length() != 2) {
+      throw Napi::TypeError::New(env, "group entry items must be [tag, value] pairs");
+    }
+    Napi::Array pair = item.As<Napi::Array>();
+    int tag = CoerceTag(env, pair.Get(0u));
+    if (tag <= 0) {
+      throw Napi::TypeError::New(env, "field tag must be a positive integer");
+    }
+    if (std::find(order.begin(), order.end(), tag) != order.end()) {
+      throw Napi::TypeError::New(env, "group entry must not repeat a tag");
+    }
+    fields.emplace_back(tag, CoerceValue(env, pair.Get(1u)));
+    order.push_back(tag);
+  }
+  order.push_back(0);  // FIX::message_order(const int[]) expects a 0 terminator.
+  NQ_TRY(env) {
+    FIX::Group group(countTag, order.front(), order.data());
+    for (const auto& [tag, value] : fields) {
+      group.setField(tag, value);
+    }
+    message_.addGroup(group);
   } NQ_CATCH(env)
   return env.Undefined();
 }

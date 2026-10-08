@@ -26,6 +26,7 @@ import nativeModule from './load-native.cjs';
 export interface NativeMessage {
   getField(tag: number): string;
   setField(tag: number, value: string): void;
+  addGroup(countTag: number, entry: ReadonlyArray<readonly [number, string | number]>): void;
   getHeaderField(tag: number): string;
   setHeaderField(tag: number, value: string): void;
   getTrailerField(tag: number): string;
