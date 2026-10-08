@@ -62,6 +62,20 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   failed construction does not lock those ids out for the rest of the process, and
   closes the engine-level log QuickFIX had already opened for it (with `log: 'file'`,
   two file streams per failed construction, which QuickFIX also leaks).
+- Repeating groups. New `Group` class (one entry of a repeating group, built from
+  its count tag and delimiter, with an optional explicit field order) and group
+  methods on `Message` and `Group`: `addGroup`, `getGroup`, `replaceGroup`,
+  `removeGroup`, `hasGroup`, `groupCount`. Groups nest. Indices are 1-based as in
+  QuickFIX; `getGroup` returns a snapshot copy, so edits are written back with
+  `replaceGroup`.
+- Dictionary-aware parsing: `Message.parse(raw, { dictionary })` and the
+  `{ sessionDictionary, applicationDictionary }` pair parse repeating groups
+  structurally. A parse without a dictionary stays flat, as before.
+- `FieldMap` surface on `Message` (and `Group`): `isSetField`, `removeField`,
+  `getFieldIfSet`, `isEmpty`, `totalFields`, `clear`, `fields()` (plus
+  `headerFields()` / `trailerFields()` on `Message`) and `[Symbol.iterator]`.
+- `DataDictionary.validate(msg, bodyOnly?)`, and the introspection methods
+  `getVersion`, `getFieldName`, `getFieldTag`, `isField`, `isMsgType`.
 
 ### Changed
 
@@ -125,6 +139,11 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   now owns that shutdown alone, which also stops listening sockets from being closed
   twice. In exchange, stopping an acceptor now takes up to one second longer: the network
   thread notices the stop on its next 1 s poll timeout, as QuickFIX's initiator already does.
+- Messages handed to engine handlers (`fromApp`, `toApp`, ...) now keep the
+  repeating groups QuickFIX parsed with the session's dictionary, and groups added
+  to an outbound message in `toApp` / `toAdmin` reach the wire. The bridge used to
+  round-trip every message through its wire string without a dictionary, which
+  flattened them.
 
 ## [0.1.0] - 2026-10-08
 

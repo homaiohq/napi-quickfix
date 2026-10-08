@@ -2,6 +2,8 @@
  * Ergonomic wrapper around the native `FIX::Message`.
  */
 import { native, type NativeMessage } from './native.js';
+import { Group } from './group.js';
+import type { DataDictionary } from './data-dictionary.js';
 
 /** Options controlling how a raw FIX string is parsed into a {@link Message}. */
 export interface MessageParseOptions {
@@ -12,6 +14,26 @@ export interface MessageParseOptions {
    * {@link DataDictionary} instead.
    */
   validate?: boolean;
+  /**
+   * Parse with this dictionary as both the session and application dictionary
+   * (the usual choice for FIX 4.x). With a dictionary, repeating groups are
+   * parsed into nested {@link Group} entries readable with
+   * {@link Message.getGroup}; without one the parse is **flat** and group
+   * fields are left as plain repeated body fields.
+   */
+  dictionary?: DataDictionary;
+  /**
+   * The session (transport) dictionary, e.g. `FIXT11.xml`. Governs header,
+   * trailer and admin messages. Overrides {@link MessageParseOptions.dictionary}
+   * for that role.
+   */
+  sessionDictionary?: DataDictionary;
+  /**
+   * The application dictionary, e.g. `FIX50SP2.xml`. Governs the body of
+   * application messages. Overrides {@link MessageParseOptions.dictionary} for
+   * that role.
+   */
+  applicationDictionary?: DataDictionary;
 }
 
 /** A structured, best-effort view of a parsed message returned by {@link Message.toJSON}. */
@@ -39,6 +61,12 @@ export interface MessageJSON {
  *
  * const parsed = Message.parse(msg.toString());
  * console.log(parsed.getMsgType());
+ *
+ * // Repeating groups: build entries with Group, read them back by 1-based index.
+ * msg.addGroup(new Group(FIELD.NoPartyIDs, FIELD.PartyID).setField(FIELD.PartyID, 'TRADER-1'));
+ * const dd = DataDictionary.fromFile('FIX44.xml');
+ * const withGroups = Message.parse(msg.toString(), { dictionary: dd });
+ * withGroups.getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID); // 'TRADER-1'
  * ```
  */
 export class Message {
@@ -60,7 +88,14 @@ export class Message {
     if (raw === undefined) {
       this.#native = new native.MessageWrap();
     } else if (typeof raw === 'string') {
-      this.#native = new native.MessageWrap(raw, opts?.validate ?? false);
+      const sessionDD = opts?.sessionDictionary ?? opts?.dictionary;
+      const appDD = opts?.applicationDictionary ?? opts?.dictionary;
+      this.#native = new native.MessageWrap(
+        raw,
+        opts?.validate ?? false,
+        sessionDD?.nativeHandle ?? null,
+        appDD?.nativeHandle ?? null,
+      );
     } else {
       // Adopt an existing native handle (bridge path).
       this.#native = raw;
@@ -70,8 +105,18 @@ export class Message {
   /**
    * Parse a raw FIX wire string into a {@link Message}.
    *
+   * Pass a `dictionary` to parse repeating groups structurally; without one
+   * the parse is flat (see {@link MessageParseOptions}).
+   *
    * @param raw Raw FIX wire string (SOH-delimited).
    * @param opts Optional parse options.
+   *
+   * @example
+   * ```ts
+   * const dd = DataDictionary.fromFile('./spec/FIX44.xml');
+   * const msg = Message.parse(raw, { dictionary: dd });
+   * msg.getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID);
+   * ```
    */
   static parse(raw: string, opts?: MessageParseOptions): Message {
     return new Message(raw, opts);
@@ -88,17 +133,143 @@ export class Message {
   }
 
   /**
-   * Read a body field by tag.
-   * @throws A `QuickFixError` (`fixError: 'FieldNotFound'`) if absent.
+   * Read a field by tag. Well-known header/trailer tags (`MsgType`,
+   * `SenderCompID`, `CheckSum`, ...) are read from their section; everything
+   * else from the body.
+   * @throws A `QuickFixError` (`fixErrorName: 'FieldNotFound'`) if absent.
    */
   getField(tag: number): string {
     return this.#native.getField(tag);
   }
 
-  /** Set a body field. Returns `this` for chaining. */
+  /**
+   * Set a field. Well-known header/trailer tags auto-route to their section;
+   * everything else goes to the body. Returns `this` for chaining.
+   */
   setField(tag: number, value: string | number): this {
     this.#native.setField(tag, String(value));
     return this;
+  }
+
+  /** Whether a field is present (same auto-routing as {@link Message.getField}). */
+  isSetField(tag: number): boolean {
+    return this.#native.isSetField(tag);
+  }
+
+  /** Remove a field (no-op if absent; same auto-routing). Returns `this` for chaining. */
+  removeField(tag: number): this {
+    this.#native.removeField(tag);
+    return this;
+  }
+
+  /** Read a field by tag, or `undefined` if absent (same auto-routing). */
+  getFieldIfSet(tag: number): string | undefined {
+    return this.#native.getFieldIfSet(tag);
+  }
+
+  /** Whether the body has no fields of its own. */
+  isEmpty(): boolean {
+    return this.#native.isEmpty();
+  }
+
+  /** The number of body fields, including every field of every group entry. */
+  totalFields(): number {
+    return this.#native.totalFields();
+  }
+
+  /** Remove every header, body and trailer field and group. Returns `this` for chaining. */
+  clear(): this {
+    this.#native.clear();
+    return this;
+  }
+
+  /** The body's own fields, in wire order, as `[tag, value]` pairs (group entries excluded). */
+  fields(): [number, string][] {
+    return this.#native.fields();
+  }
+
+  /** The header fields, in wire order, as `[tag, value]` pairs. */
+  headerFields(): [number, string][] {
+    return this.#native.headerFields();
+  }
+
+  /** The trailer fields, in wire order, as `[tag, value]` pairs. */
+  trailerFields(): [number, string][] {
+    return this.#native.trailerFields();
+  }
+
+  /** Iterates the body's own fields as `[tag, value]` pairs (see {@link Message.fields}). */
+  [Symbol.iterator](): IterableIterator<[number, string]> {
+    return this.fields()[Symbol.iterator]();
+  }
+
+  /**
+   * Append a repeating-group entry under its count tag (`group.field`). A copy
+   * is stored and the count field is updated. Header groups (e.g. `NoHops`)
+   * auto-route to the header. Returns `this` for chaining.
+   *
+   * @example
+   * ```ts
+   * order.addGroup(new Group(FIELD.NoPartyIDs, FIELD.PartyID).setField(FIELD.PartyID, 'X'));
+   * ```
+   */
+  addGroup(group: Group): this {
+    this.#native.addGroup(group.nativeHandle);
+    return this;
+  }
+
+  /**
+   * A **snapshot copy** of the `index`-th entry (1-based) of the repeating
+   * group `tag`. Mutating the returned {@link Group} does not change this
+   * message; write it back with {@link Message.replaceGroup}.
+   *
+   * Groups exist only on messages built with {@link Message.addGroup} or
+   * parsed with a dictionary (including every message the engine hands to
+   * your handlers); a flat parse leaves none.
+   *
+   * @throws A `QuickFixError` (`fixErrorName: 'FieldNotFound'`) when the tag
+   *   has no entries or `index` is out of range.
+   */
+  getGroup(index: number, tag: number): Group {
+    return Group.fromNative(this.#native.getGroup(index, tag));
+  }
+
+  /**
+   * Overwrite the `index`-th entry (1-based) under `group.field` with a copy of
+   * `group`. Returns `this` for chaining.
+   * @throws A `QuickFixError` (`fixErrorName: 'FieldNotFound'`) when that
+   *   entry does not exist.
+   */
+  replaceGroup(index: number, group: Group): this {
+    this.#native.replaceGroup(index, group.nativeHandle);
+    return this;
+  }
+
+  /**
+   * Remove every entry of the repeating group `tag` (and its count field), or
+   * only the `index`-th entry (1-based). No-op when absent. Returns `this`.
+   */
+  removeGroup(tag: number): this;
+  removeGroup(index: number, tag: number): this;
+  removeGroup(a: number, b?: number): this {
+    if (b === undefined) {
+      this.#native.removeGroup(a);
+    } else {
+      this.#native.removeGroup(a, b);
+    }
+    return this;
+  }
+
+  /** Whether the repeating group `tag` has any entry, or has an `index`-th entry (1-based). */
+  hasGroup(tag: number): boolean;
+  hasGroup(index: number, tag: number): boolean;
+  hasGroup(a: number, b?: number): boolean {
+    return b === undefined ? this.#native.hasGroup(a) : this.#native.hasGroup(a, b);
+  }
+
+  /** The number of entries of the repeating group `tag` (0 if none). */
+  groupCount(tag: number): number {
+    return this.#native.groupCount(tag);
   }
 
   /**
