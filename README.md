@@ -23,8 +23,9 @@ included.
   points.
 - **TypeScript types included** — hand-written `.d.ts` for the full public API.
 - **Full FIX surface** — the session engine (`Initiator`/`Acceptor` +
-  synchronous application handlers) *and* the pure layer (`Message`,
-  `SessionSettings`, `DataDictionary`, `SessionID`).
+  synchronous application handlers) *and* the pure layer (`Message` with
+  repeating `Group`s and dictionary-aware parsing, `SessionSettings`,
+  `DataDictionary`, `SessionID`).
 - **Ergonomic, safe API** — chainable message building with automatic
   header/trailer field routing, typed rejections, and C++ exceptions surfaced as
   JavaScript `Error`s.
@@ -206,20 +207,37 @@ come from `@homaiohq/napi-quickfix`.
 ### Message
 
 ```ts
-new Message(raw?: string, opts?: { validate?: boolean });
-Message.parse(raw: string, opts?: { validate?: boolean }): Message;
+new Message(raw?: string, opts?: MessageParseOptions);
+Message.parse(raw: string, opts?: MessageParseOptions): Message;
+// MessageParseOptions: { validate?: boolean; dictionary?: DataDictionary;
+//                        sessionDictionary?: DataDictionary; applicationDictionary?: DataDictionary }
 
 message.setField(tag: number, value: string | number): this; // chainable, auto-routes header/trailer fields
-message.getField(tag: number): string;
+message.getField(tag: number): string;           // throws QuickFixError (FieldNotFound) if absent
+message.getFieldIfSet(tag: number): string | undefined;
+message.isSetField(tag: number): boolean;
+message.removeField(tag: number): this;
 message.setHeaderField(tag, value): this;   message.getHeaderField(tag): string;
 message.setTrailerField(tag, value): this;  message.getTrailerField(tag): string;
+message.fields(): [tag: number, value: string][];   // body fields in wire order (also iterable)
+message.headerFields(); message.trailerFields();    // same shape
+message.isEmpty(): boolean;  message.totalFields(): number;  message.clear(): this;
+
+// Repeating groups (indices are 1-based, as in QuickFIX)
+message.addGroup(group: Group): this;               // appends a copy, maintains the count field
+message.getGroup(index: number, tag: number): Group; // snapshot copy; throws FieldNotFound if absent
+message.replaceGroup(index: number, group: Group): this;
+message.removeGroup(tag: number): this;  message.removeGroup(index: number, tag: number): this;
+message.hasGroup(tag: number): boolean;  message.hasGroup(index: number, tag: number): boolean;
+message.groupCount(tag: number): number;
+
 message.getMsgType(): string;
 message.toString(): string;   // raw SOH-delimited wire string
 message.toPretty(): string;   // human-readable
 message.toJSON(): { msgType?: string; raw: string };
 
 createMessage(fields?: Record<number, string | number>): Message;
-parseMessage(raw: string, opts?: { validate?: boolean }): Message;
+parseMessage(raw: string, opts?: MessageParseOptions): Message;
 ```
 
 Field values are accepted as `string | number` (numbers are stringified) and
@@ -227,6 +245,60 @@ always returned as `string`. Header/trailer fields such as `MsgType`,
 `BeginString`, and `CheckSum` are **automatically routed** to the correct
 section by `setField`, so you rarely need `setHeaderField`/`setTrailerField`
 directly.
+
+**Parsing and repeating groups.** A parse without a dictionary is *flat*: the
+fields of a repeating group are kept as plain repeated body fields and
+`getGroup` throws. Pass a `dictionary` (or a `sessionDictionary` /
+`applicationDictionary` pair for FIXT/FIX 5) to parse groups structurally.
+Messages delivered to engine handlers are already parsed with the session's
+dictionary, so `getGroup` works on them directly.
+
+```ts
+import { DataDictionary, Group, Message, FIELD, MsgType } from '@homaiohq/napi-quickfix';
+
+const dd = DataDictionary.fromFile('./spec/FIX44.xml');
+
+const order = new Message()
+  .setField(FIELD.MsgType, MsgType.NewOrderSingle)
+  .setField(FIELD.ClOrdID, 'order-1')
+  .addGroup(new Group(FIELD.NoPartyIDs, FIELD.PartyID).setField(FIELD.PartyID, 'TRADER-1').setField(FIELD.PartyRole, 11))
+  .addGroup(new Group(FIELD.NoPartyIDs, FIELD.PartyID).setField(FIELD.PartyID, 'FIRM-7').setField(FIELD.PartyRole, 1));
+// 453=2|448=TRADER-1|452=11|448=FIRM-7|452=1 on the wire
+
+const parsed = Message.parse(order.toString(), { dictionary: dd });
+parsed.groupCount(FIELD.NoPartyIDs);                           // 2
+parsed.getGroup(2, FIELD.NoPartyIDs).getField(FIELD.PartyID);  // 'FIRM-7'
+
+// getGroup returns a snapshot: write changes back with replaceGroup.
+const first = parsed.getGroup(1, FIELD.NoPartyIDs).setField(FIELD.PartyRole, 12);
+parsed.replaceGroup(1, first);
+```
+
+### Group
+
+One entry of a repeating group, identified by its **count tag** (`field`, e.g.
+`453 NoPartyIDs`) and its **delimiter** (`delim`, the first tag of every entry,
+e.g. `448 PartyID`). Groups nest through the same `addGroup`/`getGroup` API.
+
+```ts
+new Group(field: number, delim: number, order?: number[]); // order: full entry field order, delimiter first
+group.field;  group.delim;                                  // read-only
+
+group.setField(tag, value: string | number): this;  group.getField(tag): string;
+group.getFieldIfSet(tag): string | undefined;       group.isSetField(tag): boolean;
+group.removeField(tag): this;  group.isEmpty();  group.totalFields();  group.clear(): this;
+group.fields(): [tag, value][];                     // in wire order (also iterable)
+group.toString(): string;                           // the entry's fields, SOH-delimited, in wire order
+
+// Nested groups — same contract as on Message
+group.addGroup(g: Group): this;  group.getGroup(index, tag): Group;  group.replaceGroup(index, g): this;
+group.removeGroup(tag): this;    group.removeGroup(index, tag): this;
+group.hasGroup(tag): boolean;    group.hasGroup(index, tag): boolean;  group.groupCount(tag): number;
+```
+
+Without an explicit `order`, an entry's fields are emitted delimiter-first and
+then by ascending tag number, which matches the standard dictionaries for most
+groups; pass `order` (e.g. `[448, 447, 452]`) when a group's spec order differs.
 
 ### SessionID
 
@@ -250,8 +322,17 @@ settings.getSessions(): SessionID[];
 ```ts
 DataDictionary.fromString(xml: string): DataDictionary;
 DataDictionary.fromFile(xmlPath: string): DataDictionary;
-dictionary.validate(msg: Message): void; // throws QuickFixError if invalid
+dictionary.validate(msg: Message, bodyOnly?: boolean): void; // throws QuickFixError if invalid
+dictionary.getVersion(): string;                       // e.g. 'FIX.4.4'
+dictionary.getFieldName(tag: number): string | undefined;
+dictionary.getFieldTag(name: string): number | undefined;
+dictionary.isField(tag: number): boolean;
+dictionary.isMsgType(msgType: string): boolean;
 ```
+
+`validate(msg, true)` validates as the *application* dictionary only: the
+BeginString version check and header/trailer validation are skipped. A
+dictionary also drives structural parsing — see `Message.parse` above.
 
 ### Initiator / Acceptor (the session engine)
 

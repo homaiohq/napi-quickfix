@@ -10,10 +10,18 @@ namespace napi_quickfix {
 // Napi::ObjectWrap over FIX::Message.
 //
 //   new MessageWrap()
-//   new MessageWrap(raw: string, validate?: boolean = false)
+//   new MessageWrap(raw: string, validate?: boolean = false,
+//                   sessionDictionary?: DataDictionary,
+//                   applicationDictionary?: DataDictionary)
 //
-// Methods: getField / setField / getHeaderField / setHeaderField /
-// getTrailerField / setTrailerField / toString / toPretty / getMsgType.
+// With a dictionary the raw string is parsed structurally (repeating groups
+// become nested FieldMaps); without one it is parsed flat, as before.
+//
+// Field methods (getField / setField / isSetField / removeField /
+// getFieldIfSet) and group methods (addGroup / getGroup / replaceGroup /
+// removeGroup / hasGroup / groupCount) auto-route well-known header/trailer
+// tags to the right section. isEmpty / totalFields / fields read the body;
+// clear() empties all three sections.
 class MessageWrap : public Napi::ObjectWrap<MessageWrap> {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -35,12 +43,32 @@ class MessageWrap : public Napi::ObjectWrap<MessageWrap> {
  private:
   static Napi::FunctionReference constructor_;
 
+  // The section (header / body / trailer) that owns a well-known tag.
+  FIX::FieldMap& SectionFor(int tag);
+
   Napi::Value GetField(const Napi::CallbackInfo& info);
   Napi::Value SetField(const Napi::CallbackInfo& info);
+  Napi::Value IsSetField(const Napi::CallbackInfo& info);
+  Napi::Value RemoveField(const Napi::CallbackInfo& info);
+  Napi::Value GetFieldIfSet(const Napi::CallbackInfo& info);
   Napi::Value GetHeaderField(const Napi::CallbackInfo& info);
   Napi::Value SetHeaderField(const Napi::CallbackInfo& info);
   Napi::Value GetTrailerField(const Napi::CallbackInfo& info);
   Napi::Value SetTrailerField(const Napi::CallbackInfo& info);
+  Napi::Value IsEmpty(const Napi::CallbackInfo& info);
+  Napi::Value TotalFields(const Napi::CallbackInfo& info);
+  Napi::Value Clear(const Napi::CallbackInfo& info);
+  Napi::Value Fields(const Napi::CallbackInfo& info);
+  Napi::Value HeaderFields(const Napi::CallbackInfo& info);
+  Napi::Value TrailerFields(const Napi::CallbackInfo& info);
+
+  Napi::Value AddGroup(const Napi::CallbackInfo& info);
+  Napi::Value GetGroup(const Napi::CallbackInfo& info);
+  Napi::Value ReplaceGroup(const Napi::CallbackInfo& info);
+  Napi::Value RemoveGroup(const Napi::CallbackInfo& info);
+  Napi::Value HasGroup(const Napi::CallbackInfo& info);
+  Napi::Value GroupCount(const Napi::CallbackInfo& info);
+
   Napi::Value ToString(const Napi::CallbackInfo& info);
   Napi::Value ToPretty(const Napi::CallbackInfo& info);
   Napi::Value GetMsgType(const Napi::CallbackInfo& info);

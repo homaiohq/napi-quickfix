@@ -8,6 +8,7 @@ import {
   FIELD,
   MsgType,
 } from '../dist/esm/index.js';
+import { loadFix44Mini } from './fixtures/dictionary.js';
 
 // A minimal, self-contained FIX 4.4-shaped dictionary (no network / no FIX44.xml).
 // It defines only the header/trailer plus a single Heartbeat message that allows
@@ -86,5 +87,49 @@ describe('DataDictionary', () => {
         return true;
       },
     );
+  });
+
+  test('validate(msg, bodyOnly) skips the BeginString version check and header validation', () => {
+    const dd = DataDictionary.fromString(DICT);
+    // A FIX.4.2 heartbeat against a FIX.4.4 dictionary: the session-level check
+    // rejects the version, the body-only check does not look at it.
+    const wrongVersion = heartbeat((m) => m.setField(FIELD.BeginString, 'FIX.4.2'));
+    assert.throws(
+      () => dd.validate(wrongVersion),
+      (err: any) => {
+        assert.equal(err.name, 'QuickFixError');
+        assert.equal(err.fixErrorName, 'UnsupportedVersion');
+        return true;
+      },
+    );
+    assert.doesNotThrow(() => dd.validate(wrongVersion, true));
+    // Body-only still validates the body.
+    assert.throws(
+      () => dd.validate(heartbeat((m) => m.setField(55, 'AAPL')), true),
+      (err: any) => err.fixErrorName === 'InvalidTagNumber',
+    );
+  });
+
+  test('fromFile loads a spec file; introspection reads version, fields and message types', () => {
+    const dd = loadFix44Mini();
+    assert.equal(dd.getVersion(), 'FIX.4.4');
+    assert.equal(dd.getFieldName(FIELD.MsgType), 'MsgType');
+    assert.equal(dd.getFieldName(FIELD.NoPartyIDs), 'NoPartyIDs');
+    assert.equal(dd.getFieldName(99999), undefined);
+    assert.equal(dd.getFieldTag('MsgType'), 35);
+    assert.equal(dd.getFieldTag('PartySubID'), FIELD.PartySubID);
+    assert.equal(dd.getFieldTag('NoSuchField'), undefined);
+    assert.equal(dd.isField(FIELD.Symbol), true);
+    assert.equal(dd.isField(99999), false);
+    assert.equal(dd.isMsgType(MsgType.NewOrderSingle), true);
+    assert.equal(dd.isMsgType(MsgType.Logon), true);
+    assert.equal(dd.isMsgType('ZZ'), false);
+  });
+
+  test('fromString: the version is derived from the major/minor attributes', () => {
+    const dd = DataDictionary.fromString(DICT);
+    assert.equal(dd.getVersion(), 'FIX.4.4');
+    assert.equal(dd.isMsgType(MsgType.Heartbeat), true);
+    assert.equal(dd.isMsgType(MsgType.NewOrderSingle), false);
   });
 });

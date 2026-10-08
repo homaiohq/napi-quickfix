@@ -20,16 +20,48 @@ import nativeModule from './load-native.cjs';
  * ------------------------------------------------------------------------- */
 
 /**
- * Native `FIX::Message` wrapper. FIX is string-on-the-wire, so every field
- * value crosses the boundary as a string.
+ * The field and repeating-group operations every `FIX::FieldMap` exposes.
+ * Shared by the message body and by group entries. Group indices are 1-based,
+ * as in QuickFIX; `getGroup` returns a snapshot copy.
  */
-export interface NativeMessage {
+export interface NativeFieldMap {
   getField(tag: number): string;
   setField(tag: number, value: string): void;
+  isSetField(tag: number): boolean;
+  removeField(tag: number): void;
+  getFieldIfSet(tag: number): string | undefined;
+  /** Own fields plus every field of every nested group entry. */
+  totalFields(): number;
+  isEmpty(): boolean;
+  clear(): void;
+  /** Own fields, in wire order, as `[tag, value]` pairs. */
+  fields(): [number, string][];
+
+  addGroup(group: NativeGroup): void;
+  /** @throws A {@link QuickFixError} (`FieldNotFound`) when absent / out of range. */
+  getGroup(index: number, tag: number): NativeGroup;
+  /** @throws A {@link QuickFixError} (`FieldNotFound`) when the slot does not exist. */
+  replaceGroup(index: number, group: NativeGroup): void;
+  removeGroup(tag: number): void;
+  removeGroup(index: number, tag: number): void;
+  hasGroup(tag: number): boolean;
+  hasGroup(index: number, tag: number): boolean;
+  groupCount(tag: number): number;
+}
+
+/**
+ * Native `FIX::Message` wrapper. FIX is string-on-the-wire, so every field
+ * value crosses the boundary as a string. The {@link NativeFieldMap} methods
+ * auto-route well-known header/trailer tags to the right section; `fields()`,
+ * `isEmpty()` and `totalFields()` read the body, `clear()` empties everything.
+ */
+export interface NativeMessage extends NativeFieldMap {
   getHeaderField(tag: number): string;
   setHeaderField(tag: number, value: string): void;
   getTrailerField(tag: number): string;
   setTrailerField(tag: number, value: string): void;
+  headerFields(): [number, string][];
+  trailerFields(): [number, string][];
   getMsgType(): string;
   toString(): string;
   toPretty(): string;
@@ -38,7 +70,36 @@ export interface NativeMessage {
 /** Constructor shape for the native `MessageWrap` class. */
 export interface NativeMessageConstructor {
   new (): NativeMessage;
-  new (raw: string, validate?: boolean): NativeMessage;
+  /**
+   * Parse `raw`. With a dictionary the parse is structural (repeating groups
+   * become nested groups); without one it is flat. Admin messages always use
+   * the session dictionary; application messages use the application one.
+   */
+  new (
+    raw: string,
+    validate?: boolean,
+    sessionDictionary?: NativeDataDictionary | null,
+    applicationDictionary?: NativeDataDictionary | null,
+  ): NativeMessage;
+}
+
+/** Native `FIX::Group` wrapper: one entry of a repeating group. */
+export interface NativeGroup extends NativeFieldMap {
+  /** The group's count tag (e.g. 453 NoPartyIDs). */
+  field(): number;
+  /** The first tag of every entry (e.g. 448 PartyID). */
+  delim(): number;
+  /** The entry's fields (and nested groups) as a SOH-delimited string, in wire order. */
+  toString(): string;
+}
+
+/** Constructor shape for the native `GroupWrap` class. */
+export interface NativeGroupConstructor {
+  /**
+   * @param order Optional full field order of an entry, delimiter first, no
+   *   zeros. Without it, fields sort delimiter-first then by tag number.
+   */
+  new (field: number, delim: number, order?: readonly number[] | null): NativeGroup;
 }
 
 /** Native `FIX::SessionID` wrapper. */
@@ -110,8 +171,17 @@ export interface QuickFixError extends Error {
 
 /** Native `FIX::DataDictionary` wrapper. */
 export interface NativeDataDictionary {
-  /** Throws a {@link QuickFixError} if the message is invalid. */
-  validate(message: NativeMessage): void;
+  /**
+   * Throws a {@link QuickFixError} if the message is invalid. With `bodyOnly`
+   * the BeginString version check and header/trailer validation are skipped.
+   */
+  validate(message: NativeMessage, bodyOnly?: boolean): void;
+  /** The BeginString the spec declares (e.g. `'FIX.4.4'`), `''` if none. */
+  getVersion(): string;
+  getFieldName(tag: number): string | undefined;
+  getFieldTag(name: string): number | undefined;
+  isField(tag: number): boolean;
+  isMsgType(msgType: string): boolean;
 }
 
 /**
@@ -185,6 +255,7 @@ export interface NativeModule {
   enums: NativeEnums;
 
   MessageWrap: NativeMessageConstructor;
+  GroupWrap: NativeGroupConstructor;
   SessionIDWrap: NativeSessionIDConstructor;
   SessionSettingsWrap: NativeSessionSettingsConstructor;
   DataDictionaryWrap: NativeDataDictionaryConstructor;
