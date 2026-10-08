@@ -6,7 +6,7 @@ dist/
 build/
 prebuilds/
 # QuickFIX static lib lands here (its ARCHIVE_OUTPUT_DIRECTORY)
-lib/
+/lib/
 
 # yarn berry
 .yarn/*

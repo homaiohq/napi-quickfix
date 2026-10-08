@@ -37,6 +37,11 @@ Useful scripts:
   `build/_deps/` when that checkout is at the pinned tag, otherwise GitHub at the pinned
   tag, so run it after moving the QuickFIX pin. `yarn gen:fields:check` fails if the
   checked-in file is stale.
+- `yarn gen:values` — regenerate `src/generated/values.ts` (the typed value groups:
+  `MsgType`, `Side`, `ExecType`, ... and the `VALUES` tree) from QuickFIX's
+  `FixValues.h`, with the same source resolution as `gen:fields`. The upstream →
+  TypeScript naming rule is documented at the top of `scripts/gen-values.mjs`.
+  `yarn gen:values:check` fails if the checked-in file is stale.
 - `yarn prebuild` — produce prebuilt binaries for the current platform. On Linux the
   binary is libc-tagged (`node.napi.glibc.node` / `node.napi.musl.node`); detection is
   automatic and the script *fails* rather than guessing. Override with `PREBUILD_LIBC`.

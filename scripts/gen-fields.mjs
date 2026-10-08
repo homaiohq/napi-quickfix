@@ -6,71 +6,18 @@
 // checked in so consumers (and `tsc`) never need the QuickFIX sources; re-run this
 // script whenever the QuickFIX pin in CMakeLists.txt moves.
 //
-// Source resolution, in order:
-//   1. `--from <path>`                      an explicit FixFieldNumbers.h
-//   2. build/_deps/quickfix-src/src/C++/    the sources CMake FetchContent fetched,
-//                                           only if that checkout is at the pinned tag
-//   3. raw.githubusercontent.com            at the GIT_TAG pinned in CMakeLists.txt
-//
-// (2) is guarded because a stale build tree from an older pin would otherwise be
-// stamped with the new tag and pass `--check`.
+// Where the header comes from (`--from`, the FetchContent checkout at the pinned
+// tag, or GitHub) is shared with gen-values.mjs in scripts/lib/quickfix-header.mjs.
 //
 // Usage:
 //   node scripts/gen-fields.mjs            write src/generated/fields.ts
 //   node scripts/gen-fields.mjs --check    exit 1 if the checked-in file is stale
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+import { ROOT, emit, loadHeader, parseArgs } from './lib/quickfix-header.mjs';
+
 const OUT = join(ROOT, 'src', 'generated', 'fields.ts');
-const FETCHED = join(ROOT, 'build', '_deps', 'quickfix-src', 'src', 'C++', 'FixFieldNumbers.h');
-
-const args = process.argv.slice(2);
-const check = args.includes('--check');
-const fromIdx = args.indexOf('--from');
-const fromPath = fromIdx >= 0 ? args[fromIdx + 1] : undefined;
-
-function pinnedTag() {
-  const cmake = readFileSync(join(ROOT, 'CMakeLists.txt'), 'utf8');
-  const m = /^\s*GIT_TAG\s+(\S+)/m.exec(cmake);
-  if (!m) throw new Error('could not find GIT_TAG in CMakeLists.txt');
-  return m[1];
-}
-
-// Tag of the FetchContent checkout, or undefined if it cannot be determined.
-function checkoutTag(dir) {
-  try {
-    return execFileSync('git', ['-C', dir, 'describe', '--tags', '--exact-match'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-  } catch {
-    return undefined;
-  }
-}
-
-async function loadHeader() {
-  const tag = pinnedTag();
-  if (fromPath) {
-    return { text: readFileSync(resolve(fromPath), 'utf8'), origin: fromPath, tag };
-  }
-  if (existsSync(FETCHED)) {
-    const fetchedTag = checkoutTag(dirname(dirname(dirname(FETCHED))));
-    if (fetchedTag === tag) {
-      return { text: readFileSync(FETCHED, 'utf8'), origin: 'build/_deps/quickfix-src', tag };
-    }
-    console.warn(
-      `build/_deps/quickfix-src is at ${fetchedTag ?? 'an unknown tag'}, not the pinned ${tag}; ` +
-        'fetching the header from GitHub instead (run `yarn clean && yarn build` to refresh)',
-    );
-  }
-  const url = `https://raw.githubusercontent.com/quickfix/quickfix/${tag}/src/C++/FixFieldNumbers.h`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`fetch ${url} failed: ${res.status} ${res.statusText}`);
-  return { text: await res.text(), origin: url, tag };
-}
+const { check, fromPath } = parseArgs();
 
 // Parse `const int Name = 123;` lines inside `namespace FIELD { ... }`. The block
 // ends at the first closing brace after the declarations: QuickFIX has shipped
@@ -131,21 +78,14 @@ function render(fields, tag) {
   return lines.join('\n');
 }
 
-const { text, origin, tag } = await loadHeader();
+const { text, origin, tag } = await loadHeader('FixFieldNumbers.h', { fromPath });
 const fields = parseFields(text);
-const output = render(fields, tag);
-
-if (check) {
-  // Compare with line endings normalised: a Windows checkout with core.autocrlf
-  // hands us CRLF while the generator renders LF.
-  const current = existsSync(OUT) ? readFileSync(OUT, 'utf8').replace(/\r\n/g, '\n') : '';
-  if (current !== output) {
-    console.error(`${OUT} is stale (source: ${origin}); run \`yarn gen:fields\``);
-    process.exit(1);
-  }
-  console.log(`${OUT} is up to date (${fields.length} fields, QuickFIX ${tag})`);
-} else {
-  mkdirSync(dirname(OUT), { recursive: true });
-  writeFileSync(OUT, output);
-  console.log(`wrote ${OUT}: ${fields.length} fields from ${origin} (QuickFIX ${tag})`);
-}
+emit({
+  out: OUT,
+  output: render(fields, tag),
+  check,
+  summary: `${fields.length} fields`,
+  script: 'gen:fields',
+  origin,
+  tag,
+});

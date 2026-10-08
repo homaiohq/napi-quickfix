@@ -1,5 +1,7 @@
-// Module init for @homaiohq/napi-quickfix: registers all wrappers, enums, and
-// module-level functions.
+// Module init for @homaiohq/napi-quickfix: registers all wrappers and
+// module-level functions. FIX constants (field tags, value groups) are not
+// exported here: they are generated on the TS side from the QuickFIX headers
+// (scripts/gen-fields.mjs, scripts/gen-values.mjs).
 
 #include <napi.h>
 
@@ -20,9 +22,8 @@
 
 namespace napi_quickfix {
 
-// Defined in session_static.cpp / enums.cpp.
+// Defined in session_static.cpp.
 void RegisterSessionStatic(Napi::Env env, Napi::Object exports);
-void RegisterEnums(Napi::Env env, Napi::Object exports);
 
 namespace {
 
@@ -67,7 +68,6 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   AcceptorWrap::Init(env, exports);
 
   RegisterSessionStatic(env, exports);
-  RegisterEnums(env, exports);
 
   return exports;
 }

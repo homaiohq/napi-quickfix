@@ -6,9 +6,7 @@
     "moduleResolution": "NodeNext",
     "noEmit": true,
     "rootDir": ".",
-    "declaration": false,
-    "declarationMap": false,
-    "sourceMap": false
+    "declaration": false
   },
   "include": ["**/*.ts"]
 }

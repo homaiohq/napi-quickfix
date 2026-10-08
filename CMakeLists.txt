@@ -85,7 +85,11 @@ string(REPLACE "\n" "" NODE_ADDON_API_DIR ${NODE_ADDON_API_DIR})
 # ---------------------------------------------------------------------------
 # The native addon.
 # ---------------------------------------------------------------------------
-file(GLOB ADDON_SOURCES "${CMAKE_SOURCE_DIR}/cpp/*.cpp")
+# CONFIGURE_DEPENDS re-globs on every build, so adding or deleting a cpp/*.cpp
+# file is picked up by an already-configured tree. cmake-js only re-runs the
+# configure step when CMakeCache.txt is missing, so without it a deleted source
+# stays in the build graph until `yarn clean`.
+file(GLOB ADDON_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/cpp/*.cpp")
 
 add_library(napi_quickfix SHARED ${ADDON_SOURCES} ${CMAKE_JS_SRC})
 set_target_properties(napi_quickfix PROPERTIES PREFIX "" SUFFIX ".node")

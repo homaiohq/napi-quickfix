@@ -9,6 +9,41 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
+### Added
+
+- Every FIX value constant of the bundled QuickFIX, generated from `FixValues.h`
+  (690 groups, 5781 values for v1.16.0): one frozen object per field (`MsgType`, `Side`,
+  `OrdType`, `TimeInForce`, `ExecType`, `OrdStatus`, `SecurityType`, ...) with string
+  literal types, plus a `VALUES` tree keyed by field name and the `ValueGroups` /
+  `ValueGroupName` types. Names map QuickFIX's `Side_SELL_SHORT` to `Side.SellShort`,
+  lower-casing every word, acronyms included (`SecurityIDSource_ISIN_NUMBER` →
+  `SecurityIDSource.IsinNumber`); `MsgType` names are kept verbatim.
+- `@homaiohq/napi-quickfix/values` subpath export: every value group by name, without
+  loading the native addon and, in the ESM build, tree-shakeable per group.
+- `OrdType`, `TimeInForce` and `VALUES` as named root exports; `enums` now carries every
+  value group next to `FIELD`.
+- `yarn gen:values` / `yarn gen:values:check` regenerate and verify the table, like
+  `gen:fields`.
+
+### Changed
+
+- `MsgType`, `Side` and `enums` are sourced from the generated table instead of the
+  hand-curated subset in the native addon. Their keys and values are unchanged, but they
+  are now typed as literals (`Side.Buy` is `'1'`, a misspelt name is a compile error) and
+  `Enums` is the precise tree type rather than a string-indexed record.
+- **Breaking (types only):** `MsgType`, `Side` and `enums` lose their `string` index
+  signatures, and the exported `Enums` type is now the precise tree
+  (`ValueGroups & { FIELD }`) instead of `Readonly<Record<string, EnumGroup>>`. Dynamic
+  lookups such as `MsgType[nameFromConfig]` or `enums[groupName][valueName]` with
+  `string` keys no longer compile; widen the group to `EnumGroup`
+  (`const g: EnumGroup = MsgType`; every group and `FIELD` is assignable to it) or narrow
+  the key (`enums[groupName as ValueGroupName]`). Code that typed a parameter as `Enums`
+  and iterated it with `string` keys needs the same widening.
+- The native addon no longer exports `enums` (`cpp/enums.cpp` removed); the TypeScript
+  public surface is a superset of what it provided.
+- `dist/` no longer ships `.js.map` / `.d.ts.map` files. `src/` is not published, so they
+  could never resolve, and they roughly doubled the footprint of the generated tables.
+
 ## [0.1.0] - 2026-10-08
 
 Initial release. Bundles **QuickFIX v1.16.0** (statically linked).
