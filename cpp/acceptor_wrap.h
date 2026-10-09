@@ -39,6 +39,8 @@ class AcceptorWrap : public Napi::ObjectWrap<AcceptorWrap> {
   void Teardown(bool force);
   // Destroy the FIX engine under gate_->Freeze(); destructor only.
   void DestroyEngine();
+  // Destroy the FIX engine once stop() has frozen the gate; Stop() only.
+  void DestroyStoppedEngine();
 
   // Destruct order: acceptor first (declared last), then log, store, bridge.
   std::unique_ptr<ApplicationBridge> bridge_;

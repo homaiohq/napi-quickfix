@@ -37,8 +37,8 @@ namespace napi_quickfix {
 //   * Each engine wrap owns a `std::shared_ptr<SessionOpGate>` and registers
 //     it for its SessionIDs (Register) right after constructing the FIX engine,
 //     on the JS thread; it unregisters (Unregister) right before destroying it.
-//   * A worker calls Lookup(id) on its libuv thread to find the gate of the
-//     engine owning `id`, then holds an OpScope on it for its whole Execute()
+//   * A worker calls Acquire(id) on its libuv thread to find the gate of the
+//     engine owning `id` and hold an OpScope on it for its whole Execute()
 //     -- lookupSession AND the operation. Constructing the OpScope blocks while
 //     that engine is between Freeze() and Unfreeze(). No registered gate means
 //     no engine owns the session: the worker reports SessionNotFound without
@@ -57,8 +57,16 @@ namespace napi_quickfix {
 //     (now blocked) JS thread. Operations on other engines are not involved.
 //
 // The gate outlives its engine: a worker that looked it up just before the
-// engine was unregistered holds it by shared_ptr, passes the (now lifted)
-// freeze, and gets SessionNotFound from lookupSession.
+// engine was unregistered holds it by shared_ptr and passes the (now lifted)
+// freeze. By then a NEW engine may own the same id -- its sessions are what
+// lookupSession() would now return -- while the worker holds the OLD gate, on
+// which the new engine's stop() never waits. Acquire() closes that window by
+// re-reading the registry after the OpScope is held: the scope is kept only if
+// the gate is still the registered owner, and that owner cannot be destroyed
+// while the scope is in flight (Freeze() precedes Unregister() everywhere).
+// Together with the wraps rejecting a SessionID that is already live in the
+// process, this makes gate == registered owner == the engine whose session
+// lookupSession() returns.
 class SessionOpGate {
  public:
   class OpScope {
@@ -88,8 +96,10 @@ class SessionOpGate {
   SessionOpGate& operator=(const SessionOpGate&) = delete;
 
   // Block new operations on this engine's sessions and wait for the in-flight
-  // ones to finish. Nests (a Freeze() from the stop worker and one from the
-  // destructor may overlap).
+  // ones to finish. Nests: the stop worker freezes on its thread and the wrap
+  // unfreezes later on the JS thread, and in between the destructor (if the
+  // wrap is finalized during environment teardown) freezes again around its
+  // own DestroyEngine().
   void Freeze() {
     std::unique_lock<std::mutex> lock(mtx_);
     ++frozen_;
@@ -106,8 +116,11 @@ class SessionOpGate {
   }
 
   // --- registry: SessionID -> owning engine's gate ---------------------------
-  // QuickFIX rejects two live engines sharing a SessionID ("Duplicate
-  // Session"), so each id maps to at most one gate at a time.
+  // Each id maps to at most one gate at a time: the engine wraps refuse to
+  // construct an engine whose SessionID is already live in the process
+  // (ConfigError "Duplicate Session"). QuickFIX itself does NOT enforce that --
+  // its Session constructor ignores addSession()'s result, so a second engine
+  // would silently shadow the first in the process-wide session registry.
 
   static void Register(const std::set<FIX::SessionID>& ids,
                        const std::shared_ptr<SessionOpGate>& gate) {
@@ -134,6 +147,21 @@ class SessionOpGate {
     std::lock_guard<std::mutex> lock(r.mtx);
     auto it = r.gates.find(id);
     return it == r.gates.end() ? nullptr : it->second;
+  }
+
+  // Hold an OpScope on the gate of the engine currently owning `id`, or
+  // return nullptr if no engine does (-> SessionNotFound). Constructing the
+  // scope may block (the owner is stopping); once it is held the registry is
+  // re-read, and the scope is kept only if the same gate is still registered.
+  // Otherwise the owner was destroyed while we waited -- possibly replaced by
+  // a new engine with the same id -- and we start over against the new owner.
+  static std::unique_ptr<OpScope> Acquire(const FIX::SessionID& id) {
+    for (;;) {
+      std::shared_ptr<SessionOpGate> gate = Lookup(id);
+      if (!gate) return nullptr;
+      auto scope = std::make_unique<OpScope>(gate);
+      if (Lookup(id) == gate) return scope;
+    }
   }
 
  private:

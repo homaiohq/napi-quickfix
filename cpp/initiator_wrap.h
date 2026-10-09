@@ -44,6 +44,8 @@ class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap> {
   void Teardown(bool force);
   // Destroy the FIX engine under gate_->Freeze(); destructor only.
   void DestroyEngine();
+  // Destroy the FIX engine once stop() has frozen the gate; Stop() only.
+  void DestroyStoppedEngine();
 
   // Declaration order matters: members destruct in REVERSE order, so the
   // initiator (declared last) is destroyed FIRST, before the factories and

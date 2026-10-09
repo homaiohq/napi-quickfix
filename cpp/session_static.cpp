@@ -69,11 +69,11 @@ class SendToTargetWorker : public Napi::AsyncWorker {
           throw FIX::SessionNotFound();
         }
       }
-      std::shared_ptr<SessionOpGate> gate = SessionOpGate::Lookup(id);
-      if (!gate) {
+      std::unique_ptr<SessionOpGate::OpScope> inflight =
+          SessionOpGate::Acquire(id);
+      if (!inflight) {
         throw FIX::SessionNotFound(id.toString());
       }
-      SessionOpGate::OpScope inflight(gate);
       result_ = FIX::Session::sendToTarget(message_, id);
     } catch (const std::exception& e) {
       err_.Capture(e);

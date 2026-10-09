@@ -278,10 +278,16 @@ engine.unref(): void;  // let a short script / test exit
 `start`/`stop` resolve once the engine has finished starting up / shutting down;
 they run off the main thread so your handlers can fire meanwhile. Once `stop()`
 settles the engine's sessions are destroyed: `getSession` returns `undefined` and
-any `Session` handle you still hold throws `SessionNotFound`. Until then (e.g. in
-a `'logout'` listener fired by a graceful stop) they are still live, and a
-session operation already in flight (`reset()`, `sendToTarget()`, ...) always
-completes before the sessions go away.
+any `Session` handle you still hold throws `SessionNotFound`. Until then they are
+still live: a graceful `stop()` settles only after the `'logout'` events it
+triggered have been delivered, so a `'logout'` listener can still read the
+session, and a session operation already in flight (`reset()`, `sendToTarget()`,
+...) always completes before the sessions go away. `stop(true)` discards the
+events still queued and destroys the sessions right away.
+
+Two live engines cannot share a `SessionID`: constructing one whose session
+already exists in the process throws a `ConfigError` ("Duplicate Session") until
+the engine owning it has been stopped.
 
 ### Session
 

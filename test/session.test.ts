@@ -418,12 +418,42 @@ describe('Session control over a loopback (in-process)', () => {
     await first.stop(); // never started
     assert.equal(doesSessionExist(ACC_ID), false, 'stop() unregisters them, even if never started');
 
-    // Previously this threw ConfigError ("Duplicate Session") until `first` was GC'd.
+    // Had `first` still been alive this would have thrown ConfigError ("Duplicate
+    // Session"); it is stop() settling -- not GC -- that releases the ids.
     const second = new Acceptor({ settings, store: 'memory', log: 'none' });
     assert.ok(second.getSession(ACC_ID));
     assert.equal(second.getSession(ACC_ID)!.isAcceptor(), true);
     await second.stop();
     assert.equal(second.getSession(ACC_ID), undefined);
+  });
+
+  test('two live engines cannot share a SessionID', { timeout: 20_000 }, async () => {
+    // QuickFIX itself would silently let a second engine shadow the first in
+    // its process-wide session registry; the binding rejects it up front.
+    const port = await freePort();
+    const settings = SessionSettings.fromString(acceptorCfg(port));
+    const first = new Acceptor({ settings, store: 'memory', log: 'none' });
+    try {
+      assert.throws(
+        () => new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' }),
+        (err: unknown) => {
+          const e = err as { name?: string; fixErrorName?: string; message?: string };
+          assert.equal(e.name, 'QuickFixError');
+          assert.equal(e.fixErrorName, 'ConfigError');
+          assert.match(e.message ?? '', /Duplicate Session/);
+          return true;
+        },
+      );
+      // The first engine is untouched by the rejected construction.
+      assert.ok(first.getSession(ACC_ID));
+      assert.ok(doesSessionExist(ACC_ID));
+    } finally {
+      await first.stop();
+    }
+    // Released by stop(): the same ids can be used again.
+    const second = new Acceptor({ settings, store: 'memory', log: 'none' });
+    assert.ok(second.getSession(ACC_ID));
+    await second.stop();
   });
 
   test('logon() / logout() / refresh() are synchronous and take effect in program order', async () => {

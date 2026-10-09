@@ -47,6 +47,11 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 - `sendToTarget(message, qualifier?)` overload that resolves the session from the
   message's own header (`BeginString`/`SenderCompID`/`TargetCompID`), alongside the
   existing `sendToTarget(message, sessionID)`.
+- Constructing an `Initiator`/`Acceptor` with a `SessionID` that is already live in the
+  process (owned by another engine that has not been stopped) throws a `QuickFixError`
+  `ConfigError` "Duplicate Session". QuickFIX itself only rejects duplicates within one
+  settings object and would otherwise let the second engine silently shadow the first
+  in its process-wide session registry.
 
 ### Changed
 
@@ -66,12 +71,16 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   public surface is a superset of what it provided.
 - `dist/` no longer ships `.js.map` / `.d.ts.map` files. `src/` is not published, so they
   could never resolve, and they roughly doubled the footprint of the generated tables.
-- An engine now destroys its QuickFIX engine (and therefore its sessions) as soon as
-  `stop()` settles, instead of when the JS object is garbage-collected. A stopped engine
-  could not be restarted before either; the visible differences are that `Session`
-  handles fail deterministically with `SessionNotFound` after `stop()`, and that a new
+- An engine now destroys its QuickFIX engine (and therefore its sessions) when `stop()`
+  settles, instead of when the JS object is garbage-collected. A stopped engine could not
+  be restarted before either; the visible differences are that `Session` handles fail
+  deterministically with `SessionNotFound` after `stop()`, and that a new
   `Initiator`/`Acceptor` configured with the same `SessionID`s can be created right after
-  stopping the old one (previously a `ConfigError` "Duplicate Session" until GC ran).
+  stopping the old one. A graceful `stop()` settles only after the `'logout'` events it
+  triggered have been delivered, so a `'logout'` listener can still reach the session
+  (`engine.getSession(id)`); `stop(true)` discards the events still queued and destroys
+  the engine immediately. If `stop()` fails, the engine is left intact (so it can be
+  stopped again) rather than destroyed with its network thread possibly still running.
   A session operation still in flight when `stop()` is called (`reset()`,
   `sendToTarget()`, ...) always completes before the sessions are destroyed, and
   `engine.getSession()` / `engine.isLoggedOn(id)` keep answering until `stop()` settles

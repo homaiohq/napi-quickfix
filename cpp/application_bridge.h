@@ -6,6 +6,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -41,6 +42,10 @@ class ApplicationBridge : public FIX::Application {
     kToApp,
     kFromAdmin,
     kFromApp,
+    // Not an Application callback: a closure queued by the JS thread through
+    // the same FIFO, so it runs after every event queued before it (see
+    // RunAfterQueued).
+    kBarrier,
   };
 
   // Result returned from the JS trampoline for synchronous calls.
@@ -75,6 +80,9 @@ class ApplicationBridge : public FIX::Application {
     bool hasMessage = false;
     // For synchronous calls only: shared reply channel (null for fire-and-forget).
     std::shared_ptr<SyncChannel> channel;
+    // kBarrier only. Invoked with a null Env if the item is dropped (TSFN
+    // aborted / environment teardown): then it must not touch JS.
+    std::function<void(Napi::Env)> barrier;
   };
 
   // The JS-thread trampoline. Runs on the Node event-loop thread. Declared
@@ -103,6 +111,15 @@ class ApplicationBridge : public FIX::Application {
   void Deactivate();
   void Ref(Napi::Env env);
   void Unref(Napi::Env env);
+
+  // Queue `fn` to run on the JS thread AFTER every callback already queued
+  // (the TSFN queue is FIFO), and keep the event loop alive until it has run.
+  // JS thread only; call it before Release()/Abort(). Returns false, without
+  // queuing anything, if the bridge is no longer accepting work -- the caller
+  // then runs `fn` itself. `fn` receives a null Env if the queue is discarded
+  // before it is reached (Abort() / environment teardown) and must then do
+  // nothing that touches JS.
+  bool RunAfterQueued(Napi::Env env, std::function<void(Napi::Env)> fn);
 
   // FIX::Application overrides.
   void onCreate(const FIX::SessionID&) override;
