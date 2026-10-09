@@ -23,7 +23,8 @@ included.
   points.
 - **TypeScript types included** — hand-written `.d.ts` for the full public API.
 - **Full FIX surface** — the session engine (`Initiator`/`Acceptor` +
-  synchronous application handlers) *and* the pure layer (`Message`,
+  synchronous application handlers), per-session control (`Session`: sequence
+  numbers, logon/logout, runtime options) *and* the pure layer (`Message`,
   `SessionSettings`, `DataDictionary`, `SessionID`).
 - **Ergonomic, safe API** — chainable message building with automatic
   header/trailer field routing, typed rejections, and C++ exceptions surfaced as
@@ -265,11 +266,88 @@ Both extend Node's `EventEmitter` and share the same options and lifecycle:
 new Initiator({ settings, handlers?, store?: 'file' | 'memory', log?: 'screen' | 'file' | 'none' });
 new Acceptor({ settings, handlers?, store?, log? });
 
-engine.start(): void;
-engine.stop(force?: boolean): void;   // graceful drain by default; force to abort
-engine.isLoggedOn(): boolean;
+engine.start(): Promise<void>;
+engine.stop(force?: boolean): Promise<void>;   // graceful drain by default; force to abort
+engine.isLoggedOn(sessionID?: SessionID): boolean; // any session, or just that one
+engine.getSessions(): SessionID[];                 // the [SESSION]s it was configured with
+engine.getSession(sessionID: SessionID): Session | undefined;
 engine.ref(): void;    // keep the event loop alive while running (default)
 engine.unref(): void;  // let a short script / test exit
+```
+
+`start`/`stop` resolve once the engine has finished starting up / shutting down;
+they run off the main thread so your handlers can fire meanwhile. Once `stop()`
+settles the engine's sessions are destroyed: `getSession` returns `undefined` and
+any `Session` handle you still hold throws `SessionNotFound`. Until then they are
+still live: a graceful `stop()` settles only after the `'logout'` events it
+triggered have been delivered, so a `'logout'` listener can still read the
+session, and a `sendToTarget()` already in flight always completes before the
+sessions go away. `stop(true)` discards the events still queued and destroys the
+sessions right away. A `stop()` called while another is still in flight (from
+that `'logout'` listener, say) returns the same Promise, so it too settles only
+once the sessions are gone; the first call's `force` applies to both.
+
+Two live engines cannot share a `SessionID`: constructing one whose session
+already exists in the process throws a `ConfigError` ("Duplicate Session") until
+the engine owning it has been stopped. A constructor that fails on a later
+`[SESSION]` (any `ConfigError`) cleans up the sessions it had already created,
+so the ids are not locked out by the failed attempt.
+
+### Session
+
+A handle on one **live** session, obtained from `engine.getSession(id)` or the
+module-level `lookupSession(id)`. It stores only the `SessionID` and re-resolves
+the engine-owned `FIX::Session` on every call, so it never dangles — once the
+session is gone (its engine was stopped) every method throws, or rejects with, a
+`QuickFixError` whose `fixErrorName` is `'SessionNotFound'`.
+
+```ts
+session.sessionID: SessionID;
+
+// State (sync)
+session.isLoggedOn(): boolean;   session.isEnabled(): boolean;
+session.sentLogon(): boolean;    session.sentLogout(): boolean;   session.receivedLogon(): boolean;
+session.isInitiator(): boolean;  session.isAcceptor(): boolean;
+session.isSessionTime(now?: Date): boolean;   session.isLogonTime(now?: Date): boolean;
+
+// Sequence numbers (sync; setters write to the message store)
+session.getExpectedSenderNum(): number;         session.getExpectedTargetNum(): number;
+session.setNextSenderMsgSeqNum(n: number): void; session.setNextTargetMsgSeqNum(n: number): void;
+
+// Runtime options (sync; change the live session, not its SessionSettings)
+session.getResetOnLogon() / setResetOnLogon(v: boolean)        // likewise: ResetOnLogout,
+session.getLogonTimeout() / setLogonTimeout(seconds: number)   //   ResetOnDisconnect, RefreshOnLogon,
+session.getTimestampPrecision() / setTimestampPrecision(0..9)  //   CheckCompId, CheckLatency, MaxLatency,
+                                                               //   LogoutTimeout, PersistMessages,
+                                                               //   SendRedundantResendRequests,
+                                                               //   ValidateLengthAndChecksum,
+                                                               //   SendNextExpectedMsgSeqNum, IsNonStopSession
+
+// Control
+session.logon(): void;                   // enable; an initiator reconnects + logs on
+session.logout(reason?: string): void;   // disable + graceful Logout; stays down until logon()
+session.refresh(): void;                 // re-read state from the message store
+```
+
+Everything is synchronous: none of these members takes the mutex QuickFIX holds
+while it runs your handlers, so they are safe on the main thread — and because
+they run inline, `session.logout('x'); session.logon();` takes effect in that
+order. QuickFIX's `Session::disconnect()` and `reset()` are deliberately **not**
+exposed: they drop the transport through the engine's socket monitor, which is
+only safe from the engine's own network thread (QuickFIX itself never calls them
+from anywhere else). Bring a session down with `logout()` and renumber it with
+the sequence-number setters. Observe the outcome through the engine's
+`'logon'` / `'logout'` events:
+
+```ts
+initiator.on('logon', async (id) => {
+  const session = initiator.getSession(id)!;
+  console.log('next outbound seq', session.getExpectedSenderNum());
+  session.setNextTargetMsgSeqNum(1); // e.g. after the counterparty reset
+});
+
+lookupSession(id)?.logout('maintenance');   // -> 'logout' event, isLoggedOn() === false
+lookupSession(id)?.logon();                 // -> reconnects, 'logon' event
 ```
 
 ### Handlers vs. events
@@ -308,7 +386,14 @@ Recognized kinds: `'DoNotSend'`, `'RejectLogon'`, `'UnsupportedMessageType'`,
 ### Module functions and constants
 
 ```ts
-sendToTarget(message: Message, sessionID: SessionID): boolean;
+sendToTarget(message: Message, sessionID: SessionID): Promise<boolean>;
+sendToTarget(message: Message, qualifier?: string): Promise<boolean>; // session from the message header (8/49/56)
+
+lookupSession(sessionID: SessionID): Session | undefined; // any engine in this process
+doesSessionExist(sessionID: SessionID): boolean;
+getSessions(): SessionID[];      // every session in this process, across all engines
+numSessions(): number;
+
 version(): string;               // engine / addon version string
 
 FIELD        // field-name -> tag number, e.g. FIELD.MsgType === 35, FIELD.Password === 554

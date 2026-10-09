@@ -19,6 +19,7 @@
 #include "message_wrap.h"
 #include "session_id_wrap.h"
 #include "session_settings_wrap.h"
+#include "session_wrap.h"
 
 namespace napi_quickfix {
 
@@ -64,6 +65,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   SessionIDWrap::Init(env, exports);
   SessionSettingsWrap::Init(env, exports);
   DataDictionaryWrap::Init(env, exports);
+  SessionWrap::Init(env, exports);
   InitiatorWrap::Init(env, exports);
   AcceptorWrap::Init(env, exports);
 

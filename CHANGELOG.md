@@ -24,6 +24,39 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   value group next to `FIELD`.
 - `yarn gen:values` / `yarn gen:values:check` regenerate and verify the table, like
   `gen:fields`.
+- `Session`: a handle on a live `FIX::Session`, obtained from `engine.getSession(id)` or
+  the module-level `lookupSession(id)`. Sync state getters (`isLoggedOn`, `isEnabled`,
+  `sentLogon`, `sentLogout`, `receivedLogon`, `isInitiator`, `isAcceptor`,
+  `isSessionTime(now?)`, `isLogonTime(now?)`), sequence-number access
+  (`getExpectedSenderNum`, `getExpectedTargetNum`, `setNextSenderMsgSeqNum`,
+  `setNextTargetMsgSeqNum`), getters/setters for the runtime options (`ResetOnLogon`,
+  `ResetOnLogout`, `ResetOnDisconnect`, `RefreshOnLogon`, `CheckCompId`, `CheckLatency`,
+  `MaxLatency`, `LogonTimeout`, `LogoutTimeout`, `PersistMessages`,
+  `SendRedundantResendRequests`, `ValidateLengthAndChecksum`, `SendNextExpectedMsgSeqNum`,
+  `IsNonStopSession`, `TimestampPrecision`), and control: `logon()`, `logout(reason?)`
+  and `refresh()`. Every member is synchronous (and therefore takes effect in program
+  order); QuickFIX's `Session::disconnect()`/`reset()` are deliberately not exposed, as
+  they are only safe on the engine's own network thread. The handle re-resolves the
+  session on every call and throws `QuickFixError{fixErrorName: 'SessionNotFound'}`
+  once the owning engine has been stopped.
+- Module functions `lookupSession(id)`, `doesSessionExist(id)`, `getSessions()` and
+  `numSessions()` over every session in the process.
+- `Initiator`/`Acceptor`: `getSessions()` (the configured `[SESSION]`s),
+  `getSession(id)`, and `isLoggedOn(sessionID?)` — the no-argument form keeps its
+  engine-wide meaning; a `sessionID` argument that is not a `SessionID` is a
+  `TypeError`, never a fallback to the engine-wide form.
+- `sendToTarget(message, qualifier?)` overload that resolves the session from the
+  message's own header (`BeginString`/`SenderCompID`/`TargetCompID`), alongside the
+  existing `sendToTarget(message, sessionID)`. A `SessionID` from the other build of
+  the package (ESM vs. CJS) is accepted; any other non-string target is a `TypeError`,
+  never routed by the header instead.
+- Constructing an `Initiator`/`Acceptor` with a `SessionID` that is already live in the
+  process (owned by another engine that has not been stopped) throws a `QuickFixError`
+  `ConfigError` "Duplicate Session". QuickFIX itself only rejects duplicates within one
+  settings object and would otherwise let the second engine silently shadow the first
+  in its process-wide session registry. A constructor that fails on a later `[SESSION]`
+  deletes the sessions QuickFIX had already created for it (QuickFIX leaks them), so a
+  failed construction does not lock those ids out for the rest of the process.
 
 ### Changed
 
@@ -43,6 +76,26 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   public surface is a superset of what it provided.
 - `dist/` no longer ships `.js.map` / `.d.ts.map` files. `src/` is not published, so they
   could never resolve, and they roughly doubled the footprint of the generated tables.
+- An engine now destroys its QuickFIX engine (and therefore its sessions) when `stop()`
+  settles, instead of when the JS object is garbage-collected. A stopped engine could not
+  be restarted before either; the visible differences are that `Session` handles fail
+  deterministically with `SessionNotFound` after `stop()`, and that a new
+  `Initiator`/`Acceptor` configured with the same `SessionID`s can be created right after
+  stopping the old one. A graceful `stop()` settles only after the `'logout'` events it
+  triggered have been delivered, so a `'logout'` listener can still reach the session
+  (`engine.getSession(id)`); `stop(true)` discards the events still queued and destroys
+  the engine immediately. If `stop()` fails, the engine is left intact (so it can be
+  stopped again) rather than destroyed with its network thread possibly still running.
+  A `sendToTarget()` still in flight when `stop()` is called always completes before
+  the sessions are destroyed, and `engine.getSession()` / `engine.isLoggedOn(id)` keep
+  answering until `stop()` settles (e.g. from a `'logout'` listener fired by a graceful
+  stop). A `stop()` called while one is in flight returns that stop's Promise, so it
+  never settles before the sessions are gone. `stop()` on a never-started engine is
+  now asynchronous like every other `stop()`.
+- `Session` int option setters (`setLogonTimeout`, `setLogoutTimeout`, `setMaxLatency`)
+  throw `RangeError` for a non-integer or a value outside the int32 range, consistent
+  with `setNextSenderMsgSeqNum` / `setTimestampPrecision` (previously `TypeError` for a
+  non-integer and undefined behaviour for an out-of-range value).
 
 ## [0.1.0] - 2026-10-08
 

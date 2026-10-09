@@ -96,6 +96,27 @@ void ApplicationBridge::Abort() {
   }
 }
 
+bool ApplicationBridge::RunAfterQueued(Napi::Env env,
+                                       std::function<void(Napi::Env)> fn) {
+  if (released_ || inactive_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  // The loop must not exit before the barrier has run even if the user
+  // unref()'d the engine; after Release() the TSFN closes as soon as its queue
+  // is drained, so this only keeps the loop alive for that drain.
+  tsfn_.Ref(env);
+  auto* data = new CallData();
+  data->type = CallType::kBarrier;
+  data->hasMessage = false;
+  data->barrier = std::move(fn);
+  napi_status status = tsfn_.NonBlockingCall(data);
+  if (status != napi_ok) {
+    delete data;
+    return false;
+  }
+  return true;
+}
+
 void ApplicationBridge::Deactivate() {
   inactive_.store(true, std::memory_order_release);
   // Release any network thread already blocked in CallSync so the subsequent
@@ -298,6 +319,12 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
       delete data;
     }
   } guard{data, {}};
+
+  if (data->type == CallType::kBarrier) {
+    // Dropped (null env) or reached in FIFO order: either way, hand over.
+    if (data->barrier) data->barrier(env);
+    return;
+  }
 
   // env may be null during environment teardown; nothing safe to do.
   if (env == nullptr || context == nullptr) {
