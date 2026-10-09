@@ -152,14 +152,14 @@ export interface NativeEngineOptions {
  * Native handle on a live `FIX::Session`.
  *
  * The handle stores only the `FIX::SessionID`; every method re-resolves the
- * engine-owned session via `FIX::Session::lookupSession` and throws (or
- * rejects, for the async ops) a {@link QuickFixError} with
- * `fixErrorName: 'SessionNotFound'` once the owning engine has been stopped.
+ * engine-owned session via `FIX::Session::lookupSession` and throws a
+ * {@link QuickFixError} with `fixErrorName: 'SessionNotFound'` once the owning
+ * engine has been stopped.
  *
- * Sync members never take the session mutex QuickFIX holds across application
- * callbacks, so they are safe on the main thread. `disconnect`/`reset` run OFF
- * the main thread (AsyncWorker) because they take that mutex and fire
- * `toAdmin`/`onLogout`; `logon`/`logout`/`refresh` do neither and stay sync.
+ * Every member is synchronous: none takes the session mutex QuickFIX holds
+ * across application callbacks, so they are safe on the main thread.
+ * `FIX::Session::disconnect()`/`reset()` are not exposed; they are only safe
+ * on the engine's own network thread (see `cpp/session_wrap.cpp`).
  */
 export interface NativeSession {
   getSessionID(): NativeSessionID;
@@ -216,8 +216,6 @@ export interface NativeSession {
   logout(reason?: string): void;
   /** May throw a `QuickFixError` (`IOException`) from the message store. */
   refresh(): void;
-  disconnect(): Promise<void>;
-  reset(): Promise<void>;
 }
 
 /**

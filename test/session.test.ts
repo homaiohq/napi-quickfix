@@ -1,8 +1,10 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 
 import {
   Acceptor,
+  Engine,
   Initiator,
   Session,
   SessionSettings,
@@ -19,10 +21,14 @@ import {
 } from '../dist/esm/index.js';
 import { acceptorCfg, freePort, initiatorCfg, waitForEvent, waitUntil } from './helpers.js';
 
+// The CJS build of the same package: a distinct `SessionID` class over the
+// same native addon, as a consumer mixing `import` and `require` would get.
+const cjs = createRequire(import.meta.url)('../dist/cjs/index.js') as typeof import('../dist/esm/index.js');
+
 // Per-session lookup, sequence numbers and logon control, exercised against a
 // real in-process loopback (Acceptor + Initiator over localhost). Same harness
-// as loopback.test.ts; the logon handshake, a logout/logon cycle and a reset
-// each cost ~1-2s (ReconnectInterval=1), hence the generous timeouts.
+// as loopback.test.ts; the logon handshake and a logout/logon cycle each cost
+// ~1-2s (ReconnectInterval=1), hence the generous timeouts.
 
 const HANDSHAKE_TIMEOUT_MS = 8000;
 const DELIVERY_TIMEOUT_MS = 5000;
@@ -57,7 +63,7 @@ describe('Session lookup without an engine', () => {
 
 describe('Session control over a loopback (in-process)', () => {
   test(
-    'lookup, state, seq nums, logout/logon, setNextSenderMsgSeqNum, reset, options, stop',
+    'lookup, state, seq nums, logout/logon, setNextSenderMsgSeqNum, options, stop',
     { timeout: 60_000 },
     async () => {
       const port = await freePort();
@@ -233,16 +239,6 @@ describe('Session control over a loopback (in-process)', () => {
         assert.throws(() => iniSession!.setNextSenderMsgSeqNum(-1), RangeError);
         assert.throws(() => iniSession!.setNextTargetMsgSeqNum(1.5), RangeError);
 
-        // --- reset(): Logout + disconnect + store reset, then auto-reconnect ------------
-        const resetLogout = waitForEvent(ini, 'logout', 'initiator logout (reset)', HANDSHAKE_TIMEOUT_MS);
-        const resetLogon = waitForEvent(ini, 'logon', 'initiator logon (after reset)', HANDSHAKE_TIMEOUT_MS);
-        await iniSession.reset();
-        await resetLogout;
-        assert.equal(iniSession.isEnabled(), true, 'reset() leaves the session enabled');
-        await resetLogon;
-        assert.equal(iniSession.isLoggedOn(), true);
-        assert.ok(iniSession.getExpectedSenderNum() < 50, 'reset() cleared the store');
-
         // --- refresh() is sync and does not throw ------------------------------------------
         assert.doesNotThrow(() => iniSession!.refresh());
 
@@ -319,8 +315,6 @@ describe('Session control over a loopback (in-process)', () => {
       assert.throws(() => iniSession!.logout(), isSessionNotFound);
       assert.throws(() => iniSession!.logon(), isSessionNotFound);
       assert.throws(() => accSession!.refresh(), isSessionNotFound);
-      await assert.rejects(() => iniSession!.reset(), isSessionNotFound);
-      await assert.rejects(() => accSession!.disconnect(), isSessionNotFound);
     },
   );
 
@@ -377,15 +371,15 @@ describe('Session control over a loopback (in-process)', () => {
       const iniSession = lookupSession(INI_ID)!;
       const accSession = lookupSession(ACC_ID)!;
 
-      // Queue async session ops and a send, then stop WITHOUT awaiting them.
-      // The engine must outlive the ops (they hold raw FIX::Session pointers on
-      // a worker thread); each op then either completes or, if it had not yet
-      // resolved its session when the engine went away, rejects SessionNotFound.
+      // Queue sends, then stop WITHOUT awaiting them. The engine must outlive
+      // the sends (they hold raw FIX::Session pointers on a worker thread);
+      // each then either completes or, if it had not yet resolved its session
+      // when the engine went away, rejects SessionNotFound.
       accSession.logout('stopping');
       iniSession.refresh();
       const pending = [
-        settles(iniSession.reset()),
-        settles(iniSession.disconnect()),
+        settles(sendToTarget(newOrder(), INI_ID)),
+        settles(sendToTarget(newOrder(), ACC_ID)),
         settles(sendToTarget(newOrder(), INI_ID)),
       ];
       await ini.stop();
@@ -400,14 +394,155 @@ describe('Session control over a loopback (in-process)', () => {
     }
 
     // Same race against a never-started engine: its sessions exist from
-    // construction, so a session op can be in flight when stop() destroys them.
+    // construction, so a send can be in flight when stop() destroys them.
     const idle = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
-    const idleSession = lookupSession(ACC_ID);
-    assert.ok(idleSession);
-    const idleOps = [settles(idleSession.reset()), settles(idleSession.disconnect())];
+    assert.ok(lookupSession(ACC_ID));
+    const idleOps = [settles(sendToTarget(newOrder(), ACC_ID)), settles(sendToTarget(newOrder(), ACC_ID))];
     await idle.stop();
     assert.equal((await Promise.all(idleOps)).length, 2);
     assert.equal(lookupSession(ACC_ID), undefined);
+  });
+
+  test('a second stop() while one is in flight settles with it, not before', { timeout: 30_000 }, async () => {
+    const port = await freePort();
+    const acc = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
+    const ini = new Initiator({ settings: SessionSettings.fromString(initiatorCfg(port)), store: 'memory', log: 'none' });
+    try {
+      const logons = Promise.all([
+        waitForEvent(acc, 'logon', 'acceptor logon', HANDSHAKE_TIMEOUT_MS),
+        waitForEvent(ini, 'logon', 'initiator logon', HANDSHAKE_TIMEOUT_MS),
+      ]);
+      await acc.start();
+      await ini.start();
+      await logons;
+
+      // The 'logout' listener fired by a graceful stop runs BEFORE that stop
+      // settles (the engine is destroyed behind the queued events). A stop()
+      // issued from there used to resolve immediately -- `stopped_` was already
+      // set -- while the sessions were still alive.
+      let fromListener: Promise<void> | undefined;
+      let sessionGoneWhenSettled: boolean | undefined;
+      ini.once('logout', () => {
+        fromListener = ini.stop();
+        void fromListener.then(() => {
+          sessionGoneWhenSettled = ini.getSession(INI_ID) === undefined;
+        });
+      });
+
+      const first = ini.stop();
+      // Synchronously after: the worker is running, a second call joins it
+      // (the first call's `force` applies; it is not restarted as a force stop).
+      assert.strictEqual(ini.stop(true), first, 'a concurrent stop() returns the in-flight promise');
+      await first;
+
+      assert.ok(fromListener, "the 'logout' listener ran and called stop()");
+      assert.strictEqual(fromListener, first, "stop() from the 'logout' listener joined the in-flight stop");
+      await fromListener;
+      assert.equal(sessionGoneWhenSettled, true, 'when the joined promise settled the sessions were gone');
+      assert.equal(ini.getSession(INI_ID), undefined);
+
+      // Once settled, stop() is a fresh, immediately-resolved no-op again.
+      const again = ini.stop();
+      assert.notStrictEqual(again, first);
+      await again;
+    } finally {
+      await ini.stop().catch(() => {});
+      await acc.stop().catch(() => {});
+    }
+
+    // Never-started engine: same joining while its (async) stop() is pending.
+    const idle = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
+    const a = idle.stop();
+    const b = idle.stop();
+    assert.strictEqual(b, a);
+    await a;
+    assert.equal(lookupSession(ACC_ID), undefined);
+  });
+
+  test('a constructor that fails on a later [SESSION] leaves no orphaned session behind', { timeout: 20_000 }, async () => {
+    // QuickFIX's Initiator/Acceptor::initialize() creates the sessions one by
+    // one and, if a later [SESSION] is misconfigured, throws without deleting
+    // the ones already created: they would stay in the process-wide registry
+    // with no owner, locking their ids out of every later engine ("Duplicate
+    // Session") and resolvable through lookupSession(). The wraps clean them
+    // up. The valid session is named to sort FIRST (std::set<SessionID>
+    // iterates in order) so that it is the one created before the throw.
+    const port = await freePort();
+    const good = new SessionID('FIX.4.4', 'AAA', 'SERVER');
+    const cases: Array<[string, string, RegExp, () => Engine]> = [
+      [
+        'Initiator',
+        `${initiatorCfg(port).replace('SenderCompID=CLIENT', 'SenderCompID=AAA')}
+[SESSION]
+BeginString=FIX.4.4
+SenderCompID=ZZZ
+TargetCompID=SERVER
+HeartBtInt=0
+`,
+        /Heartbeat must be greater than zero/,
+        () => new Initiator({ settings: SessionSettings.fromString(initiatorCfg(port).replace('SenderCompID=CLIENT', 'SenderCompID=AAA')), store: 'memory', log: 'none' }),
+      ],
+      [
+        'Acceptor',
+        `${acceptorCfg(port).replace('SenderCompID=SERVER\nTargetCompID=CLIENT', 'SenderCompID=AAA\nTargetCompID=SERVER')}
+[SESSION]
+BeginString=FIX.4.4
+SenderCompID=ZZZ
+TargetCompID=SERVER
+StartDay=Monday
+`,
+        /StartDay used without EndDay/,
+        () => new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port).replace('SenderCompID=SERVER\nTargetCompID=CLIENT', 'SenderCompID=AAA\nTargetCompID=SERVER')), store: 'memory', log: 'none' }),
+      ],
+    ];
+    for (const [kind, cfg, reason, retryWithGoodOnly] of cases) {
+      const settings = SessionSettings.fromString(cfg);
+      assert.ok(settings.getSessions().length === 2, `${kind}: both [SESSION]s parsed`);
+      const Ctor = kind === 'Initiator' ? Initiator : Acceptor;
+      const isThatConfigError = (err: unknown) => {
+        const e = err as { name?: string; fixErrorName?: string; message?: string };
+        assert.equal(e.name, 'QuickFixError');
+        assert.equal(e.fixErrorName, 'ConfigError');
+        assert.match(e.message ?? '', reason);
+        return true;
+      };
+      assert.throws(() => new Ctor({ settings, store: 'memory', log: 'none' }), isThatConfigError, `${kind}: rejected`);
+      assert.equal(doesSessionExist(good), false, `${kind}: the session created before the throw is gone`);
+      assert.equal(lookupSession(good), undefined);
+      // Retrying is the same ConfigError, not "Duplicate Session".
+      assert.throws(() => new Ctor({ settings, store: 'memory', log: 'none' }), isThatConfigError, `${kind}: retry`);
+      // And the id is free for a correct engine.
+      const engine = retryWithGoodOnly();
+      assert.ok(engine.getSession(good), `${kind}: a valid engine can use the id afterwards`);
+      await engine.stop();
+    }
+  });
+
+  test('SessionID arguments are validated, never silently reinterpreted', async () => {
+    const port = await freePort();
+    const engine = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
+    try {
+      const session = engine.getSession(ACC_ID)!;
+      // sendToTarget: a bad target must not fall through to the "route by the
+      // message header" form; it is a synchronous TypeError, as on the native
+      // layer.
+      assert.throws(() => sendToTarget(newOrder(), {} as unknown as SessionID), TypeError);
+      assert.throws(() => sendToTarget(newOrder(), null as unknown as SessionID), TypeError);
+      assert.throws(() => sendToTarget(newOrder(), { nativeHandle: undefined } as unknown as SessionID), TypeError);
+      assert.throws(() => sendToTarget(newOrder(), session as unknown as SessionID), TypeError);
+      // engine.isLoggedOn: a bad id must not degrade to the engine-wide form.
+      assert.throws(() => engine.isLoggedOn({} as unknown as SessionID), TypeError);
+      assert.throws(() => engine.isLoggedOn(null as unknown as SessionID), TypeError);
+      assert.throws(() => engine.isLoggedOn(session as unknown as SessionID), TypeError);
+      assert.equal(engine.isLoggedOn(undefined), false, 'an explicit undefined is the engine-wide form');
+      assert.equal(engine.isLoggedOn(ACC_ID), false);
+      // Same for the other SessionID-taking entry points.
+      assert.throws(() => engine.getSession({} as unknown as SessionID), TypeError);
+      assert.throws(() => lookupSession(null as unknown as SessionID), TypeError);
+      assert.throws(() => doesSessionExist(session as unknown as SessionID), TypeError);
+    } finally {
+      await engine.stop();
+    }
   });
 
   test('a stopped engine releases its SessionIDs for a new engine', { timeout: 20_000 }, async () => {
@@ -479,18 +614,28 @@ describe('Session control over a loopback (in-process)', () => {
     }
   });
 
-  test('sendToTarget accepts a SessionID from another copy of the package', async () => {
-    // An ESM and a CJS build of this package each have their own SessionID
-    // class; `instanceof` across them is false. Only the shape must matter.
+  test('SessionID arguments from the other build of the package are accepted', async () => {
+    // The ESM and CJS builds each have their own SessionID class, so
+    // `instanceof SessionID` across them is false; what they share is the
+    // native addon, whose SessionIDWrap the argument check keys on.
+    assert.notStrictEqual(cjs.SessionID, SessionID, 'the two builds really are distinct classes');
+    const foreign = new cjs.SessionID('FIX.4.4', 'SERVER', 'CLIENT') as unknown as SessionID;
+    assert.ok(!(foreign instanceof SessionID));
+
     const port = await freePort();
     const engine = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
     try {
-      const foreign = { nativeHandle: ACC_ID.nativeHandle } as unknown as SessionID;
       // Not logged on, so the engine queues the message and reports false --
       // the point is that it is routed, not rejected with a TypeError.
       assert.equal(await sendToTarget(newOrder(), foreign), false);
+      assert.equal(engine.isLoggedOn(foreign), false);
+      assert.ok(engine.getSession(foreign));
+      assert.ok(lookupSession(foreign));
+      assert.equal(doesSessionExist(foreign), true);
+      // And the other way round: this build's id into the CJS build's API.
+      assert.equal(cjs.doesSessionExist(ACC_ID as unknown as Parameters<typeof cjs.doesSessionExist>[0]), true);
       await assert.rejects(
-        () => sendToTarget(newOrder(), { nativeHandle: new SessionID('FIX.4.4', 'NOPE', 'NADA').nativeHandle } as unknown as SessionID),
+        () => sendToTarget(newOrder(), new cjs.SessionID('FIX.4.4', 'NOPE', 'NADA') as unknown as SessionID),
         isSessionNotFound,
       );
     } finally {

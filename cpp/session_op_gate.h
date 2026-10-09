@@ -13,14 +13,14 @@
 namespace napi_quickfix {
 
 // Per-engine gate between the libuv-thread session operations
-// (SessionOpWorker, SendToTargetWorker) and the destruction of the engine that
-// owns the sessions they operate on.
+// (SendToTargetWorker, session_static.cpp) and the destruction of the engine
+// that owns the sessions they operate on.
 //
 // Why: FIX::Session::lookupSession() hands out a raw, non-owning pointer into
 // an engine-owned object, and nothing in QuickFIX keeps that session alive
 // while the caller uses it. The engine wraps destroy their FIX engine (which
 // deletes every FIX::Session) as soon as stop() settles, so without this gate
-// a `session.reset()` still running on one libuv thread while `engine.stop()`
+// a `sendToTarget()` still running on one libuv thread while `engine.stop()`
 // completes would be a use-after-free.
 //
 // Why per engine (not process-wide): the gate must only ever couple an
@@ -49,7 +49,7 @@ namespace napi_quickfix {
 //     then unregisters and destroys the engine on the JS thread (OnOK) and
 //     calls Unfreeze(). Because Freeze() waits on a libuv thread while the JS
 //     loop is free, an in-flight operation blocked in a BlockingCall to JS
-//     (e.g. reset() -> toAdmin) can still complete.
+//     (sendToTarget() -> toApp) can still complete.
 //   * The wrap destructor calls Freeze() on the JS thread, but only after
 //     Teardown() has deactivated the bridge (waking every pending BlockingCall
 //     and making later callbacks pass through) and joined the network threads,

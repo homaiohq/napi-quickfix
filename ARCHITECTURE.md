@@ -173,20 +173,29 @@ and the entire pure layer (`Message`, `SessionID`, `SessionSettings`, `DataDicti
 cleanup hook deactivates the bridge and force-stops the engine **before** the TSFN is torn down, so a live session
 never crashes on shutdown.
 
-### `Session`: which members are async, and why
+### `Session`: why every member is synchronous
 
-`SessionWrap` is a handle on an engine-owned `FIX::Session`. The rule for its sync/async split is the lock, not the
-I/O: **QuickFIX holds `Session::m_mutex` while it runs application callbacks** (`sendRaw` holds it across
-`toAdmin`/`toApp`; `disconnect` holds it across `onLogout`). A QuickFIX thread blocked in one of those callbacks is
-waiting on the JS event loop via a `BlockingCall`, so any main-thread call that takes `m_mutex` would wait on a
-thread that is waiting on the main thread — deadlock.
+`SessionWrap` is a handle on an engine-owned `FIX::Session`. The rule for what may run on the main thread is the
+lock, not the I/O: **QuickFIX holds `Session::m_mutex` while it runs application callbacks** (`sendRaw` holds it
+across `toAdmin`/`toApp`; `disconnect` holds it across `onLogout`). A QuickFIX thread blocked in one of those
+callbacks is waiting on the JS event loop via a `BlockingCall`, so any main-thread call that takes `m_mutex` would
+wait on a thread that is waiting on the main thread — deadlock. Every exposed member stays clear of it:
 
 | Members | Thread | Why |
 | --- | --- | --- |
 | `isLoggedOn` · `isEnabled` · `sentLogon` · `sentLogout` · `receivedLogon` · `isInitiator` · `isAcceptor` · `isSessionTime` · `isLogonTime` · option getters/setters | sync, main | Read/write plain members of `FIX::Session`; no lock, no callback. |
 | `getExpectedSenderNum` · `getExpectedTargetNum` · `setNextSenderMsgSeqNum` · `setNextTargetMsgSeqNum` | sync, main | Touch the `MessageStore` under `SessionState`'s own mutex, which QuickFIX never holds across a callback. May throw `IOException` (mapped to `QuickFixError`). |
 | `logon` · `logout` · `refresh` | sync, main | Only touch `SessionState` (`enabled`/`logoutReason`, and the store for `refresh`) under its own mutex; no `m_mutex`, no callback. Running them inline also keeps them **ordered**: as AsyncWorkers, `logout(); logon();` could land on two pool threads in either order. |
-| `reset` · `disconnect` | **async, `SessionOpWorker`** | Take `m_mutex` **and** fire `toAdmin` (`reset` sends a Logout) / `onLogout` through the TSFN — the deadlock case above. |
+
+`FIX::Session::disconnect()` and `reset()` (which calls it) are **not exposed**, and not only because they take
+`m_mutex` and fire callbacks (that alone would just make them AsyncWorkers, like `sendToTarget`). Through the
+session's responder they reach `FIX::SocketMonitor::drop()`, which erases from the monitor's socket sets and pushes
+onto its dropped queue with **no lock**, while the engine's network thread iterates those same sets in
+`SocketMonitor::block()`. QuickFIX only ever calls them from that thread itself (timeouts, logout handling,
+remote disconnects); from any other thread they are a data race with a crash window of a few instructions
+(upstream quickfix/quickfix#346, closed "not planned"). There is no public hook to run code on the network thread,
+and this binding does not patch QuickFIX, so the supported way to bring a session down is `logout()` — exactly
+what `Initiator::stop()` itself does — and to renumber it, the sequence-number setters.
 
 **Lifetime.** `FIX::Session` objects are owned by the engine and `FIX::Session::lookupSession` returns a raw,
 non-owning pointer, so `SessionWrap` never caches it: it stores the `FIX::SessionID` by value and re-resolves on
@@ -199,20 +208,26 @@ after the old one has been stopped. A `SessionID` that is still live is refused:
 `ConfigError` "Duplicate Session" (`RejectDuplicateSessions`, `engine_common.h`). QuickFIX itself does **not**
 enforce that — its `Session` constructor ignores `addSession()`'s result and the only upstream "Duplicate Session"
 check is within one `SessionSettings` — so without it a second engine silently shadowed the first in the registry.
+The check has a corollary: `Initiator`/`Acceptor::initialize()` creates the sessions one `[SESSION]` at a time and,
+if a later one throws `ConfigError`, unwinds without the engine destructor that would delete the ones already
+created — they would stay registered with no owner, resolvable through `lookupSession` yet refused as duplicates
+by every later engine. Both wrap constructors therefore catch the throw and delete those orphans
+(`DestroyOrphanedSessions`, `engine_common.h`): the duplicate check just before guarantees every session of theirs
+that exists at that point was created by the failed constructor.
 
 That eager destruction races with the worker-thread operations above, which hold a raw `FIX::Session*` between
 `lookupSession` and the end of the operation. `session_op_gate.h` closes the race with a **per-engine** gate.
 Each wrap owns a `shared_ptr<SessionOpGate>` and registers it for its `SessionID`s at construction (the duplicate
-check above is what keeps the registry one-to-one). `SessionOpWorker` / `SendToTargetWorker` call
-`SessionOpGate::Acquire(id)` on the worker thread (deriving the id from the message header first, for the
-qualifier form of `sendToTarget`) and hold the returned `OpScope` for their whole `Execute()`; no registered gate
+check above is what keeps the registry one-to-one). `SendToTargetWorker` calls `SessionOpGate::Acquire(id)` on
+the worker thread (deriving the id from the message header first, for the qualifier form of `sendToTarget`) and
+holds the returned `OpScope` for its whole `Execute()`; no registered gate
 means no engine owns the session, reported as `SessionNotFound`. `Acquire` re-reads the registry *after* the scope
 is held and keeps it only if the same gate is still the owner: constructing the scope may have blocked across the
 owner's destruction, and a new engine may own the id by then — holding the old gate would let the new engine's
 `stop()` destroy the session mid-operation. The engine's stop worker — on its **own** libuv thread, after `stop()`
 has joined the network threads — calls `Freeze()` on *its* gate, which blocks new operations on *its* sessions and
 waits for the in-flight ones to drain. Waiting on the worker thread rather than on the JS thread matters: an
-in-flight `reset()` may be blocked in a `toAdmin` `BlockingCall`, which needs the JS loop free. A never-started
+in-flight `sendToTarget()` may be blocked in a `toApp` `BlockingCall`, which needs the JS loop free. A never-started
 engine takes the same async path on `stop()`, since its sessions are registered from construction.
 
 The destruction itself (unregister, delete the engine, `Unfreeze()`) runs on the JS thread, but **not** straight
@@ -224,6 +239,10 @@ behind those events, then releases the TSFN; the TSFN is ref'd for that drain so
 still resolves. `stop(true)` aborts the TSFN (discarding queued events) and destroys immediately. If `stop()`
 itself threw, the engine is left intact, the gate unfrozen and `stopped_` cleared so a later `stop()` or the
 destructor's `Teardown()` retries — the network thread may still be running, so destroying would be unsafe.
+Because the settlement is deferred, `stopped_` is set long before the engine is gone; a `stop()` made in that
+window (typically from the `'logout'` listener the stop fired) must not resolve on the strength of `stopped_`
+alone. The wrap keeps a reference to the in-flight stop's promise (`stopPromise_`) until it settles and returns
+that same promise to any `stop()` made meanwhile, whatever its `force` argument.
 
 The gate is per engine, not process-wide, for two reasons. Stopping engine A must not stall engine B's operations,
 nor wait on them. And the wrap **destructor** (GC, JS thread) also freezes before destroying its engine: with one
@@ -299,7 +318,7 @@ musl entries and link musl objects into a glibc addon.
 | Per-session control | `src/session.ts` (`Session`, `lookupSession`, `doesSessionExist`, `getSessions`, `numSessions`), `cpp/session_wrap.{h,cpp}` |
 | Native loader | `src/native.ts`, `src/load-native.cjs` |
 | Addon entry / wraps | `cpp/addon.cpp`, `cpp/*_wrap.{h,cpp}`, `cpp/session_static.cpp` (`sendToTarget` + session lookups) |
-| Bridge / async / errors | `cpp/application_bridge.{h,cpp}`, `cpp/engine_workers.h` (`EngineOpWorker`, `SessionOpWorker`), `cpp/errors.h` |
+| Bridge / async / errors | `cpp/application_bridge.{h,cpp}`, `cpp/engine_workers.h` (`EngineOpWorker`), `cpp/session_static.cpp` (`SendToTargetWorker`), `cpp/errors.h` |
 | Build / dist | `CMakeLists.txt`, `scripts/prebuild.mjs`, `tsconfig.*.json`, `package.json` |
 | Tests | `test/*.test.ts`, `test/helpers.ts` (loopback harness) |
 | CI | `.github/workflows/ci.yml`, `.github/workflows/release.yml` |

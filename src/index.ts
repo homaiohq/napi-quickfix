@@ -6,7 +6,7 @@
  */
 import { native } from './native.js';
 import type { Message } from './message.js';
-import type { SessionID } from './session-id.js';
+import { type SessionID, toNativeSessionID } from './session-id.js';
 
 // --- Pure layer -----------------------------------------------------------
 export { Message, createMessage, parseMessage } from './message.js';
@@ -46,6 +46,8 @@ export type { Enums, EnumGroup, FieldName, ValueGroups, ValueGroupName } from '.
  * @param message The message to send.
  * @param sessionID The destination session.
  * @returns A Promise resolving to `true` if the message was accepted for sending.
+ * @throws {TypeError} synchronously if `sessionID` is neither a {@link SessionID}
+ *   nor a qualifier string (it is not routed by the header instead).
  *
  * @example
  * ```ts
@@ -75,11 +77,13 @@ export function sendToTarget(
 ): Promise<boolean> {
   // Dispatch on the primitive, not `instanceof SessionID`: this package ships
   // ESM and CJS builds, and a SessionID created by the other build is a
-  // different class with the same shape. Duck-typing keeps it working.
+  // different class with the same shape (see toNativeSessionID). Anything
+  // else is a TypeError here rather than an `undefined` target the native
+  // layer would read as "route by the message header".
   const target =
     typeof sessionIDOrQualifier === 'string' || sessionIDOrQualifier === undefined
       ? sessionIDOrQualifier
-      : sessionIDOrQualifier.nativeHandle;
+      : toNativeSessionID(sessionIDOrQualifier, 'sessionID');
   return native.sendToTarget(message.nativeHandle, target);
 }
 

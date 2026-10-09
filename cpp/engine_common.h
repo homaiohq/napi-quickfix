@@ -38,6 +38,35 @@ inline void RejectDuplicateSessions(const FIX::SessionSettings& settings,
   }
 }
 
+// Delete the FIX::Session objects a FAILED engine constructor left behind.
+// FIX::Initiator/Acceptor::initialize() creates one FIX::Session per [SESSION]
+// of its connection type, registering each in the process-wide registry, and
+// if a later [SESSION] throws ConfigError the constructor unwinds WITHOUT the
+// engine destructor that would delete them: they stay registered with no
+// owner, so lookupSession() keeps resolving them and every later engine with
+// one of those ids is rejected as a duplicate for the rest of the process.
+// Call it right after the engine constructor threw, on the JS thread, with
+// the same `settings`/`connectionType` RejectDuplicateSessions() was called
+// with just before: that check guarantees every session of ours that exists
+// now was created by the failed constructor, and each one is fully
+// constructed: the only callback FIX::Session's constructor makes after
+// registering itself is onCreate, which the bridge dispatches fire-and-forget
+// (a throwing JS handler never unwinds the constructor). ~Session unregisters
+// it and destroys its store/log through the factories the wrap still owns
+// (public virtual destructor; the engine destructor does exactly this
+// `delete`).
+inline void DestroyOrphanedSessions(const FIX::SessionSettings& settings,
+                                    const std::string& connectionType) {
+  for (const FIX::SessionID& id : settings.getSessions()) {
+    const FIX::Dictionary& dict = settings.get(id);
+    if (!dict.has("ConnectionType") ||
+        dict.getString("ConnectionType") != connectionType) {
+      continue;
+    }
+    delete FIX::Session::lookupSession(id);  // nullptr-safe
+  }
+}
+
 // A LogFactory that produces no-op NullLog instances, for log:'none'. QuickFIX
 // ships NullLog but no public NullLogFactory, so we provide one.
 class NullLogFactory : public FIX::LogFactory {

@@ -8,15 +8,12 @@
 #include <utility>
 
 #include "errors.h"
-#include "quickfix/Exceptions.h"
-#include "quickfix/Session.h"
-#include "quickfix/SessionID.h"
-#include "session_op_gate.h"
 
 namespace napi_quickfix {
 
 // A generic AsyncWorker that runs a blocking QuickFIX engine operation
 // (start/stop) on a libuv worker thread and resolves/rejects a JS Promise.
+// (The per-message SendToTargetWorker lives in session_static.cpp.)
 //
 // Why off-thread: start()/stop() synchronously invoke FIX::Application callbacks
 // (toAdmin/toApp during send-on-logon, onLogout during stop) which the
@@ -136,81 +133,6 @@ class EngineOpWorker : public Napi::AsyncWorker {
   Napi::ObjectReference ownerRef_;
   std::function<void()> op_;
   OnSettled onSettled_;
-  CapturedError err_;
-};
-
-// An AsyncWorker that runs a blocking per-session operation (disconnect /
-// reset) against a FIX::Session on a libuv worker thread.
-//
-// Why off-thread: FIX::Session holds its m_mutex across the Application
-// callbacks it fires (toAdmin/toApp inside sendRaw, onLogout inside disconnect).
-// reset() and disconnect() both take that mutex and fire callbacks, so run ON
-// the JS thread they would either block behind a QuickFIX thread that is itself
-// waiting on the (now-blocked) event loop, or fire a BlockingCall the loop can't
-// service — a deadlock either way. logon()/logout()/refresh() take neither that
-// mutex nor fire callbacks, so they are plain synchronous calls on SessionWrap:
-// running them here would only make two back-to-back calls race each other on
-// the thread pool (`logout(); logon();` could land as logon-then-logout).
-//
-// Lifetime: FIX::Session objects are owned by the engine and looked up by value
-// (FIX::SessionID) on the WORKER thread, never cached. A missing session is
-// surfaced as a QuickFixError with fixErrorName 'SessionNotFound'. The lookup
-// and the operation run under the owning engine's SessionOpGate::OpScope so
-// that engine cannot be destroyed (by stop() settling) while the raw pointer is
-// in use.
-class SessionOpWorker : public Napi::AsyncWorker {
- public:
-  SessionOpWorker(Napi::Env env, FIX::SessionID id,
-                  std::function<void(FIX::Session&)> op)
-      : Napi::AsyncWorker(env),
-        deferred_(Napi::Promise::Deferred::New(env)),
-        id_(std::move(id)),
-        op_(std::move(op)) {}
-
-  Napi::Promise Promise() { return deferred_.Promise(); }
-
-  // Worker thread. NO Napi/JS access.
-  void Execute() override {
-    try {
-      std::unique_ptr<SessionOpGate::OpScope> inflight =
-          SessionOpGate::Acquire(id_);
-      if (!inflight) {
-        // No engine owns this id, so no FIX::Session can exist for it.
-        throw FIX::SessionNotFound(id_.toString());
-      }
-      FIX::Session* session = FIX::Session::lookupSession(id_);
-      if (session == nullptr) {
-        throw FIX::SessionNotFound(id_.toString());
-      }
-      op_(*session);
-    } catch (const std::exception& e) {
-      err_.Capture(e);
-    } catch (...) {
-      err_.has = true;
-      err_.message = "unknown native error";
-      err_.fixErrorName = "Error";
-    }
-  }
-
-  void OnOK() override {
-    Napi::Env env = Env();
-    Napi::HandleScope scope(env);
-    if (err_.has) {
-      deferred_.Reject(err_.ToError(env).Value());
-    } else {
-      deferred_.Resolve(env.Undefined());
-    }
-  }
-
-  void OnError(const Napi::Error& e) override {
-    Napi::HandleScope scope(Env());
-    deferred_.Reject(e.Value());
-  }
-
- private:
-  Napi::Promise::Deferred deferred_;
-  FIX::SessionID id_;
-  std::function<void(FIX::Session&)> op_;
   CapturedError err_;
 };
 

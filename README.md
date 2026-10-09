@@ -281,13 +281,17 @@ settles the engine's sessions are destroyed: `getSession` returns `undefined` an
 any `Session` handle you still hold throws `SessionNotFound`. Until then they are
 still live: a graceful `stop()` settles only after the `'logout'` events it
 triggered have been delivered, so a `'logout'` listener can still read the
-session, and a session operation already in flight (`reset()`, `sendToTarget()`,
-...) always completes before the sessions go away. `stop(true)` discards the
-events still queued and destroys the sessions right away.
+session, and a `sendToTarget()` already in flight always completes before the
+sessions go away. `stop(true)` discards the events still queued and destroys the
+sessions right away. A `stop()` called while another is still in flight (from
+that `'logout'` listener, say) returns the same Promise, so it too settles only
+once the sessions are gone; the first call's `force` applies to both.
 
 Two live engines cannot share a `SessionID`: constructing one whose session
 already exists in the process throws a `ConfigError` ("Duplicate Session") until
-the engine owning it has been stopped.
+the engine owning it has been stopped. A constructor that fails on a later
+`[SESSION]` (any `ConfigError`) cleans up the sessions it had already created,
+so the ids are not locked out by the failed attempt.
 
 ### Session
 
@@ -319,23 +323,20 @@ session.getTimestampPrecision() / setTimestampPrecision(0..9)  //   CheckCompId,
                                                                //   ValidateLengthAndChecksum,
                                                                //   SendNextExpectedMsgSeqNum, IsNonStopSession
 
-// Control (sync)
+// Control
 session.logon(): void;                   // enable; an initiator reconnects + logs on
 session.logout(reason?: string): void;   // disable + graceful Logout; stays down until logon()
 session.refresh(): void;                 // re-read state from the message store
-
-// Control (async -- runs off the main thread, see below)
-session.disconnect(): Promise<void>;     // drop the transport, no Logout exchange
-session.reset(): Promise<void>;          // Logout + disconnect + reset the store (seq nums -> 1)
 ```
 
-Why the split: the sync members never take the mutex QuickFIX holds while it
-runs your handlers, so they are safe on the main thread — and because they run
-inline, `session.logout('x'); session.logon();` takes effect in that order.
-`reset()` and `disconnect()` do take that mutex — and fire `toAdmin` /
-`onLogout`, which have to round-trip through the event loop — so calling them
-*on* the main thread would deadlock. They therefore return a `Promise` and run
-on a worker thread. Either way, observe the outcome through the engine's
+Everything is synchronous: none of these members takes the mutex QuickFIX holds
+while it runs your handlers, so they are safe on the main thread — and because
+they run inline, `session.logout('x'); session.logon();` takes effect in that
+order. QuickFIX's `Session::disconnect()` and `reset()` are deliberately **not**
+exposed: they drop the transport through the engine's socket monitor, which is
+only safe from the engine's own network thread (QuickFIX itself never calls them
+from anywhere else). Bring a session down with `logout()` and renumber it with
+the sequence-number setters. Observe the outcome through the engine's
 `'logon'` / `'logout'` events:
 
 ```ts

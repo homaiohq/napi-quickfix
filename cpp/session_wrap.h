@@ -3,8 +3,6 @@
 
 #include <napi.h>
 
-#include <functional>
-
 #include "quickfix/Session.h"
 #include "quickfix/SessionID.h"
 
@@ -22,15 +20,15 @@ namespace napi_quickfix {
 //   new SessionWrap(sessionID: SessionIDWrap)   -- internal; JS reaches a
 //   Session through lookupSession() / engine.getSession().
 //
-// Sync (safe on the JS thread — they never take FIX::Session::m_mutex, which
-// QuickFIX holds across application callbacks):
+// Every member is synchronous and safe on the JS thread: none takes
+// FIX::Session::m_mutex, which QuickFIX holds across application callbacks.
 //   getSessionID, isLoggedOn, isEnabled, sentLogon, sentLogout, receivedLogon,
 //   isInitiator, isAcceptor, isSessionTime(nowMs?), isLogonTime(nowMs?),
 //   getExpectedSenderNum, getExpectedTargetNum, setNextSenderMsgSeqNum,
 //   setNextTargetMsgSeqNum, logon, logout(reason?), refresh, and the runtime
 //   option getters/setters.
-// Async (Promise; run on a SessionOpWorker — see engine_workers.h):
-//   disconnect, reset.
+// FIX::Session::disconnect()/reset() are not exposed: they are only safe on
+// the engine's own network thread (see session_wrap.cpp).
 class SessionWrap : public Napi::ObjectWrap<SessionWrap> {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -99,14 +97,11 @@ class SessionWrap : public Napi::ObjectWrap<SessionWrap> {
   Napi::Value GetTimestampPrecision(const Napi::CallbackInfo& info);
   Napi::Value SetTimestampPrecision(const Napi::CallbackInfo& info);
 
-  // Control. logon/logout/refresh are sync (they only touch SessionState
-  // under its own mutex, which QuickFIX never holds across a callback);
-  // disconnect/reset are async.
+  // Control. All sync: they only touch SessionState under its own mutex,
+  // which QuickFIX never holds across a callback.
   Napi::Value Logon(const Napi::CallbackInfo& info);
   Napi::Value Logout(const Napi::CallbackInfo& info);
   Napi::Value Refresh(const Napi::CallbackInfo& info);
-  Napi::Value Disconnect(const Napi::CallbackInfo& info);
-  Napi::Value Reset(const Napi::CallbackInfo& info);
 
   // Shared helpers for the one-liner getters/setters above.
   template <typename Fn>
@@ -120,8 +115,6 @@ class SessionWrap : public Napi::ObjectWrap<SessionWrap> {
   Napi::Value TimeCheck(const Napi::CallbackInfo& info, bool logonTime);
   Napi::Value SeqNumSet(const Napi::CallbackInfo& info, bool sender,
                         const char* name);
-  Napi::Value RunAsync(const Napi::CallbackInfo& info,
-                       std::function<void(FIX::Session&)> op);
 
   FIX::SessionID id_;
 };

@@ -60,6 +60,10 @@ class AcceptorWrap : public Napi::ObjectWrap<AcceptorWrap> {
   bool started_ = false;
   bool stopped_ = false;
   bool busy_ = false;  // guards against overlapping start/stop AsyncWorkers
+  // The promise of the stop() in flight, from the call until it settles
+  // (which, for a graceful stop, is after its worker's OnOK). A stop() made
+  // meanwhile returns this same promise instead of resolving early.
+  Napi::ObjectReference stopPromise_;
 
   static void CleanupEntry(AcceptorWrap* self);
 

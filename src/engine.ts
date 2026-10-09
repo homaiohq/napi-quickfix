@@ -13,7 +13,7 @@ import {
   type NativeSessionID,
 } from './native.js';
 import { Message } from './message.js';
-import { SessionID } from './session-id.js';
+import { SessionID, toNativeSessionID } from './session-id.js';
 import { Session } from './session.js';
 import type { ApplicationHandlers } from './application.js';
 import type { SessionSettings } from './session-settings.js';
@@ -150,7 +150,11 @@ export abstract class Engine extends EventEmitter {
    * Stop the engine.
    *
    * Runs off the main thread and resolves once shutdown completes, keeping the
-   * event loop free for any in-flight callbacks.
+   * event loop free for any in-flight callbacks. Once it settles the engine's
+   * sessions are destroyed. A `stop()` called while another is still in flight
+   * (even from a `'logout'` listener that stop fired) returns the same Promise,
+   * so it too settles only once the sessions are gone; the first call's
+   * `force` applies to both.
    *
    * @param force When `true`, aborts immediately instead of draining gracefully.
    *
@@ -171,9 +175,14 @@ export abstract class Engine extends EventEmitter {
    * and is logged on (`false`, not an error, for a foreign id). Always `false`
    * before {@link Engine.start} and once {@link Engine.stop} has settled; while
    * a graceful stop is still in progress it reports the live state.
+   *
+   * @throws {TypeError} if `sessionID` is given but is not a {@link SessionID}
+   *   (it does not fall back to the engine-wide form).
    */
   isLoggedOn(sessionID?: SessionID): boolean {
-    return this.#native.isLoggedOn(sessionID?.nativeHandle);
+    return sessionID === undefined
+      ? this.#native.isLoggedOn()
+      : this.#native.isLoggedOn(toNativeSessionID(sessionID, 'sessionID'));
   }
 
   /**
@@ -202,7 +211,7 @@ export abstract class Engine extends EventEmitter {
    * ```
    */
   getSession(sessionID: SessionID): Session | undefined {
-    const handle = this.#native.getSession(sessionID.nativeHandle);
+    const handle = this.#native.getSession(toNativeSessionID(sessionID, 'sessionID'));
     return handle ? Session.fromNative(handle) : undefined;
   }
 

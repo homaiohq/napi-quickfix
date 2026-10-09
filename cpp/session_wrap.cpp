@@ -2,12 +2,9 @@
 
 #include <cmath>
 #include <ctime>
-#include <functional>
 #include <limits>
 #include <string>
-#include <utility>
 
-#include "engine_workers.h"
 #include "errors.h"
 #include "quickfix/Exceptions.h"
 #include "quickfix/FieldTypes.h"
@@ -90,8 +87,6 @@ Napi::Object SessionWrap::Init(Napi::Env env, Napi::Object exports) {
           InstanceMethod("logon", &SessionWrap::Logon),
           InstanceMethod("logout", &SessionWrap::Logout),
           InstanceMethod("refresh", &SessionWrap::Refresh),
-          InstanceMethod("disconnect", &SessionWrap::Disconnect),
-          InstanceMethod("reset", &SessionWrap::Reset),
       });
 
   constructor_ = Napi::Persistent(func);
@@ -248,16 +243,6 @@ Napi::Value SessionWrap::SeqNumSet(const Napi::CallbackInfo& info, bool sender,
   } NQ_CATCH(env)
 }
 
-Napi::Value SessionWrap::RunAsync(const Napi::CallbackInfo& info,
-                                  std::function<void(FIX::Session&)> op) {
-  // The SessionID is copied by value into the worker; Execute() never touches
-  // this wrap or any JS object.
-  auto* worker = new SessionOpWorker(info.Env(), id_, std::move(op));
-  Napi::Promise promise = worker->Promise();
-  worker->Queue();
-  return promise;
-}
-
 // --- state getters -----------------------------------------------------------
 
 Napi::Value SessionWrap::IsLoggedOn(const Napi::CallbackInfo& info) {
@@ -363,13 +348,21 @@ Napi::Value SessionWrap::SetTimestampPrecision(const Napi::CallbackInfo& info) {
   } NQ_CATCH(env)
 }
 
-// --- control: sync -----------------------------------------------------------
+// --- control ------------------------------------------------------------------
 // FIX::Session::logon()/logout() only flip SessionState's `enabled` flag and
 // `logoutReason` (the latter under SessionState's own mutex), and refresh()
 // re-reads the store under that same mutex; none of them take
 // FIX::Session::m_mutex or fire a callback, so they are safe on the JS thread.
 // Keeping them synchronous also keeps them ORDERED: as AsyncWorkers,
 // `logout(); logon();` could have run on two pool threads in either order.
+//
+// FIX::Session::disconnect() and reset() are deliberately NOT exposed. Through
+// the session's responder they reach FIX::SocketMonitor::drop(), which mutates
+// the monitor's socket sets with no lock while the engine's network thread
+// iterates them in SocketMonitor::block(); QuickFIX only ever calls them from
+// that thread itself (upstream issue #346, closed "not planned"). Any thread
+// this binding could run them on -- JS or libuv -- races it. logout() is the
+// supported way to bring a session down from the application.
 
 Napi::Value SessionWrap::Logon(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
@@ -401,18 +394,6 @@ Napi::Value SessionWrap::Refresh(const Napi::CallbackInfo& info) {
     Resolve().refresh();
     return env.Undefined();
   } NQ_CATCH(env)
-}
-
-// --- control: async ----------------------------------------------------------
-// Both take FIX::Session::m_mutex and fire application callbacks (reset ->
-// generateLogout -> toAdmin; disconnect -> onLogout), see engine_workers.h.
-
-Napi::Value SessionWrap::Disconnect(const Napi::CallbackInfo& info) {
-  return RunAsync(info, [](FIX::Session& s) { s.disconnect(); });
-}
-
-Napi::Value SessionWrap::Reset(const Napi::CallbackInfo& info) {
-  return RunAsync(info, [](FIX::Session& s) { s.reset(); });
 }
 
 }  // namespace napi_quickfix

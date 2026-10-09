@@ -92,8 +92,15 @@ InitiatorWrap::InitiatorWrap(const Napi::CallbackInfo& info)
     }
 
     RejectDuplicateSessions(settings, "initiator");
-    initiator_ = std::make_unique<FIX::SocketInitiator>(
-        *bridge_, *storeFactory_, settings, *logFactory_);
+    try {
+      initiator_ = std::make_unique<FIX::SocketInitiator>(
+          *bridge_, *storeFactory_, settings, *logFactory_);
+    } catch (...) {
+      // A [SESSION] after the first valid one threw: QuickFIX has leaked the
+      // sessions it had already created (see DestroyOrphanedSessions).
+      DestroyOrphanedSessions(settings, "initiator");
+      throw;
+    }
     sessionIDs_ = initiator_->getSessions();
     SessionOpGate::Register(sessionIDs_, gate_);
   } NQ_CATCH(env)
@@ -222,6 +229,14 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
     force = info[0].ToBoolean().Value();
   }
   auto deferred = Napi::Promise::Deferred::New(env);
+  // A stop() is in flight (its worker is running, or a graceful stop is
+  // waiting for its queued 'logout' events to be dispatched before destroying
+  // the engine): join it. Resolving right away here -- `stopped_` is already
+  // set -- would break the README's promise that the sessions are gone once
+  // stop() settles. The first call's `force` applies to both.
+  if (!stopPromise_.IsEmpty()) {
+    return stopPromise_.Value();
+  }
   if (stopped_) {
     deferred.Resolve(env.Undefined());
     return deferred.Promise();
@@ -263,17 +278,23 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
           throw;
         }
         // stop() has joined the network threads. Now block new session
-        // operations (SessionOpWorker / SendToTargetWorker) on THIS engine's
+        // operations (SendToTargetWorker) on THIS engine's
         // sessions and wait for the in-flight ones to finish: they hold raw
         // FIX::Session pointers that the destruction below is about to
         // invalidate. Waiting HERE, on the worker thread, keeps the JS loop
         // free for any BlockingCall such an operation is still making (e.g.
-        // reset() -> toAdmin). Other engines' operations are unaffected.
+        // sendToTarget() -> toApp). Other engines' operations are unaffected.
         gate->Freeze();
       },
       [self, bridge, env, force](
           bool ok, const std::shared_ptr<EngineOpWorker::Settlement>& s) {
         self->busy_ = false;
+        // Settles the promise and lets a later stop() start over (the
+        // in-flight stop is finished, successfully or not).
+        auto settle = [self, s]() {
+          self->stopPromise_.Reset();
+          s->Settle();
+        };
         if (!ok) {
           // stop() threw part-way: the network threads may still be running,
           // so the engine is NOT safe to destroy. Keep it, let session
@@ -283,7 +304,7 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
           // Start() clearing started_ on failure.
           self->stopped_ = false;
           self->gate_->Unfreeze();
-          s->Settle();
+          settle();
           return;
         }
         // stop() has completed: the network threads are joined and session
@@ -300,7 +321,7 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
           // 'logout' listener may therefore never run), and destroy right away.
           if (bridge) bridge->Abort();
           self->DestroyStoppedEngine();
-          s->Settle();
+          settle();
           return;
         }
         // Graceful: the 'logout' events stop() fired are still queued in the
@@ -312,23 +333,27 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
         // destruction through the bridge's own FIFO behind them, then release
         // the TSFN so it closes once drained. The owner reference held by the
         // settlement keeps this wrap alive until then.
-        const bool queued = bridge->RunAfterQueued(env, [self, s](Napi::Env e) {
-          if (e == nullptr) {
-            // Discarded: the environment is being torn down. The wrap's own
-            // teardown destroys the engine; nothing JS-side is safe here.
-            s->Abandon();
-            return;
-          }
-          self->DestroyStoppedEngine();
-          s->Settle();
-        });
+        const bool queued =
+            bridge->RunAfterQueued(env, [self, s, settle](Napi::Env e) {
+              if (e == nullptr) {
+                // Discarded: the environment is being torn down. The wrap's
+                // own teardown destroys the engine; nothing JS-side is safe
+                // here, the promise reference included.
+                self->stopPromise_.SuppressDestruct();
+                s->Abandon();
+                return;
+              }
+              self->DestroyStoppedEngine();
+              settle();
+            });
         bridge->Release();
         if (!queued) {
           self->DestroyStoppedEngine();
-          s->Settle();
+          settle();
         }
       });
   Napi::Promise promise = worker->Promise();
+  stopPromise_ = Napi::Persistent(static_cast<Napi::Object>(promise));
   worker->Queue();
   return promise;
 }

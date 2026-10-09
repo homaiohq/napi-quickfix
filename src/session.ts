@@ -2,7 +2,7 @@
  * Ergonomic wrapper around a live native `FIX::Session`.
  */
 import { native, type NativeSession } from './native.js';
-import { SessionID } from './session-id.js';
+import { SessionID, toNativeSessionID } from './session-id.js';
 
 /**
  * A handle on one live FIX session (wraps `FIX::Session`).
@@ -14,17 +14,18 @@ import { SessionID } from './session-id.js';
  * **Lifetime.** The underlying `FIX::Session` is owned by its engine. This
  * handle stores only the {@link SessionID} and re-resolves the session on every
  * call, so it never dangles: once the owning engine has been stopped (which
- * destroys its sessions) every method throws — or, for the async ones, rejects
- * with — a {@link QuickFixError} whose `fixErrorName` is `'SessionNotFound'`.
+ * destroys its sessions) every method throws a {@link QuickFixError} whose
+ * `fixErrorName` is `'SessionNotFound'`.
  *
- * **Sync vs. async.** State queries, sequence-number access, the runtime
- * option getters/setters, {@link Session.logon}, {@link Session.logout} and
- * {@link Session.refresh} are synchronous: they never take the mutex QuickFIX
- * holds while running your application handlers, so calls made in program order
- * take effect in program order. {@link Session.disconnect} and
- * {@link Session.reset} return a `Promise` and run off the main thread, because
- * they take that mutex and fire `onLogout`/`toAdmin`, which must round-trip to
- * the event loop (see ARCHITECTURE.md §5).
+ * **Everything is synchronous.** State queries, sequence-number access, the
+ * runtime option getters/setters, {@link Session.logon}, {@link Session.logout}
+ * and {@link Session.refresh} never take the mutex QuickFIX holds while running
+ * your application handlers, so they are safe on the main thread and calls made
+ * in program order take effect in program order. QuickFIX's
+ * `Session::disconnect()` / `reset()` are deliberately not exposed: they are
+ * only safe on the engine's own network thread (see ARCHITECTURE.md §5). Use
+ * {@link Session.logout} to bring a session down, and the sequence-number
+ * setters to reset its numbering.
  *
  * @example
  * ```ts
@@ -306,24 +307,6 @@ export class Session {
   refresh(): void {
     this.#native.refresh();
   }
-
-  /**
-   * Drop the transport immediately (no Logout exchange). Fires `onLogout` if
-   * the session was logged on. An enabled initiator session reconnects at its
-   * next `ReconnectInterval`. Runs off the main thread (see the class docs).
-   */
-  disconnect(): Promise<void> {
-    return this.#native.disconnect();
-  }
-
-  /**
-   * Send a Logout, disconnect, and reset the message store (sequence numbers
-   * back to 1). An enabled initiator session then reconnects. Runs off the
-   * main thread (see the class docs).
-   */
-  reset(): Promise<void> {
-    return this.#native.reset();
-  }
 }
 
 /**
@@ -339,13 +322,13 @@ export class Session {
  * ```
  */
 export function lookupSession(sessionID: SessionID): Session | undefined {
-  const handle = native.lookupSession(sessionID.nativeHandle);
+  const handle = native.lookupSession(toNativeSessionID(sessionID, 'sessionID'));
   return handle ? Session.fromNative(handle) : undefined;
 }
 
 /** Whether a session with this id exists in this process. */
 export function doesSessionExist(sessionID: SessionID): boolean {
-  return native.doesSessionExist(sessionID.nativeHandle);
+  return native.doesSessionExist(toNativeSessionID(sessionID, 'sessionID'));
 }
 
 /** The ids of every session in this process, across all engines. */
