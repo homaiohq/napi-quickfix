@@ -194,21 +194,36 @@ non-owning pointer, so `SessionWrap` never caches it: it stores the `FIX::Sessio
 'SessionNotFound'}` when the session is gone. QuickFIX only deletes sessions — and removes them from the registry
 `lookupSession` reads — in the engine destructor, so `InitiatorWrap`/`AcceptorWrap` destroy their engine as soon
 as `stop()` settles (all network threads are joined by then) rather than waiting for GC. That is what makes a stale
-`Session` handle fail deterministically after `stop()`, and lets a new engine reuse the same `SessionID`s
-immediately instead of hitting a "Duplicate Session" `ConfigError`.
+`Session` handle fail deterministically after `stop()`, and lets a new engine reuse the same `SessionID`s right
+after the old one has been stopped. A `SessionID` that is still live is refused: both wrap constructors throw
+`ConfigError` "Duplicate Session" (`RejectDuplicateSessions`, `engine_common.h`). QuickFIX itself does **not**
+enforce that — its `Session` constructor ignores `addSession()`'s result and the only upstream "Duplicate Session"
+check is within one `SessionSettings` — so without it a second engine silently shadowed the first in the registry.
 
 That eager destruction races with the worker-thread operations above, which hold a raw `FIX::Session*` between
 `lookupSession` and the end of the operation. `session_op_gate.h` closes the race with a **per-engine** gate.
-Each wrap owns a `shared_ptr<SessionOpGate>` and registers it for its `SessionID`s at construction (QuickFIX
-forbids two live engines sharing an id, so the registry is one-to-one). `SessionOpWorker` / `SendToTargetWorker`
-look up the gate for their session's id on the worker thread (deriving the id from the message header first, for
-the qualifier form of `sendToTarget`), and hold a `SessionOpGate::OpScope` on it for their whole `Execute()`; no
-registered gate means no engine owns the session, reported as `SessionNotFound`. The engine's stop worker — on its
-**own** libuv thread, after `stop()` has joined the network threads — calls `Freeze()` on *its* gate, which blocks
-new operations on *its* sessions and waits for the in-flight ones to drain. Only then does `OnOK` unregister and
-destroy the engine on the JS thread and `Unfreeze()`. Waiting on the worker thread rather than in `OnOK` matters:
-an in-flight `reset()` may be blocked in a `toAdmin` `BlockingCall`, which needs the JS loop free. A never-started
+Each wrap owns a `shared_ptr<SessionOpGate>` and registers it for its `SessionID`s at construction (the duplicate
+check above is what keeps the registry one-to-one). `SessionOpWorker` / `SendToTargetWorker` call
+`SessionOpGate::Acquire(id)` on the worker thread (deriving the id from the message header first, for the
+qualifier form of `sendToTarget`) and hold the returned `OpScope` for their whole `Execute()`; no registered gate
+means no engine owns the session, reported as `SessionNotFound`. `Acquire` re-reads the registry *after* the scope
+is held and keeps it only if the same gate is still the owner: constructing the scope may have blocked across the
+owner's destruction, and a new engine may own the id by then — holding the old gate would let the new engine's
+`stop()` destroy the session mid-operation. The engine's stop worker — on its **own** libuv thread, after `stop()`
+has joined the network threads — calls `Freeze()` on *its* gate, which blocks new operations on *its* sessions and
+waits for the in-flight ones to drain. Waiting on the worker thread rather than on the JS thread matters: an
+in-flight `reset()` may be blocked in a `toAdmin` `BlockingCall`, which needs the JS loop free. A never-started
 engine takes the same async path on `stop()`, since its sessions are registered from construction.
+
+The destruction itself (unregister, delete the engine, `Unfreeze()`) runs on the JS thread, but **not** straight
+from the worker's `OnOK`: the `'logout'` events a graceful `stop()` fired are fire-and-forget TSFN calls still
+queued in the bridge, and nothing orders their dispatch before the AsyncWorker completion. So for a graceful stop
+`OnOK` queues the destruction — together with the settlement of the `stop()` promise and the owner reference that
+keeps the wrap alive — through the bridge's own FIFO (`ApplicationBridge::RunAfterQueued`, a `kBarrier` item)
+behind those events, then releases the TSFN; the TSFN is ref'd for that drain so an `unref()`'d engine's `stop()`
+still resolves. `stop(true)` aborts the TSFN (discarding queued events) and destroys immediately. If `stop()`
+itself threw, the engine is left intact, the gate unfrozen and `stopped_` cleared so a later `stop()` or the
+destructor's `Teardown()` retries — the network thread may still be running, so destroying would be unsafe.
 
 The gate is per engine, not process-wide, for two reasons. Stopping engine A must not stall engine B's operations,
 nor wait on them. And the wrap **destructor** (GC, JS thread) also freezes before destroying its engine: with one
