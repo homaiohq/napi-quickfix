@@ -6,7 +6,7 @@
  */
 import { native } from './native.js';
 import type { Message } from './message.js';
-import { SessionID } from './session-id.js';
+import type { SessionID } from './session-id.js';
 
 // --- Pure layer -----------------------------------------------------------
 export { Message, createMessage, parseMessage } from './message.js';
@@ -73,10 +73,13 @@ export function sendToTarget(
   message: Message,
   sessionIDOrQualifier?: SessionID | string,
 ): Promise<boolean> {
+  // Dispatch on the primitive, not `instanceof SessionID`: this package ships
+  // ESM and CJS builds, and a SessionID created by the other build is a
+  // different class with the same shape. Duck-typing keeps it working.
   const target =
-    sessionIDOrQualifier instanceof SessionID
-      ? sessionIDOrQualifier.nativeHandle
-      : sessionIDOrQualifier;
+    typeof sessionIDOrQualifier === 'string' || sessionIDOrQualifier === undefined
+      ? sessionIDOrQualifier
+      : sessionIDOrQualifier.nativeHandle;
   return native.sendToTarget(message.nativeHandle, target);
 }
 

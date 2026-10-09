@@ -17,20 +17,21 @@ import { SessionID } from './session-id.js';
  * destroys its sessions) every method throws — or, for the async ones, rejects
  * with — a {@link QuickFixError} whose `fixErrorName` is `'SessionNotFound'`.
  *
- * **Sync vs. async.** State queries, sequence-number access and the runtime
- * option getters/setters are synchronous: they never take the mutex QuickFIX
- * holds while running your application handlers. {@link Session.logon},
- * {@link Session.logout}, {@link Session.disconnect}, {@link Session.reset} and
- * {@link Session.refresh} return a `Promise` and run off the main thread, because
- * `reset`/`disconnect` take that mutex and fire `toAdmin`/`onLogout`, which must
- * round-trip to the event loop (see ARCHITECTURE.md §5).
+ * **Sync vs. async.** State queries, sequence-number access, the runtime
+ * option getters/setters, {@link Session.logon}, {@link Session.logout} and
+ * {@link Session.refresh} are synchronous: they never take the mutex QuickFIX
+ * holds while running your application handlers, so calls made in program order
+ * take effect in program order. {@link Session.disconnect} and
+ * {@link Session.reset} return a `Promise` and run off the main thread, because
+ * they take that mutex and fire `onLogout`/`toAdmin`, which must round-trip to
+ * the event loop (see ARCHITECTURE.md §5).
  *
  * @example
  * ```ts
  * const session = initiator.getSession(sessionID)!;
  * if (session.isLoggedOn()) {
  *   console.log('next outbound seq', session.getExpectedSenderNum());
- *   await session.logout('maintenance');
+ *   session.logout('maintenance');
  * }
  * ```
  */
@@ -274,31 +275,42 @@ export class Session {
     this.#native.setTimestampPrecision(precision);
   }
 
-  // --- control (async) -------------------------------------------------------------
+  // --- control -----------------------------------------------------------------------
 
   /**
    * Enable the session. An initiator session reconnects and logs on at its
    * next `ReconnectInterval`; an acceptor session accepts the next inbound
-   * Logon. Observe the result through the engine's `'logon'` event.
+   * Logon. Takes effect immediately ({@link Session.isEnabled} is `true` on
+   * return); observe the handshake through the engine's `'logon'` event.
    */
-  logon(): Promise<void> {
-    return this.#native.logon();
+  logon(): void {
+    this.#native.logon();
   }
 
   /**
    * Disable the session and initiate a graceful Logout (sent with `reason` as
    * tag 58 on the next engine tick). The session stays disabled — it will not
-   * reconnect — until {@link Session.logon}. Observe completion through the
-   * engine's `'logout'` event.
+   * reconnect — until {@link Session.logon}. Takes effect immediately
+   * ({@link Session.isEnabled} is `false` on return); observe completion
+   * through the engine's `'logout'` event.
    */
-  logout(reason?: string): Promise<void> {
-    return this.#native.logout(reason);
+  logout(reason?: string): void {
+    this.#native.logout(reason);
+  }
+
+  /**
+   * Re-read the session state (sequence numbers etc.) from the message store.
+   *
+   * @throws {QuickFixError} `IOException` if the store cannot be read.
+   */
+  refresh(): void {
+    this.#native.refresh();
   }
 
   /**
    * Drop the transport immediately (no Logout exchange). Fires `onLogout` if
    * the session was logged on. An enabled initiator session reconnects at its
-   * next `ReconnectInterval`.
+   * next `ReconnectInterval`. Runs off the main thread (see the class docs).
    */
   disconnect(): Promise<void> {
     return this.#native.disconnect();
@@ -306,15 +318,11 @@ export class Session {
 
   /**
    * Send a Logout, disconnect, and reset the message store (sequence numbers
-   * back to 1). An enabled initiator session then reconnects.
+   * back to 1). An enabled initiator session then reconnects. Runs off the
+   * main thread (see the class docs).
    */
   reset(): Promise<void> {
     return this.#native.reset();
-  }
-
-  /** Re-read the session state (sequence numbers etc.) from the message store. */
-  refresh(): Promise<void> {
-    return this.#native.refresh();
   }
 }
 

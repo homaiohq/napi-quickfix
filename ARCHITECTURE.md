@@ -185,8 +185,8 @@ thread that is waiting on the main thread — deadlock.
 | --- | --- | --- |
 | `isLoggedOn` · `isEnabled` · `sentLogon` · `sentLogout` · `receivedLogon` · `isInitiator` · `isAcceptor` · `isSessionTime` · `isLogonTime` · option getters/setters | sync, main | Read/write plain members of `FIX::Session`; no lock, no callback. |
 | `getExpectedSenderNum` · `getExpectedTargetNum` · `setNextSenderMsgSeqNum` · `setNextTargetMsgSeqNum` | sync, main | Touch the `MessageStore` under `SessionState`'s own mutex, which QuickFIX never holds across a callback. May throw `IOException` (mapped to `QuickFixError`). |
+| `logon` · `logout` · `refresh` | sync, main | Only touch `SessionState` (`enabled`/`logoutReason`, and the store for `refresh`) under its own mutex; no `m_mutex`, no callback. Running them inline also keeps them **ordered**: as AsyncWorkers, `logout(); logon();` could land on two pool threads in either order. |
 | `reset` · `disconnect` | **async, `SessionOpWorker`** | Take `m_mutex` **and** fire `toAdmin` (`reset` sends a Logout) / `onLogout` through the TSFN — the deadlock case above. |
-| `logon` · `logout` · `refresh` | **async, `SessionOpWorker`** | Don't take `m_mutex` today, but they are state transitions whose effect is only observable through `'logon'`/`'logout'` events; they share the async shape so the control surface is uniform and robust to upstream locking changes. |
 
 **Lifetime.** `FIX::Session` objects are owned by the engine and `FIX::Session::lookupSession` returns a raw,
 non-owning pointer, so `SessionWrap` never caches it: it stores the `FIX::SessionID` by value and re-resolves on
@@ -198,15 +198,24 @@ as `stop()` settles (all network threads are joined by then) rather than waiting
 immediately instead of hitting a "Duplicate Session" `ConfigError`.
 
 That eager destruction races with the worker-thread operations above, which hold a raw `FIX::Session*` between
-`lookupSession` and the end of the operation. `session_op_gate.h` closes the race with a process-wide gate:
-`SessionOpWorker` / `SendToTargetWorker` hold a `SessionOpGate::OpScope` for their whole `Execute()`, and the
-engine's stop worker — on its **own** libuv thread, after `stop()` has joined the network threads — calls
-`SessionOpGate::Freeze()`, which blocks new operations and waits for the in-flight ones to drain. Only then does
-`OnOK` destroy the engine on the JS thread and `Unfreeze()`. Waiting on the worker thread rather than in `OnOK`
-matters: an in-flight `reset()` may be blocked in a `toAdmin` `BlockingCall`, which needs the JS loop free. A
-never-started engine takes the same async path on `stop()`, since its sessions are registered from construction.
-The wrap destructor also freezes before destroying the engine, but only after `Teardown()` has deactivated the
-bridge, so no in-flight operation can be waiting on the (blocked) JS thread.
+`lookupSession` and the end of the operation. `session_op_gate.h` closes the race with a **per-engine** gate.
+Each wrap owns a `shared_ptr<SessionOpGate>` and registers it for its `SessionID`s at construction (QuickFIX
+forbids two live engines sharing an id, so the registry is one-to-one). `SessionOpWorker` / `SendToTargetWorker`
+look up the gate for their session's id on the worker thread (deriving the id from the message header first, for
+the qualifier form of `sendToTarget`), and hold a `SessionOpGate::OpScope` on it for their whole `Execute()`; no
+registered gate means no engine owns the session, reported as `SessionNotFound`. The engine's stop worker — on its
+**own** libuv thread, after `stop()` has joined the network threads — calls `Freeze()` on *its* gate, which blocks
+new operations on *its* sessions and waits for the in-flight ones to drain. Only then does `OnOK` unregister and
+destroy the engine on the JS thread and `Unfreeze()`. Waiting on the worker thread rather than in `OnOK` matters:
+an in-flight `reset()` may be blocked in a `toAdmin` `BlockingCall`, which needs the JS loop free. A never-started
+engine takes the same async path on `stop()`, since its sessions are registered from construction.
+
+The gate is per engine, not process-wide, for two reasons. Stopping engine A must not stall engine B's operations,
+nor wait on them. And the wrap **destructor** (GC, JS thread) also freezes before destroying its engine: with one
+gate per engine that only waits for operations on *this* engine's sessions, which cannot be blocked on the JS
+thread because `Teardown()` has already deactivated this bridge and joined these network threads. A process-wide
+gate would have made that finalizer wait for *another* engine's operation blocked in a `BlockingCall` that only the
+JS thread can service — a deadlock.
 
 Until `stop()` settles the engine is alive on the JS thread, so `engine.getSession()` / `engine.isLoggedOn(id)`
 keep answering during a graceful stop (a `'logout'` listener can still read the final sequence numbers).

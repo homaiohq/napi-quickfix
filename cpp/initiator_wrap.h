@@ -12,6 +12,7 @@
 #include "quickfix/SocketInitiator.h"
 
 #include "application_bridge.h"
+#include "session_op_gate.h"
 
 namespace napi_quickfix {
 
@@ -41,7 +42,7 @@ class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap> {
   Napi::Value Unref(const Napi::CallbackInfo& info);
 
   void Teardown(bool force);
-  // Destroy the FIX engine under SessionOpGate::Freeze(); destructor only.
+  // Destroy the FIX engine under gate_->Freeze(); destructor only.
   void DestroyEngine();
 
   // Declaration order matters: members destruct in REVERSE order, so the
@@ -50,6 +51,11 @@ class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap> {
   std::unique_ptr<ApplicationBridge> bridge_;
   std::unique_ptr<FIX::MessageStoreFactory> storeFactory_;
   std::unique_ptr<FIX::LogFactory> logFactory_;
+  // Gate between this engine's destruction and the libuv-thread session
+  // operations on ITS sessions (see session_op_gate.h). Shared with the stop
+  // worker; registered for sessionIDs_ at construction, unregistered when the
+  // engine is destroyed.
+  std::shared_ptr<SessionOpGate> gate_ = std::make_shared<SessionOpGate>();
   std::unique_ptr<FIX::SocketInitiator> initiator_;
 
   // The SessionIDs this engine was configured with, copied at construction so

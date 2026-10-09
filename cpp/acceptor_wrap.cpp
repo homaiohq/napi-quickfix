@@ -1,5 +1,6 @@
 #include "acceptor_wrap.h"
 
+#include <memory>
 #include <string>
 
 #include "quickfix/FileLog.h"
@@ -92,6 +93,7 @@ AcceptorWrap::AcceptorWrap(const Napi::CallbackInfo& info)
     acceptor_ = std::make_unique<FIX::SocketAcceptor>(
         *bridge_, *storeFactory_, settings, *logFactory_);
     sessionIDs_ = acceptor_->getSessions();
+    SessionOpGate::Register(sessionIDs_, gate_);
   } NQ_CATCH(env)
 
   // Deterministic teardown on env shutdown, before the TSFN is finalized. See
@@ -138,14 +140,19 @@ void AcceptorWrap::Teardown(bool force) {
 // Destroy the FIX engine (and with it every FIX::Session it owns) on the JS
 // thread, with no session operation in flight on a libuv thread. Called from
 // the destructor only; stop() does the same from its worker's OnOK, but there
-// the Freeze() has already happened on the worker thread (see Stop()). Here
-// Teardown() has already deactivated the bridge, so an in-flight operation
-// cannot be blocked on the JS thread and Freeze() cannot deadlock.
+// the Freeze() has already happened on the worker thread (see Stop()). The
+// gate is per engine, so Freeze() here only waits for operations on THIS
+// engine's sessions, and Teardown() has already deactivated its bridge and
+// joined its network threads: none of those operations can be blocked on the
+// JS thread (or on a session mutex), so Freeze() cannot deadlock. Operations
+// on other engines -- which may well be blocked in a BlockingCall that needs
+// this very thread -- are not waited for.
 void AcceptorWrap::DestroyEngine() {
   if (!acceptor_) return;
-  SessionOpGate::Freeze();
+  gate_->Freeze();
+  SessionOpGate::Unregister(sessionIDs_, gate_.get());
   acceptor_.reset();
-  SessionOpGate::Unfreeze();
+  gate_->Unfreeze();
 }
 
 Napi::Value AcceptorWrap::Start(const Napi::CallbackInfo& info) {
@@ -216,25 +223,27 @@ Napi::Value AcceptorWrap::Stop(const Napi::CallbackInfo& info) {
   FIX::SocketAcceptor* acceptor = acceptor_.get();
   ApplicationBridge* bridge = bridge_.get();
   const bool started = started_;
+  std::shared_ptr<SessionOpGate> gate = gate_;
   auto* self = this;
   auto* worker = new EngineOpWorker(
       env, info.This().As<Napi::Object>(),
       // Runs on the worker thread. stop()'s onLogout/toAdmin callbacks fire on
       // QuickFIX threads while the main loop is free to service the TSFN.
-      [acceptor, started, force]() {
+      [acceptor, gate, started, force]() {
         try {
           if (started) acceptor->stop(force);
         } catch (...) {
-          SessionOpGate::Freeze();
+          gate->Freeze();
           throw;
         }
         // stop() has joined the network threads. Now block new session
-        // operations (SessionOpWorker / SendToTargetWorker) and wait for the
-        // in-flight ones to finish: they hold raw FIX::Session pointers that
-        // the destruction in OnOK below is about to invalidate. Waiting HERE,
-        // on the worker thread, keeps the JS loop free for any BlockingCall
-        // such an operation is still making (e.g. reset() -> toAdmin).
-        SessionOpGate::Freeze();
+        // operations (SessionOpWorker / SendToTargetWorker) on THIS engine's
+        // sessions and wait for the in-flight ones to finish: they hold raw
+        // FIX::Session pointers that the destruction in OnOK below is about
+        // to invalidate. Waiting HERE, on the worker thread, keeps the JS loop
+        // free for any BlockingCall such an operation is still making (e.g.
+        // reset() -> toAdmin). Other engines' operations are unaffected.
+        gate->Freeze();
       },
       [self, bridge, force](bool /*ok*/) {
         self->busy_ = false;
@@ -257,8 +266,9 @@ Napi::Value AcceptorWrap::Stop(const Napi::CallbackInfo& info) {
         // "Duplicate Session" ConfigError until the old wrap happened to be
         // collected. A stopped engine cannot be restarted anyway (start()
         // rejects once stopped_ is set).
+        SessionOpGate::Unregister(self->sessionIDs_, self->gate_.get());
         self->acceptor_.reset();
-        SessionOpGate::Unfreeze();
+        self->gate_->Unfreeze();
       });
   Napi::Promise promise = worker->Promise();
   worker->Queue();

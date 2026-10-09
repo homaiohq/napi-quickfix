@@ -157,9 +157,9 @@ export interface NativeEngineOptions {
  * `fixErrorName: 'SessionNotFound'` once the owning engine has been stopped.
  *
  * Sync members never take the session mutex QuickFIX holds across application
- * callbacks, so they are safe on the main thread. `logon`/`logout`/
- * `disconnect`/`reset`/`refresh` run OFF the main thread (AsyncWorker) because
- * `reset`/`disconnect` take that mutex and fire `toAdmin`/`onLogout`.
+ * callbacks, so they are safe on the main thread. `disconnect`/`reset` run OFF
+ * the main thread (AsyncWorker) because they take that mutex and fire
+ * `toAdmin`/`onLogout`; `logon`/`logout`/`refresh` do neither and stay sync.
  */
 export interface NativeSession {
   getSessionID(): NativeSessionID;
@@ -212,11 +212,12 @@ export interface NativeSession {
   /** Throws a `RangeError` unless `precision` is an integer in `0..9`. */
   setTimestampPrecision(precision: number): void;
 
-  logon(): Promise<void>;
-  logout(reason?: string): Promise<void>;
+  logon(): void;
+  logout(reason?: string): void;
+  /** May throw a `QuickFixError` (`IOException`) from the message store. */
+  refresh(): void;
   disconnect(): Promise<void>;
   reset(): Promise<void>;
-  refresh(): Promise<void>;
 }
 
 /**

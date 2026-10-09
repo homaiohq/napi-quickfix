@@ -27,9 +27,10 @@ namespace napi_quickfix {
 //   getSessionID, isLoggedOn, isEnabled, sentLogon, sentLogout, receivedLogon,
 //   isInitiator, isAcceptor, isSessionTime(nowMs?), isLogonTime(nowMs?),
 //   getExpectedSenderNum, getExpectedTargetNum, setNextSenderMsgSeqNum,
-//   setNextTargetMsgSeqNum, and the runtime option getters/setters.
+//   setNextTargetMsgSeqNum, logon, logout(reason?), refresh, and the runtime
+//   option getters/setters.
 // Async (Promise; run on a SessionOpWorker — see engine_workers.h):
-//   logon, logout(reason?), disconnect, reset, refresh.
+//   disconnect, reset.
 class SessionWrap : public Napi::ObjectWrap<SessionWrap> {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -98,12 +99,14 @@ class SessionWrap : public Napi::ObjectWrap<SessionWrap> {
   Napi::Value GetTimestampPrecision(const Napi::CallbackInfo& info);
   Napi::Value SetTimestampPrecision(const Napi::CallbackInfo& info);
 
-  // Async.
+  // Control. logon/logout/refresh are sync (they only touch SessionState
+  // under its own mutex, which QuickFIX never holds across a callback);
+  // disconnect/reset are async.
   Napi::Value Logon(const Napi::CallbackInfo& info);
   Napi::Value Logout(const Napi::CallbackInfo& info);
+  Napi::Value Refresh(const Napi::CallbackInfo& info);
   Napi::Value Disconnect(const Napi::CallbackInfo& info);
   Napi::Value Reset(const Napi::CallbackInfo& info);
-  Napi::Value Refresh(const Napi::CallbackInfo& info);
 
   // Shared helpers for the one-liner getters/setters above.
   template <typename Fn>

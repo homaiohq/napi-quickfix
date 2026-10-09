@@ -89,9 +89,9 @@ Napi::Object SessionWrap::Init(Napi::Env env, Napi::Object exports) {
 
           InstanceMethod("logon", &SessionWrap::Logon),
           InstanceMethod("logout", &SessionWrap::Logout),
+          InstanceMethod("refresh", &SessionWrap::Refresh),
           InstanceMethod("disconnect", &SessionWrap::Disconnect),
           InstanceMethod("reset", &SessionWrap::Reset),
-          InstanceMethod("refresh", &SessionWrap::Refresh),
       });
 
   constructor_ = Napi::Persistent(func);
@@ -363,10 +363,20 @@ Napi::Value SessionWrap::SetTimestampPrecision(const Napi::CallbackInfo& info) {
   } NQ_CATCH(env)
 }
 
-// --- async ops ---------------------------------------------------------------
+// --- control: sync -----------------------------------------------------------
+// FIX::Session::logon()/logout() only flip SessionState's `enabled` flag and
+// `logoutReason` (the latter under SessionState's own mutex), and refresh()
+// re-reads the store under that same mutex; none of them take
+// FIX::Session::m_mutex or fire a callback, so they are safe on the JS thread.
+// Keeping them synchronous also keeps them ORDERED: as AsyncWorkers,
+// `logout(); logon();` could have run on two pool threads in either order.
 
 Napi::Value SessionWrap::Logon(const Napi::CallbackInfo& info) {
-  return RunAsync(info, [](FIX::Session& s) { s.logon(); });
+  Napi::Env env = info.Env();
+  NQ_TRY(env) {
+    Resolve().logon();
+    return env.Undefined();
+  } NQ_CATCH(env)
 }
 
 Napi::Value SessionWrap::Logout(const Napi::CallbackInfo& info) {
@@ -378,8 +388,24 @@ Napi::Value SessionWrap::Logout(const Napi::CallbackInfo& info) {
     }
     reason = info[0].As<Napi::String>().Utf8Value();
   }
-  return RunAsync(info, [reason](FIX::Session& s) { s.logout(reason); });
+  NQ_TRY(env) {
+    Resolve().logout(reason);
+    return env.Undefined();
+  } NQ_CATCH(env)
 }
+
+// May throw IOException from the message store (mapped to QuickFixError).
+Napi::Value SessionWrap::Refresh(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NQ_TRY(env) {
+    Resolve().refresh();
+    return env.Undefined();
+  } NQ_CATCH(env)
+}
+
+// --- control: async ----------------------------------------------------------
+// Both take FIX::Session::m_mutex and fire application callbacks (reset ->
+// generateLogout -> toAdmin; disconnect -> onLogout), see engine_workers.h.
 
 Napi::Value SessionWrap::Disconnect(const Napi::CallbackInfo& info) {
   return RunAsync(info, [](FIX::Session& s) { s.disconnect(); });
@@ -387,10 +413,6 @@ Napi::Value SessionWrap::Disconnect(const Napi::CallbackInfo& info) {
 
 Napi::Value SessionWrap::Reset(const Napi::CallbackInfo& info) {
   return RunAsync(info, [](FIX::Session& s) { s.reset(); });
-}
-
-Napi::Value SessionWrap::Refresh(const Napi::CallbackInfo& info) {
-  return RunAsync(info, [](FIX::Session& s) { s.refresh(); });
 }
 
 }  // namespace napi_quickfix

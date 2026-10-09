@@ -313,21 +313,24 @@ session.getTimestampPrecision() / setTimestampPrecision(0..9)  //   CheckCompId,
                                                                //   ValidateLengthAndChecksum,
                                                                //   SendNextExpectedMsgSeqNum, IsNonStopSession
 
+// Control (sync)
+session.logon(): void;                   // enable; an initiator reconnects + logs on
+session.logout(reason?: string): void;   // disable + graceful Logout; stays down until logon()
+session.refresh(): void;                 // re-read state from the message store
+
 // Control (async -- runs off the main thread, see below)
-session.logon(): Promise<void>;                 // enable; an initiator reconnects + logs on
-session.logout(reason?: string): Promise<void>; // disable + graceful Logout; stays down until logon()
-session.disconnect(): Promise<void>;            // drop the transport, no Logout exchange
-session.reset(): Promise<void>;                 // Logout + disconnect + reset the store (seq nums -> 1)
-session.refresh(): Promise<void>;               // re-read state from the message store
+session.disconnect(): Promise<void>;     // drop the transport, no Logout exchange
+session.reset(): Promise<void>;          // Logout + disconnect + reset the store (seq nums -> 1)
 ```
 
 Why the split: the sync members never take the mutex QuickFIX holds while it
-runs your handlers, so they are safe on the main thread. `reset()` and
-`disconnect()` do take it — and fire `toAdmin` / `onLogout`, which have to
-round-trip through the event loop — so calling them *on* the main thread would
-deadlock. They (and `logon`/`logout`/`refresh`, for a uniform API) therefore
-return a `Promise` and run on a worker thread. Observe the outcome through the
-engine's `'logon'` / `'logout'` events:
+runs your handlers, so they are safe on the main thread — and because they run
+inline, `session.logout('x'); session.logon();` takes effect in that order.
+`reset()` and `disconnect()` do take that mutex — and fire `toAdmin` /
+`onLogout`, which have to round-trip through the event loop — so calling them
+*on* the main thread would deadlock. They therefore return a `Promise` and run
+on a worker thread. Either way, observe the outcome through the engine's
+`'logon'` / `'logout'` events:
 
 ```ts
 initiator.on('logon', async (id) => {
@@ -336,8 +339,8 @@ initiator.on('logon', async (id) => {
   session.setNextTargetMsgSeqNum(1); // e.g. after the counterparty reset
 });
 
-await lookupSession(id)?.logout('maintenance');   // -> 'logout' event, isLoggedOn() === false
-await lookupSession(id)?.logon();                 // -> reconnects, 'logon' event
+lookupSession(id)?.logout('maintenance');   // -> 'logout' event, isLoggedOn() === false
+lookupSession(id)?.logon();                 // -> reconnects, 'logon' event
 ```
 
 ### Handlers vs. events

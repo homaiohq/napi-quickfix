@@ -33,11 +33,12 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   `ResetOnLogout`, `ResetOnDisconnect`, `RefreshOnLogon`, `CheckCompId`, `CheckLatency`,
   `MaxLatency`, `LogonTimeout`, `LogoutTimeout`, `PersistMessages`,
   `SendRedundantResendRequests`, `ValidateLengthAndChecksum`, `SendNextExpectedMsgSeqNum`,
-  `IsNonStopSession`, `TimestampPrecision`), and async control (`logon()`,
-  `logout(reason?)`, `disconnect()`, `reset()`, `refresh()`), which run off the main
-  thread because `reset`/`disconnect` fire application callbacks. The handle re-resolves
-  the session on every call and throws/rejects `QuickFixError{fixErrorName:
-  'SessionNotFound'}` once the owning engine has been stopped.
+  `IsNonStopSession`, `TimestampPrecision`), and control: `logon()`, `logout(reason?)`
+  and `refresh()` are synchronous (and therefore take effect in program order), while
+  `disconnect()` and `reset()` return a `Promise` and run off the main thread because
+  they fire application callbacks. The handle re-resolves the session on every call and
+  throws/rejects `QuickFixError{fixErrorName: 'SessionNotFound'}` once the owning
+  engine has been stopped.
 - Module functions `lookupSession(id)`, `doesSessionExist(id)`, `getSessions()` and
   `numSessions()` over every session in the process.
 - `Initiator`/`Acceptor`: `getSessions()` (the configured `[SESSION]`s),

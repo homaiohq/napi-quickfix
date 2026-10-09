@@ -1,11 +1,13 @@
 #include <napi.h>
 
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
 
 #include "errors.h"
 #include "message_wrap.h"
+#include "quickfix/Exceptions.h"
 #include "quickfix/Message.h"
 #include "quickfix/Session.h"
 #include "quickfix/SessionID.h"
@@ -32,8 +34,10 @@ namespace {
 // BeginString / SenderCompID / TargetCompID).
 //
 // Session::sendToTarget looks the session up in the process-wide registry and
-// uses the raw pointer, so Execute() runs under a SessionOpGate::OpScope to
-// keep the owning engine alive until the send has returned.
+// uses the raw pointer, so Execute() runs under the owning engine's
+// SessionOpGate::OpScope to keep that engine alive until the send has returned.
+// For the qualifier form the SessionID is derived from the message header
+// first (exactly as the upstream overload does) so the right gate can be found.
 class SendToTargetWorker : public Napi::AsyncWorker {
  public:
   SendToTargetWorker(Napi::Env env, FIX::Message message, FIX::SessionID id)
@@ -54,10 +58,23 @@ class SendToTargetWorker : public Napi::AsyncWorker {
 
   // Worker thread. NO Napi/JS access.
   void Execute() override {
-    SessionOpGate::OpScope inflight;
     try {
-      result_ = byId_ ? FIX::Session::sendToTarget(message_, id_)
-                      : FIX::Session::sendToTarget(message_, qualifier_);
+      FIX::SessionID id = id_;
+      if (!byId_) {
+        // Mirrors FIX::Session::sendToTarget(Message&, const std::string&):
+        // a header missing tag 8/49/56 is a SessionNotFound.
+        try {
+          id = message_.getSessionID(qualifier_);
+        } catch (const FIX::FieldNotFound&) {
+          throw FIX::SessionNotFound();
+        }
+      }
+      std::shared_ptr<SessionOpGate> gate = SessionOpGate::Lookup(id);
+      if (!gate) {
+        throw FIX::SessionNotFound(id.toString());
+      }
+      SessionOpGate::OpScope inflight(gate);
+      result_ = FIX::Session::sendToTarget(message_, id);
     } catch (const std::exception& e) {
       err_.Capture(e);
     } catch (...) {

@@ -4,6 +4,7 @@
 #include <napi.h>
 
 #include <functional>
+#include <memory>
 #include <utility>
 
 #include "errors.h"
@@ -85,24 +86,25 @@ class EngineOpWorker : public Napi::AsyncWorker {
   CapturedError err_;
 };
 
-// An AsyncWorker that runs a blocking per-session operation (logon / logout /
-// disconnect / reset / refresh) against a FIX::Session on a libuv worker thread.
+// An AsyncWorker that runs a blocking per-session operation (disconnect /
+// reset) against a FIX::Session on a libuv worker thread.
 //
 // Why off-thread: FIX::Session holds its m_mutex across the Application
 // callbacks it fires (toAdmin/toApp inside sendRaw, onLogout inside disconnect).
 // reset() and disconnect() both take that mutex and fire callbacks, so run ON
 // the JS thread they would either block behind a QuickFIX thread that is itself
 // waiting on the (now-blocked) event loop, or fire a BlockingCall the loop can't
-// service — a deadlock either way. logon()/logout()/refresh() don't hold the
-// session mutex today, but they are state transitions whose effect is only
-// observable through callbacks, so they share the same async shape for a
-// uniform API.
+// service — a deadlock either way. logon()/logout()/refresh() take neither that
+// mutex nor fire callbacks, so they are plain synchronous calls on SessionWrap:
+// running them here would only make two back-to-back calls race each other on
+// the thread pool (`logout(); logon();` could land as logon-then-logout).
 //
 // Lifetime: FIX::Session objects are owned by the engine and looked up by value
 // (FIX::SessionID) on the WORKER thread, never cached. A missing session is
 // surfaced as a QuickFixError with fixErrorName 'SessionNotFound'. The lookup
-// and the operation run under a SessionOpGate::OpScope so the owning engine
-// cannot be destroyed (by stop() settling) while the raw pointer is in use.
+// and the operation run under the owning engine's SessionOpGate::OpScope so
+// that engine cannot be destroyed (by stop() settling) while the raw pointer is
+// in use.
 class SessionOpWorker : public Napi::AsyncWorker {
  public:
   SessionOpWorker(Napi::Env env, FIX::SessionID id,
@@ -116,8 +118,13 @@ class SessionOpWorker : public Napi::AsyncWorker {
 
   // Worker thread. NO Napi/JS access.
   void Execute() override {
-    SessionOpGate::OpScope inflight;
     try {
+      std::shared_ptr<SessionOpGate> gate = SessionOpGate::Lookup(id_);
+      if (!gate) {
+        // No engine owns this id, so no FIX::Session can exist for it.
+        throw FIX::SessionNotFound(id_.toString());
+      }
+      SessionOpGate::OpScope inflight(gate);
       FIX::Session* session = FIX::Session::lookupSession(id_);
       if (session == nullptr) {
         throw FIX::SessionNotFound(id_.toString());

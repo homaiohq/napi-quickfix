@@ -192,7 +192,7 @@ describe('Session control over a loopback (in-process)', () => {
           waitForEvent(ini, 'logout', 'initiator logout', HANDSHAKE_TIMEOUT_MS),
           waitForEvent(acc, 'logout', 'acceptor logout', HANDSHAKE_TIMEOUT_MS),
         ]);
-        await iniSession.logout('test logout');
+        iniSession.logout('test logout');
         assert.equal(iniSession.isEnabled(), false, 'logout() disables the session immediately');
         await logouts;
         assert.ok(await waitUntil(() => !iniSession!.isLoggedOn(), DELIVERY_TIMEOUT_MS));
@@ -207,7 +207,7 @@ describe('Session control over a loopback (in-process)', () => {
           waitForEvent(ini, 'logon', 'initiator re-logon', HANDSHAKE_TIMEOUT_MS),
           waitForEvent(acc, 'logon', 'acceptor re-logon', HANDSHAKE_TIMEOUT_MS),
         ]);
-        await iniSession.logon();
+        iniSession.logon();
         assert.equal(iniSession.isEnabled(), true);
         await relogons;
         assert.equal(iniSession.isLoggedOn(), true);
@@ -243,8 +243,8 @@ describe('Session control over a loopback (in-process)', () => {
         assert.equal(iniSession.isLoggedOn(), true);
         assert.ok(iniSession.getExpectedSenderNum() < 50, 'reset() cleared the store');
 
-        // --- refresh() resolves ----------------------------------------------------------
-        await assert.doesNotReject(() => iniSession!.refresh());
+        // --- refresh() is sync and does not throw ------------------------------------------
+        assert.doesNotThrow(() => iniSession!.refresh());
 
         // --- runtime option getters/setters round-trip ----------------------------------
         assert.equal(iniSession.getResetOnLogon(), true, 'ResetOnLogon=Y from the config');
@@ -316,11 +316,11 @@ describe('Session control over a loopback (in-process)', () => {
       assert.throws(() => accSession!.getExpectedSenderNum(), isSessionNotFound);
       assert.throws(() => iniSession!.setNextSenderMsgSeqNum(1), isSessionNotFound);
       assert.throws(() => iniSession!.getResetOnLogon(), isSessionNotFound);
-      await assert.rejects(() => iniSession!.logout(), isSessionNotFound);
-      await assert.rejects(() => iniSession!.logon(), isSessionNotFound);
+      assert.throws(() => iniSession!.logout(), isSessionNotFound);
+      assert.throws(() => iniSession!.logon(), isSessionNotFound);
+      assert.throws(() => accSession!.refresh(), isSessionNotFound);
       await assert.rejects(() => iniSession!.reset(), isSessionNotFound);
       await assert.rejects(() => accSession!.disconnect(), isSessionNotFound);
-      await assert.rejects(() => accSession!.refresh(), isSessionNotFound);
     },
   );
 
@@ -381,17 +381,17 @@ describe('Session control over a loopback (in-process)', () => {
       // The engine must outlive the ops (they hold raw FIX::Session pointers on
       // a worker thread); each op then either completes or, if it had not yet
       // resolved its session when the engine went away, rejects SessionNotFound.
+      accSession.logout('stopping');
+      iniSession.refresh();
       const pending = [
         settles(iniSession.reset()),
         settles(iniSession.disconnect()),
-        settles(iniSession.refresh()),
         settles(sendToTarget(newOrder(), INI_ID)),
-        settles(accSession.logout('stopping')),
       ];
       await ini.stop();
       await acc.stop();
       const outcomes = await Promise.all(pending);
-      assert.equal(outcomes.length, 5);
+      assert.equal(outcomes.length, 3);
       assert.equal(lookupSession(INI_ID), undefined);
       assert.equal(lookupSession(ACC_ID), undefined);
     } finally {
@@ -404,7 +404,7 @@ describe('Session control over a loopback (in-process)', () => {
     const idle = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
     const idleSession = lookupSession(ACC_ID);
     assert.ok(idleSession);
-    const idleOps = [settles(idleSession.reset()), settles(idleSession.refresh())];
+    const idleOps = [settles(idleSession.reset()), settles(idleSession.disconnect())];
     await idle.stop();
     assert.equal((await Promise.all(idleOps)).length, 2);
     assert.equal(lookupSession(ACC_ID), undefined);
@@ -424,5 +424,47 @@ describe('Session control over a loopback (in-process)', () => {
     assert.equal(second.getSession(ACC_ID)!.isAcceptor(), true);
     await second.stop();
     assert.equal(second.getSession(ACC_ID), undefined);
+  });
+
+  test('logon() / logout() / refresh() are synchronous and take effect in program order', async () => {
+    // A never-started engine has live sessions and no network thread, so the
+    // enabled flag is only ever touched by these calls.
+    const port = await freePort();
+    const engine = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
+    try {
+      const session = engine.getSession(ACC_ID);
+      assert.ok(session);
+      assert.equal(session.isEnabled(), true);
+      // As AsyncWorkers these could land on two pool threads in either order.
+      session.logout('flip');
+      session.logon();
+      assert.equal(session.isEnabled(), true, 'logout(); logon(); ends enabled');
+      session.logon();
+      session.logout('flop');
+      assert.equal(session.isEnabled(), false, 'logon(); logout(); ends disabled');
+      assert.equal(session.refresh(), undefined);
+      assert.equal(session.logon(), undefined);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  test('sendToTarget accepts a SessionID from another copy of the package', async () => {
+    // An ESM and a CJS build of this package each have their own SessionID
+    // class; `instanceof` across them is false. Only the shape must matter.
+    const port = await freePort();
+    const engine = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
+    try {
+      const foreign = { nativeHandle: ACC_ID.nativeHandle } as unknown as SessionID;
+      // Not logged on, so the engine queues the message and reports false --
+      // the point is that it is routed, not rejected with a TypeError.
+      assert.equal(await sendToTarget(newOrder(), foreign), false);
+      await assert.rejects(
+        () => sendToTarget(newOrder(), { nativeHandle: new SessionID('FIX.4.4', 'NOPE', 'NADA').nativeHandle } as unknown as SessionID),
+        isSessionNotFound,
+      );
+    } finally {
+      await engine.stop();
+    }
   });
 });
