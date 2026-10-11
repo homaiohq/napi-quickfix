@@ -82,13 +82,15 @@ AcceptorWrap::AcceptorWrap(const Napi::CallbackInfo& info)
       storeFactory_ = std::make_unique<FIX::FileStoreFactory>(settings);
     }
 
+    std::unique_ptr<FIX::LogFactory> logFactory;
     if (log == "none") {
-      logFactory_ = std::make_unique<NullLogFactory>();
+      logFactory = std::make_unique<NullLogFactory>();
     } else if (log == "file") {
-      logFactory_ = std::make_unique<FIX::FileLogFactory>(settings);
+      logFactory = std::make_unique<FIX::FileLogFactory>(settings);
     } else {
-      logFactory_ = std::make_unique<FIX::ScreenLogFactory>(settings);
+      logFactory = std::make_unique<FIX::ScreenLogFactory>(settings);
     }
+    logFactory_ = std::make_unique<TrackingLogFactory>(std::move(logFactory));
 
     RejectDuplicateSessions(settings, "acceptor");
     try {
@@ -96,8 +98,12 @@ AcceptorWrap::AcceptorWrap(const Napi::CallbackInfo& info)
           *bridge_, *storeFactory_, settings, *logFactory_);
     } catch (...) {
       // A [SESSION] after the first valid one threw: QuickFIX has leaked the
-      // sessions it had already created (see DestroyOrphanedSessions).
+      // sessions it had already created (see DestroyOrphanedSessions) and the
+      // engine-level Log it requested before creating any of them (see
+      // TrackingLogFactory). Both would otherwise only have been reclaimed by
+      // the engine destructor that never runs.
       DestroyOrphanedSessions(settings, "acceptor");
+      logFactory_->DestroyOrphanedEngineLog();
       throw;
     }
     sessionIDs_ = acceptor_->getSessions();
@@ -127,12 +133,21 @@ void AcceptorWrap::Teardown(bool force) {
   // Runs on the MAIN thread. Ordering (see InitiatorWrap::Teardown for detail):
   //   1. Deactivate the bridge so callbacks during stop() pass through without
   //      touching the TSFN or waiting on the frozen JS loop (breaks deadlock).
-  //   2. stop(force): joins the QuickFIX network threads.
-  //   3. Abort the TSFN: safe now that no producer thread remains.
-  if (stopped_) return;
+  //   2. Join the stop() worker if one is in flight, so the engine is never
+  //      destroyed under its FIX::Acceptor::stop() / gate freeze. Hence the
+  //      early return is keyed on tornDown_, not on stopped_.
+  //   3. stop(force): joins the QuickFIX network threads (a no-op if the
+  //      worker's stop() completed).
+  //   4. Abort the TSFN: safe now that no producer thread remains.
+  if (tornDown_) return;
+  tornDown_ = true;
   stopped_ = true;
   if (bridge_) {
     bridge_->Deactivate();
+  }
+  if (stopSync_) {
+    stopSync_->Wait();
+    stopSync_.reset();
   }
   if (acceptor_ && started_) {
     try {
@@ -240,6 +255,10 @@ Napi::Value AcceptorWrap::Stop(const Napi::CallbackInfo& info) {
   }
   busy_ = true;
   stopped_ = true;
+  // Lets Teardown() wait for the worker's operation instead of destroying the
+  // engine under it; cleared in onSettled once the operation has returned.
+  auto stopDone = std::make_shared<StopCompletion>();
+  stopSync_ = stopDone;
 
   // A never-started engine takes the same async path (minus the stop() call):
   // its FIX::Session objects are registered from construction, so a session
@@ -254,7 +273,13 @@ Napi::Value AcceptorWrap::Stop(const Napi::CallbackInfo& info) {
       env, info.This().As<Napi::Object>(),
       // Runs on the worker thread. stop()'s onLogout/toAdmin callbacks fire on
       // QuickFIX threads while the main loop is free to service the TSFN.
-      [acceptor, gate, started, force]() {
+      [acceptor, gate, started, force, stopDone]() {
+        // Signal completion on every exit of this lambda, success or throw,
+        // and only after the gate freeze below has returned as well.
+        struct SignalOnExit {
+          std::shared_ptr<StopCompletion> done;
+          ~SignalOnExit() { done->Signal(); }
+        } signalOnExit{stopDone};
         try {
           if (started) acceptor->stop(force);
         } catch (...) {
@@ -273,6 +298,7 @@ Napi::Value AcceptorWrap::Stop(const Napi::CallbackInfo& info) {
       [self, bridge, env, force](
           bool ok, const std::shared_ptr<EngineOpWorker::Settlement>& s) {
         self->busy_ = false;
+        self->stopSync_.reset();  // the worker's operation has returned
         // Settles the promise and lets a later stop() start over (the
         // in-flight stop is finished, successfully or not).
         auto settle = [self, s]() {

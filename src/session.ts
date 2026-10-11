@@ -20,8 +20,11 @@ import { SessionID, toNativeSessionID } from './session-id.js';
  * **Everything is synchronous.** State queries, sequence-number access, the
  * runtime option getters/setters, {@link Session.logon}, {@link Session.logout}
  * and {@link Session.refresh} never take the mutex QuickFIX holds while running
- * your application handlers, so they are safe on the main thread and calls made
- * in program order take effect in program order. QuickFIX's
+ * your application handlers, so they cannot deadlock the main thread, and calls
+ * made in program order take effect in program order. ({@link Session.logon} /
+ * {@link Session.logout} flip a plain flag the engine's network thread reads
+ * without a lock, exactly as QuickFIX's own `Initiator::stop()` does; the
+ * engine picks the change up on its next pass.) QuickFIX's
  * `Session::disconnect()` / `reset()` are deliberately not exposed: they are
  * only safe on the engine's own network thread (see ARCHITECTURE.md §5). Use
  * {@link Session.logout} to bring a session down, and the sequence-number

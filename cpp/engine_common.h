@@ -1,8 +1,10 @@
 #ifndef NAPI_QUICKFIX_ENGINE_COMMON_H
 #define NAPI_QUICKFIX_ENGINE_COMMON_H
 
+#include <memory>
 #include <set>
 #include <string>
+#include <utility>
 
 #include "quickfix/Exceptions.h"
 #include "quickfix/Log.h"
@@ -74,6 +76,50 @@ class NullLogFactory : public FIX::LogFactory {
   FIX::Log* create() override { return new FIX::NullLog(); }
   FIX::Log* create(const FIX::SessionID&) override { return new FIX::NullLog(); }
   void destroy(FIX::Log* log) override { delete log; }
+};
+
+// The wrap's LogFactory: forwards to the real one (File/Screen/Null) and
+// remembers the ENGINE-level Log that FIX::Initiator/Acceptor's constructor
+// requests with create() -- no SessionID -- before it runs initialize(). When
+// initialize() throws ConfigError the constructor unwinds without the engine
+// destructor that would hand that Log back (`m_pLogFactory->destroy(m_pLog)`),
+// and QuickFIX's own factories do not reclaim it either (~FileLogFactory does
+// not delete its m_globalLog): with log:'file' every failed construction left
+// two open streams behind. The wrap calls DestroyOrphanedEngineLog() next to
+// DestroyOrphanedSessions() when the engine constructor threw. The engine
+// keeps a raw pointer to its LogFactory for its whole life (per-session logs,
+// and the destroy() in its destructor), so this object must outlive it: it is
+// the wrap's logFactory_ member, declared before the engine.
+class TrackingLogFactory : public FIX::LogFactory {
+ public:
+  explicit TrackingLogFactory(std::unique_ptr<FIX::LogFactory> inner)
+      : inner_(std::move(inner)) {}
+
+  FIX::Log* create() override {
+    FIX::Log* log = inner_->create();  // may throw: nothing recorded then
+    engineLog_ = log;
+    return log;
+  }
+  FIX::Log* create(const FIX::SessionID& id) override {
+    return inner_->create(id);
+  }
+  void destroy(FIX::Log* log) override {
+    if (log == engineLog_) engineLog_ = nullptr;
+    inner_->destroy(log);
+  }
+
+  // Destroy the engine-level Log if the engine constructor requested one and
+  // then threw, so no engine will ever destroy() it. No-op otherwise.
+  void DestroyOrphanedEngineLog() {
+    if (engineLog_ == nullptr) return;
+    FIX::Log* log = engineLog_;
+    engineLog_ = nullptr;
+    inner_->destroy(log);
+  }
+
+ private:
+  std::unique_ptr<FIX::LogFactory> inner_;
+  FIX::Log* engineLog_ = nullptr;
 };
 
 }  // namespace napi_quickfix

@@ -1,6 +1,9 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   Acceptor,
@@ -517,6 +520,62 @@ StartDay=Monday
       await engine.stop();
     }
   });
+
+  test(
+    'a constructor that fails on a later [SESSION] closes the engine log QuickFIX had opened',
+    { timeout: 20_000, skip: process.platform !== 'linux' ? '/proc/self/fd is Linux-only' : false },
+    async () => {
+      // FIX::Initiator/Acceptor's constructor asks the LogFactory for the
+      // engine-level log BEFORE creating the sessions; when a later [SESSION]
+      // throws, the constructor unwinds without the engine destructor that
+      // would hand that log back, and QuickFIX's FileLogFactory does not
+      // reclaim it either. With log:'file' that is two open streams per failed
+      // construction. The wraps destroy it next to the orphaned sessions, so
+      // the process-wide fd count must not move across failed constructions.
+      // Measured synchronously (no await between the samples) so nothing else
+      // in the test process can open or close a descriptor in between.
+      const port = await freePort();
+      const dir = mkdtempSync(join(tmpdir(), 'napi-quickfix-log-'));
+      const withFileLog = (cfg: string) => cfg.replace('[DEFAULT]\n', `[DEFAULT]\nFileLogPath=${dir}\n`);
+      const cases: Array<[string, string]> = [
+        [
+          'Initiator',
+          `${withFileLog(initiatorCfg(port).replace('SenderCompID=CLIENT', 'SenderCompID=AAA'))}
+[SESSION]
+BeginString=FIX.4.4
+SenderCompID=ZZZ
+TargetCompID=SERVER
+HeartBtInt=0
+`,
+        ],
+        [
+          'Acceptor',
+          `${withFileLog(acceptorCfg(port).replace('SenderCompID=SERVER\nTargetCompID=CLIENT', 'SenderCompID=AAA\nTargetCompID=SERVER'))}
+[SESSION]
+BeginString=FIX.4.4
+SenderCompID=ZZZ
+TargetCompID=SERVER
+StartDay=Monday
+`,
+        ],
+      ];
+      const openFds = () => readdirSync('/proc/self/fd').length;
+      try {
+        for (const [kind, cfg] of cases) {
+          const Ctor = kind === 'Initiator' ? Initiator : Acceptor;
+          const settings = SessionSettings.fromString(cfg);
+          const before = openFds();
+          for (let i = 0; i < 5; i++) {
+            assert.throws(() => new Ctor({ settings, store: 'memory', log: 'file' }), { name: 'QuickFixError', fixErrorName: 'ConfigError' });
+          }
+          assert.equal(openFds(), before, `${kind}: five failed constructions leaked no file descriptor`);
+          assert.equal(doesSessionExist(new SessionID('FIX.4.4', 'AAA', 'SERVER')), false);
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 
   test('SessionID arguments are validated, never silently reinterpreted', async () => {
     const port = await freePort();

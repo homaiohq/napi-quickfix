@@ -56,7 +56,9 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   settings object and would otherwise let the second engine silently shadow the first
   in its process-wide session registry. A constructor that fails on a later `[SESSION]`
   deletes the sessions QuickFIX had already created for it (QuickFIX leaks them), so a
-  failed construction does not lock those ids out for the rest of the process.
+  failed construction does not lock those ids out for the rest of the process, and
+  closes the engine-level log QuickFIX had already opened for it (with `log: 'file'`,
+  two file streams per failed construction, which QuickFIX also leaks).
 
 ### Changed
 

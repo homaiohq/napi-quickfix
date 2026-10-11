@@ -352,7 +352,15 @@ Napi::Value SessionWrap::SetTimestampPrecision(const Napi::CallbackInfo& info) {
 // FIX::Session::logon()/logout() only flip SessionState's `enabled` flag and
 // `logoutReason` (the latter under SessionState's own mutex), and refresh()
 // re-reads the store under that same mutex; none of them take
-// FIX::Session::m_mutex or fire a callback, so they are safe on the JS thread.
+// FIX::Session::m_mutex or fire a callback, so they cannot deadlock the JS
+// thread against a QuickFIX thread blocked in a handler. That is the property
+// that lets them run here. What they are NOT is race-free: `enabled` is a
+// plain bool that SessionState::enabled(bool) stores with no lock and that
+// the engine's network thread reads in Session::next() under Session::m_mutex
+// -- formally a data race (ThreadSanitizer reports it), the same one
+// FIX::Initiator::stop() makes when it calls logout()/logon() on every session
+// from the stopping thread. In practice the network thread observes the flag
+// on its next pass; this binding does not patch QuickFIX to make it atomic.
 // Keeping them synchronous also keeps them ORDERED: as AsyncWorkers,
 // `logout(); logon();` could have run on two pool threads in either order.
 //

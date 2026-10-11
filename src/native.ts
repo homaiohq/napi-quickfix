@@ -157,7 +157,9 @@ export interface NativeEngineOptions {
  * engine has been stopped.
  *
  * Every member is synchronous: none takes the session mutex QuickFIX holds
- * across application callbacks, so they are safe on the main thread.
+ * across application callbacks, so they cannot deadlock the main thread
+ * (`logon()`/`logout()` write a plain flag the network thread reads without a
+ * lock, as QuickFIX's own `Initiator::stop()` does).
  * `FIX::Session::disconnect()`/`reset()` are not exposed; they are only safe
  * on the engine's own network thread (see `cpp/session_wrap.cpp`).
  */

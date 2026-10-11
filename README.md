@@ -290,8 +290,9 @@ once the sessions are gone; the first call's `force` applies to both.
 Two live engines cannot share a `SessionID`: constructing one whose session
 already exists in the process throws a `ConfigError` ("Duplicate Session") until
 the engine owning it has been stopped. A constructor that fails on a later
-`[SESSION]` (any `ConfigError`) cleans up the sessions it had already created,
-so the ids are not locked out by the failed attempt.
+`[SESSION]` (any `ConfigError`) cleans up the sessions it had already created
+(so the ids are not locked out by the failed attempt) and the engine-level log
+QuickFIX had already opened for it.
 
 ### Session
 
@@ -330,9 +331,11 @@ session.refresh(): void;                 // re-read state from the message store
 ```
 
 Everything is synchronous: none of these members takes the mutex QuickFIX holds
-while it runs your handlers, so they are safe on the main thread — and because
-they run inline, `session.logout('x'); session.logon();` takes effect in that
-order. QuickFIX's `Session::disconnect()` and `reset()` are deliberately **not**
+while it runs your handlers, so they cannot deadlock the main thread — and
+because they run inline, `session.logout('x'); session.logon();` takes effect in
+that order. (`logon()`/`logout()` flip a plain flag the engine's network thread
+reads without a lock, exactly as QuickFIX's own `Initiator::stop()` does from
+the stopping thread; the engine picks the change up on its next pass.) QuickFIX's `Session::disconnect()` and `reset()` are deliberately **not**
 exposed: they drop the transport through the engine's socket monitor, which is
 only safe from the engine's own network thread (QuickFIX itself never calls them
 from anywhere else). Bring a session down with `logout()` and renumber it with

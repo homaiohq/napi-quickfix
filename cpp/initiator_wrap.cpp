@@ -83,13 +83,15 @@ InitiatorWrap::InitiatorWrap(const Napi::CallbackInfo& info)
       storeFactory_ = std::make_unique<FIX::FileStoreFactory>(settings);
     }
 
+    std::unique_ptr<FIX::LogFactory> logFactory;
     if (log == "none") {
-      logFactory_ = std::make_unique<NullLogFactory>();
+      logFactory = std::make_unique<NullLogFactory>();
     } else if (log == "file") {
-      logFactory_ = std::make_unique<FIX::FileLogFactory>(settings);
+      logFactory = std::make_unique<FIX::FileLogFactory>(settings);
     } else {
-      logFactory_ = std::make_unique<FIX::ScreenLogFactory>(settings);
+      logFactory = std::make_unique<FIX::ScreenLogFactory>(settings);
     }
+    logFactory_ = std::make_unique<TrackingLogFactory>(std::move(logFactory));
 
     RejectDuplicateSessions(settings, "initiator");
     try {
@@ -97,8 +99,12 @@ InitiatorWrap::InitiatorWrap(const Napi::CallbackInfo& info)
           *bridge_, *storeFactory_, settings, *logFactory_);
     } catch (...) {
       // A [SESSION] after the first valid one threw: QuickFIX has leaked the
-      // sessions it had already created (see DestroyOrphanedSessions).
+      // sessions it had already created (see DestroyOrphanedSessions) and the
+      // engine-level Log it requested before creating any of them (see
+      // TrackingLogFactory). Both would otherwise only have been reclaimed by
+      // the engine destructor that never runs.
       DestroyOrphanedSessions(settings, "initiator");
+      logFactory_->DestroyOrphanedEngineLog();
       throw;
     }
     sessionIDs_ = initiator_->getSessions();
@@ -139,14 +145,32 @@ void InitiatorWrap::Teardown(bool force) {
   //   1. Deactivate the bridge (set a flag, no TSFN op): any callback firing on
   //      a QuickFIX network thread during the upcoming stop() will pass through
   //      immediately without touching the TSFN or waiting on the (frozen) JS
-  //      loop. This breaks the stop()->onLogout->BlockingCall deadlock.
-  //   2. stop(force): joins all QuickFIX network threads. After it returns, no
-  //      network thread is running, so none can race into the TSFN.
-  //   3. Abort the TSFN: safe now that no producer thread remains.
-  if (stopped_) return;
+  //      loop, and every BlockingCall already waiting is woken. This breaks
+  //      the stop()->onLogout->BlockingCall deadlock.
+  //   2. Join the stop() worker if one is in flight: its operation may still
+  //      be inside FIX::Initiator::stop() -- or waiting in gate->Freeze() for
+  //      a sendToTarget() that step 1 has just unblocked -- on a libuv thread,
+  //      and the destructor's DestroyEngine() that follows Teardown() must not
+  //      delete the engine under it. (Node drains the thread pool before it
+  //      runs cleanup hooks or finalizers, so this wait is expected to return
+  //      at once; it makes the ordering a property of this code rather than
+  //      of Node's shutdown sequence.) This is also why the early return is
+  //      keyed on tornDown_, not stopped_: stopped_ is set for the whole
+  //      duration of an in-flight stop().
+  //   3. stop(force): joins all QuickFIX network threads. A no-op if the
+  //      worker's stop() completed (FIX::Initiator::isStopped()); the real
+  //      stop if it threw part-way or no stop() was ever called. After it
+  //      returns, no network thread is running, so none can race into the TSFN.
+  //   4. Abort the TSFN: safe now that no producer thread remains.
+  if (tornDown_) return;
+  tornDown_ = true;
   stopped_ = true;
   if (bridge_) {
     bridge_->Deactivate();
+  }
+  if (stopSync_) {
+    stopSync_->Wait();
+    stopSync_.reset();
   }
   if (initiator_ && started_) {
     try {
@@ -256,6 +280,10 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
   }
   busy_ = true;
   stopped_ = true;
+  // Lets Teardown() wait for the worker's operation instead of destroying the
+  // engine under it; cleared in onSettled once the operation has returned.
+  auto stopDone = std::make_shared<StopCompletion>();
+  stopSync_ = stopDone;
 
   // A never-started engine takes the same async path (minus the stop() call):
   // its FIX::Session objects are registered from construction, so a session
@@ -270,7 +298,13 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
       env, info.This().As<Napi::Object>(),
       // Runs on the worker thread. stop()'s onLogout/toAdmin callbacks fire on
       // QuickFIX threads while the main loop is free to service the TSFN.
-      [initiator, gate, started, force]() {
+      [initiator, gate, started, force, stopDone]() {
+        // Signal completion on every exit of this lambda, success or throw,
+        // and only after the gate freeze below has returned as well.
+        struct SignalOnExit {
+          std::shared_ptr<StopCompletion> done;
+          ~SignalOnExit() { done->Signal(); }
+        } signalOnExit{stopDone};
         try {
           if (started) initiator->stop(force);
         } catch (...) {
@@ -289,6 +323,7 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
       [self, bridge, env, force](
           bool ok, const std::shared_ptr<EngineOpWorker::Settlement>& s) {
         self->busy_ = false;
+        self->stopSync_.reset();  // the worker's operation has returned
         // Settles the promise and lets a later stop() start over (the
         // in-flight stop is finished, successfully or not).
         auto settle = [self, s]() {

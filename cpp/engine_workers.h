@@ -3,13 +3,39 @@
 
 #include <napi.h>
 
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <utility>
 
 #include "errors.h"
 
 namespace napi_quickfix {
+
+// One-shot completion signal from a libuv worker to the JS thread. The stop
+// worker signals it once its operation (FIX stop() + gate freeze) has
+// returned, success or not; the wrap's Teardown() waits on it rather than
+// destroying the engine under an operation that may still be running it.
+class StopCompletion {
+ public:
+  void Signal() {
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      done_ = true;
+    }
+    cv_.notify_all();
+  }
+  void Wait() {
+    std::unique_lock<std::mutex> lock(mtx_);
+    cv_.wait(lock, [this] { return done_; });
+  }
+
+ private:
+  std::mutex mtx_;
+  std::condition_variable cv_;
+  bool done_ = false;
+};
 
 // A generic AsyncWorker that runs a blocking QuickFIX engine operation
 // (start/stop) on a libuv worker thread and resolves/rejects a JS Promise.

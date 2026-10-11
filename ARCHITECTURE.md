@@ -185,7 +185,7 @@ wait on a thread that is waiting on the main thread — deadlock. Every exposed 
 | --- | --- | --- |
 | `isLoggedOn` · `isEnabled` · `sentLogon` · `sentLogout` · `receivedLogon` · `isInitiator` · `isAcceptor` · `isSessionTime` · `isLogonTime` · option getters/setters | sync, main | Read/write plain members of `FIX::Session`; no lock, no callback. |
 | `getExpectedSenderNum` · `getExpectedTargetNum` · `setNextSenderMsgSeqNum` · `setNextTargetMsgSeqNum` | sync, main | Touch the `MessageStore` under `SessionState`'s own mutex, which QuickFIX never holds across a callback. May throw `IOException` (mapped to `QuickFixError`). |
-| `logon` · `logout` · `refresh` | sync, main | Only touch `SessionState` (`enabled`/`logoutReason`, and the store for `refresh`) under its own mutex; no `m_mutex`, no callback. Running them inline also keeps them **ordered**: as AsyncWorkers, `logout(); logon();` could land on two pool threads in either order. |
+| `logon` · `logout` · `refresh` | sync, main | Only touch `SessionState` (`enabled`/`logoutReason`, and the store for `refresh`); no `m_mutex`, no callback, so no deadlock. `logoutReason` and the store are under `SessionState`'s own mutex; `enabled` is a plain `bool` written with **no lock** while the network thread reads it in `Session::next()` — formally a data race (TSan reports it), the same one `Initiator::stop()` makes from the stopping thread, benign in practice (the flag is picked up on the next pass). Running them inline also keeps them **ordered**: as AsyncWorkers, `logout(); logon();` could land on two pool threads in either order. |
 
 `FIX::Session::disconnect()` and `reset()` (which calls it) are **not exposed**, and not only because they take
 `m_mutex` and fire callbacks (that alone would just make them AsyncWorkers, like `sendToTarget`). Through the
@@ -213,7 +213,12 @@ if a later one throws `ConfigError`, unwinds without the engine destructor that 
 created — they would stay registered with no owner, resolvable through `lookupSession` yet refused as duplicates
 by every later engine. Both wrap constructors therefore catch the throw and delete those orphans
 (`DestroyOrphanedSessions`, `engine_common.h`): the duplicate check just before guarantees every session of theirs
-that exists at that point was created by the failed constructor.
+that exists at that point was created by the failed constructor. The same unwinding leaks the **engine-level
+`Log`** that the `Initiator`/`Acceptor` constructor requests from the `LogFactory` (`create()` with no `SessionID`)
+before `initialize()` runs — only the engine destructor hands it back, and QuickFIX's `FileLogFactory` does not
+reclaim it either, so with `log: 'file'` each failed construction left two open streams. The wraps therefore hand
+the engine a `TrackingLogFactory` (`engine_common.h`) that forwards to the real factory and remembers that `Log`;
+on a failed construction they destroy it next to the orphaned sessions.
 
 That eager destruction races with the worker-thread operations above, which hold a raw `FIX::Session*` between
 `lookupSession` and the end of the operation. `session_op_gate.h` closes the race with a **per-engine** gate.
@@ -239,6 +244,13 @@ behind those events, then releases the TSFN; the TSFN is ref'd for that drain so
 still resolves. `stop(true)` aborts the TSFN (discarding queued events) and destroys immediately. If `stop()`
 itself threw, the engine is left intact, the gate unfrozen and `stopped_` cleared so a later `stop()` or the
 destructor's `Teardown()` retries — the network thread may still be running, so destroying would be unsafe.
+`Teardown()` (the env cleanup hook and the destructor) runs once, keyed on its own `tornDown_` flag rather than on
+`stopped_`, which is set for the whole duration of an in-flight `stop()`: if the stop worker is still running, it
+first deactivates the bridge (waking any `BlockingCall` the worker's `Freeze()` may be waiting behind) and then
+waits for the worker's operation to return (`StopCompletion`, `engine_workers.h`) before force-stopping — a no-op if
+the worker's `stop()` completed — and destroying the engine. Node drains the thread pool before it runs cleanup hooks
+or finalizers, so that wait is expected to return at once; it makes the ordering a property of this code rather
+than of Node's shutdown sequence.
 Because the settlement is deferred, `stopped_` is set long before the engine is gone; a `stop()` made in that
 window (typically from the `'logout'` listener the stop fired) must not resolve on the strength of `stopped_`
 alone. The wrap keeps a reference to the in-flight stop's promise (`stopPromise_`) until it settles and returns

@@ -12,6 +12,8 @@
 #include "quickfix/SocketInitiator.h"
 
 #include "application_bridge.h"
+#include "engine_common.h"
+#include "engine_workers.h"
 #include "session_op_gate.h"
 
 namespace napi_quickfix {
@@ -52,7 +54,9 @@ class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap> {
   // bridge it references.
   std::unique_ptr<ApplicationBridge> bridge_;
   std::unique_ptr<FIX::MessageStoreFactory> storeFactory_;
-  std::unique_ptr<FIX::LogFactory> logFactory_;
+  // Wraps the real factory so a failed engine constructor can reclaim the
+  // engine-level Log QuickFIX would otherwise leak (see engine_common.h).
+  std::unique_ptr<TrackingLogFactory> logFactory_;
   // Gate between this engine's destruction and the libuv-thread session
   // operations on ITS sessions (see session_op_gate.h). Shared with the stop
   // worker; registered for sessionIDs_ at construction, unregistered when the
@@ -65,8 +69,16 @@ class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap> {
   std::set<FIX::SessionID> sessionIDs_;
 
   bool started_ = false;
+  // Set by stop() when it launches its worker (so start() rejects from then
+  // on) and by Teardown(); cleared again if that stop() failed. It is NOT
+  // "the engine is stopped": a stop() may be in flight.
   bool stopped_ = false;
+  bool tornDown_ = false;  // Teardown() has run (it runs once)
   bool busy_ = false;  // guards against overlapping start/stop AsyncWorkers
+  // Signalled by the in-flight stop() worker once its operation has returned;
+  // non-null from Stop() launching the worker until that stop settles on the
+  // JS thread. Teardown() waits on it (see there).
+  std::shared_ptr<StopCompletion> stopSync_;
   // The promise of the stop() in flight, from the call until it settles
   // (which, for a graceful stop, is after its worker's OnOK). A stop() made
   // meanwhile returns this same promise instead of resolving early.
