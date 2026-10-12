@@ -1,5 +1,6 @@
 #include "application_bridge.h"
 
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -211,16 +212,11 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
     return r;
   }
 
-  auto channel = std::make_shared<SyncChannel>();
-  std::uint64_t channelId = 0;
-  if (!RegisterChannel(channel, channelId)) {
-    // Lost the race with Deactivate()/Abort(): the wake loop has already run
-    // (or is running) over pending_, so waiting now could block until Abort().
-    Result r;
-    return r;
-  }
-
-  auto* data = new CallData();
+  // Everything that can throw (the copy, its serialization, the dictionary
+  // lookup) runs before the channel is registered, and `data` is owned until
+  // the TSFN takes it: an exception (std::bad_alloc) leaks nothing and leaves
+  // no channel in pending_.
+  auto data = std::make_unique<CallData>();
   data->type = type;
   data->sessionID = id;
   // Deep copy, nested entries kept typed: the engine parsed them as
@@ -235,17 +231,27 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
   }
   data->sessionDictionary = SessionDictionary(id);
   data->hasMessage = true;
+
+  auto channel = std::make_shared<SyncChannel>();
+  std::uint64_t channelId = 0;
+  if (!RegisterChannel(channel, channelId)) {
+    // Lost the race with Deactivate()/Abort(): the wake loop has already run
+    // (or is running) over pending_, so waiting now could block until Abort().
+    Result r;
+    return r;
+  }
   data->channel = channel;  // shared: trampoline gets its own owning copy
 
-  napi_status status = tsfn_.BlockingCall(data);
+  napi_status status = tsfn_.BlockingCall(data.get());
   if (status != napi_ok) {
     // TSFN is closing/aborted: it won't take ownership and won't fulfill the
-    // channel. Clean up and return a pass-through result.
-    delete data;
+    // channel. Clean up (`data` frees itself) and return a pass-through
+    // result.
     UnregisterChannel(channelId);
     Result r;
     return r;
   }
+  data.release();  // the trampoline owns it now
 
   // Wait for the trampoline (normal completion) or Abort/Deactivate (teardown)
   // to signal the channel. Never blocks forever: WakeAllPending() sets done.
