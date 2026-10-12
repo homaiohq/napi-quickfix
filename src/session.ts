@@ -135,7 +135,8 @@ export class Session {
    * Set the MsgSeqNum the next outbound message will carry (writes to the
    * message store; a file store may throw `IOException`).
    *
-   * @throws `RangeError` if `seqNum` is not a non-negative safe integer.
+   * @throws `RangeError` if `seqNum` is not a positive safe integer (MsgSeqNum is
+   * 1-based).
    */
   setNextSenderMsgSeqNum(seqNum: number): void {
     this.#native.setNextSenderMsgSeqNum(seqNum);
@@ -145,7 +146,8 @@ export class Session {
    * Set the MsgSeqNum expected on the next inbound message (writes to the
    * message store; a file store may throw `IOException`).
    *
-   * @throws `RangeError` if `seqNum` is not a non-negative safe integer.
+   * @throws `RangeError` if `seqNum` is not a positive safe integer (MsgSeqNum is
+   * 1-based).
    */
   setNextTargetMsgSeqNum(seqNum: number): void {
     this.#native.setNextTargetMsgSeqNum(seqNum);

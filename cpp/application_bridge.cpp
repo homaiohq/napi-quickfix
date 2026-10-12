@@ -125,12 +125,21 @@ void ApplicationBridge::Deactivate() {
   WakeAllPending();
 }
 
-std::uint64_t ApplicationBridge::RegisterChannel(
-    const std::shared_ptr<SyncChannel>& ch) {
+bool ApplicationBridge::RegisterChannel(const std::shared_ptr<SyncChannel>& ch,
+                                        std::uint64_t& id) {
   std::lock_guard<std::mutex> lock(pendingMtx_);
-  std::uint64_t id = nextChannelId_++;
+  // Checked under the lock: Deactivate()/Abort()/Release() store inactive_
+  // before they take pendingMtx_ for WakeAllPending(), so either this
+  // registration lands in pending_ before the wake loop iterates it, or it
+  // observes inactive_ here and is refused. Without this re-check a caller
+  // could pass CallSync's unlocked fast-path check, register after the wake
+  // loop ran, and wait until Abort() while the JS thread is blocked on it.
+  if (inactive_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  id = nextChannelId_++;
   pending_[id] = ch;
-  return id;
+  return true;
 }
 
 void ApplicationBridge::UnregisterChannel(std::uint64_t id) {
@@ -191,14 +200,21 @@ ApplicationBridge::Result ApplicationBridge::CallSync(CallType type,
   // Bridge is releasing/aborting: never call into the TSFN (its internals may be
   // torn down during finalize -> calling would abort the process). Return an
   // empty pass-through result so the QuickFIX thread proceeds without mutation
-  // or thrown exception.
+  // or thrown exception. This is only a cheap fast path; the authoritative
+  // check is the one RegisterChannel() makes under pendingMtx_.
   if (inactive_.load(std::memory_order_acquire)) {
     Result r;
     return r;
   }
 
   auto channel = std::make_shared<SyncChannel>();
-  std::uint64_t channelId = RegisterChannel(channel);
+  std::uint64_t channelId = 0;
+  if (!RegisterChannel(channel, channelId)) {
+    // Lost the race with Deactivate()/Abort(): the wake loop has already run
+    // (or is running) over pending_, so waiting now could block until Abort().
+    Result r;
+    return r;
+  }
 
   auto* data = new CallData();
   data->type = type;

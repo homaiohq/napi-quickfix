@@ -255,6 +255,10 @@ describe('Session control over a loopback (in-process)', () => {
 
         assert.throws(() => iniSession!.setNextSenderMsgSeqNum(-1), RangeError);
         assert.throws(() => iniSession!.setNextTargetMsgSeqNum(1.5), RangeError);
+        // MsgSeqNum is 1-based: 0 would go out on the wire as 34=0 and be
+        // answered with a Logout ("MsgSeqNum too low").
+        assert.throws(() => iniSession!.setNextSenderMsgSeqNum(0), RangeError);
+        assert.throws(() => iniSession!.setNextTargetMsgSeqNum(0), RangeError);
 
         // --- refresh() is sync and does not throw ------------------------------------------
         assert.doesNotThrow(() => iniSession!.refresh());

@@ -154,11 +154,21 @@ class ApplicationBridge : public FIX::Application {
   // Wake all in-flight synchronous callers (used by Deactivate/Abort so a
   // network thread blocked in CallSync doesn't wait forever when the main loop
   // is frozen inside a cleanup hook). Registers each SyncChannel while pending.
+  //
+  // Invariant: every path that sets inactive_ stores it BEFORE taking
+  // pendingMtx_ to run WakeAllPending(), and RegisterChannel() re-checks
+  // inactive_ UNDER pendingMtx_. So a registration that saw inactive_ unset is
+  // already in pending_ when the wake loop runs, and one that lost the race is
+  // refused; either way no caller can start waiting after the wake. The JS
+  // thread relies on this when it blocks on a network thread after
+  // Deactivate() (Teardown's stop() join, DestroyEngine's gate freeze).
   std::mutex pendingMtx_;
   std::unordered_map<std::uint64_t, std::shared_ptr<SyncChannel>> pending_;
   std::uint64_t nextChannelId_ = 0;
 
-  std::uint64_t RegisterChannel(const std::shared_ptr<SyncChannel>& ch);
+  // Returns false (nothing registered) if the bridge is already inactive.
+  bool RegisterChannel(const std::shared_ptr<SyncChannel>& ch,
+                       std::uint64_t& id);
   void UnregisterChannel(std::uint64_t id);
   void WakeAllPending();
 };

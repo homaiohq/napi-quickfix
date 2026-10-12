@@ -216,7 +216,9 @@ Napi::Value SessionWrap::TimeCheck(const Napi::CallbackInfo& info,
 
 // Sequence numbers are FIX::SEQNUM (uint64_t). JS numbers are exact up to
 // 2^53, which is far beyond any practical MsgSeqNum; reject anything that is
-// not a non-negative safe integer.
+// not a positive safe integer. MsgSeqNum (tag 34) is 1-based: QuickFIX's own
+// SessionState::reset() and MemoryStore start at 1, and a peer answers 34=0
+// with a Logout ("MsgSeqNum too low").
 Napi::Value SessionWrap::SeqNumSet(const Napi::CallbackInfo& info, bool sender,
                                    const char* name) {
   Napi::Env env = info.Env();
@@ -225,10 +227,10 @@ Napi::Value SessionWrap::SeqNumSet(const Napi::CallbackInfo& info, bool sender,
   }
   const double raw = info[0].As<Napi::Number>().DoubleValue();
   constexpr double kMaxSafe = 9007199254740991.0;  // Number.MAX_SAFE_INTEGER
-  if (!std::isfinite(raw) || std::floor(raw) != raw || raw < 0 ||
+  if (!std::isfinite(raw) || std::floor(raw) != raw || raw < 1 ||
       raw > kMaxSafe) {
     throw Napi::RangeError::New(
-        env, std::string(name) + ": seqNum must be a non-negative safe integer");
+        env, std::string(name) + ": seqNum must be a positive safe integer");
   }
   const FIX::SEQNUM num = static_cast<FIX::SEQNUM>(raw);
   NQ_TRY(env) {

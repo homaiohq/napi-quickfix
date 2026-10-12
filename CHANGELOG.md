@@ -99,6 +99,14 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   with `setNextSenderMsgSeqNum` / `setTimestampPrecision` (previously `TypeError` for a
   non-integer and undefined behaviour for an out-of-range value).
 
+### Fixed
+
+- A `toApp`/`toAdmin`/`fromApp`/`fromAdmin` callback that started on a network thread at
+  the same instant the engine was torn down could register its reply channel after the
+  teardown had woken the pending callbacks, and then wait on the frozen event loop
+  (a hang on exit, or in `stop()`). The registration now re-checks the teardown flag
+  under the same lock the wake-up takes, so the callback passes through instead.
+
 ## [0.1.0] - 2026-10-08
 
 Initial release. Bundles **QuickFIX v1.16.0** (statically linked).
