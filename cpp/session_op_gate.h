@@ -54,9 +54,13 @@ namespace napi_quickfix {
 //     engine's own stop() has returned: it blocks new operations on this
 //     engine's sessions and waits for the in-flight ones to drain. The wrap
 //     then unregisters and destroys the engine on the JS thread (OnOK) and
-//     calls Unfreeze(). Because Freeze() waits on a libuv thread while the JS
-//     loop is free, an in-flight operation blocked in a BlockingCall to JS
-//     (sendToTarget() -> toApp) can still complete.
+//     calls Unfreeze() -- or, if the engine survives (the stop threw, or the
+//     environment is torn down before a graceful stop's queued destruction
+//     runs), calls Unfreeze() alone so that operations parked meanwhile are
+//     woken rather than left pinning a libuv thread. Because Freeze() waits
+//     on a libuv thread while the JS loop is free, an in-flight operation
+//     blocked in a BlockingCall to JS (sendToTarget() -> toApp) can still
+//     complete.
 //   * The wrap destructor calls Freeze() on the JS thread, but only after
 //     Teardown() has deactivated the bridge (waking every pending BlockingCall
 //     and making later callbacks pass through) and joined the network threads,

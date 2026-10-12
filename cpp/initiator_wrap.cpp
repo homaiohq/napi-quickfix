@@ -320,7 +320,7 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
         // sendToTarget() -> toApp). Other engines' operations are unaffected.
         gate->Freeze();
       },
-      [self, bridge, env, force](
+      [self, bridge, env, force, gate](
           bool ok, const std::shared_ptr<EngineOpWorker::Settlement>& s) {
         self->busy_ = false;
         self->stopSync_.reset();  // the worker's operation has returned
@@ -369,19 +369,35 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
         // the TSFN so it closes once drained. The owner reference held by the
         // settlement keeps this wrap alive until then.
         const bool queued =
-            bridge->RunAfterQueued(env, [self, s, settle](Napi::Env e) {
+            bridge->RunAfterQueued(env, [self, s, settle, gate](Napi::Env e) {
               if (e == nullptr) {
                 // Discarded: the environment is being torn down. The wrap's
                 // own teardown (cleanup hook, then destructor) destroys the
-                // engine; touch nothing but the settlement, which this
-                // closure owns. In particular do not reach through `self`:
-                // what keeps the wrap alive until here is the TSFN's
-                // reference on the napi_env (the env -- and with it every
-                // ObjectWrap finalizer -- is deleted only after the TSFN has
-                // dropped its queue), a Node internal this code must not
-                // lean on. The promise reference needs no special care: the
-                // wrap destructor deletes it, and runs with the env valid.
+                // engine; touch nothing but the settlement and the gate,
+                // which this closure owns (the gate by shared_ptr). In
+                // particular do not reach through `self`: what keeps the
+                // wrap alive until here is the TSFN's reference on the
+                // napi_env (the env -- and with it every ObjectWrap
+                // finalizer -- is deleted only after the TSFN has dropped
+                // its queue), a Node internal this code must not lean on.
+                // The promise reference needs no special care: the wrap
+                // destructor deletes it, and runs with the env valid.
+                //
+                // The freeze the stop worker took is still held: lift it,
+                // as DestroyStoppedEngine() would have. A SendToTargetWorker
+                // parked in OpScope since then is otherwise never woken, and
+                // the destructor's own DestroyEngine() -- which nests its
+                // freeze inside this one -- never brings the count to zero
+                // either; the libuv pool thread it sits on would be parked
+                // for good, and whoever drains the pool at exit (a Worker's
+                // terminate(), the process teardown) would hang on it. Once
+                // woken it runs against the engine, still intact at this
+                // point (the bridge is inactive, so a callback it makes
+                // passes through), or is refused by Acquire() if the engine
+                // has already been unregistered; the destructor's Freeze()
+                // waits for it either way.
                 s->Abandon();
+                gate->Unfreeze();
                 return;
               }
               self->DestroyStoppedEngine();
