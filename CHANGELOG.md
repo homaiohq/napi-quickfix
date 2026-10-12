@@ -76,15 +76,15 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   `headerFields()` / `trailerFields()` on `Message`) and `[Symbol.iterator]`.
 - `DataDictionary.validate(msg, bodyOnly?)`, and the introspection methods
   `getVersion`, `getFieldName`, `getFieldTag`, `isField`, `isMsgType`.
-- Argument validation on the field and group methods: a tag passed to a setter
-  (and a `Group` count tag / delimiter / order entry) must be a positive integer,
-  a tag passed to a reader and a group index must be an integer. Anything else
-  throws a `TypeError` instead of being silently truncated (`1.5` → `1`,
-  `NaN` → `0`) or emitted on the wire (`setField(0, 'x')` → `0=x`). A `Group`
-  delimiter or order entry above 2^20 throws a `RangeError`, since QuickFIX
-  allocates `largestTag + 1` ints per group order. `replaceGroup(0, …)` throws
-  `FieldNotFound` and `hasGroup(0, tag)` is `false`: QuickFIX has no lower
-  bound on group indices and would silently drop the update.
+- Group argument checks. A `Group` delimiter or order entry above 2^20 throws a
+  `RangeError`, since QuickFIX allocates `largestTag + 1` ints per group order,
+  and an order that lists a tag twice throws a `TypeError` (QuickFIX would rank
+  it by its last position, which can move the delimiter off the front).
+  `replaceGroup` and `removeGroup(index, tag)` throw `FieldNotFound` for a
+  missing entry, index 0 included, and `hasGroup(0, tag)` is `false`: QuickFIX
+  has no lower bound on group indices and would silently drop the call.
+  `replaceGroup` throws a `TypeError` when the replacement's delimiter differs
+  from the stored entry's.
 
 ### Changed
 
@@ -133,6 +133,26 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   `isLogonTime(now)` likewise throw `RangeError` for an invalid `Date` or a time outside
   the `Date` range, instead of `TypeError` for the former and undefined behaviour for
   the latter.
+- **Breaking:** messages handed to engine handlers (`fromApp`, `toApp`, ...) now
+  keep the repeating groups QuickFIX parsed with the session's dictionary, and
+  groups added to an outbound message in `toApp` / `toAdmin` reach the wire. The
+  bridge used to round-trip every message through its wire string without a
+  dictionary, which flattened them. With the default `UseDataDictionary=Y`, a
+  field inside a group (e.g. `PartyID` under `NoPartyIDs`) is no longer a body
+  field: `getField(448)` now throws `FieldNotFound`; read it with
+  `getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID)`.
+- **Breaking:** field tags and group indices are validated. A tag passed to a
+  setter (and a `Group` count tag / delimiter / order entry) must be a positive
+  integer; a tag passed to a reader (`Message`, `Group`, and
+  `DataDictionary.getFieldName` / `isField`) and a group index must be an
+  integer. Anything else throws a `TypeError` instead of being silently
+  truncated (`1.5` → `1`, `NaN` → `0`) or emitted on the wire
+  (`setField(0, 'x')` → `0=x`).
+- **Breaking:** `getField` / `isSetField` / `getFieldIfSet` / `setField` /
+  `removeField` find a field that only the data dictionary declares as a header
+  or trailer field (a user-defined tag, say) where the engine parsed it, instead
+  of looking in the body. `setField` edits such a field in place instead of
+  adding a body duplicate; a tag held nowhere is still a body field.
 
 ### Fixed
 
@@ -148,16 +168,6 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   now owns that shutdown alone, which also stops listening sockets from being closed
   twice. In exchange, stopping an acceptor now takes up to one second longer: the network
   thread notices the stop on its next 1 s poll timeout, as QuickFIX's initiator already does.
-- Messages handed to engine handlers (`fromApp`, `toApp`, ...) now keep the
-  repeating groups QuickFIX parsed with the session's dictionary, and groups added
-  to an outbound message in `toApp` / `toAdmin` reach the wire. The bridge used to
-  round-trip every message through its wire string without a dictionary, which
-  flattened them.
-- `getField` / `isSetField` / `getFieldIfSet` / `setField` / `removeField` find a
-  field that only the data dictionary declares as a header or trailer field (a
-  user-defined tag, say) where the engine parsed it. `setField` edits such a field
-  in place instead of adding a body duplicate; a tag held nowhere is still a body
-  field.
 - A nested group entry keeps its delimiter through every copy (`addGroup`,
   `replaceGroup`, `getGroup`, the handler and `sendToTarget` paths), so an entry
   that is empty or lacks its delimiter field reports the right `delim` and
