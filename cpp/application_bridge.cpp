@@ -96,6 +96,29 @@ void ApplicationBridge::Abort() {
   }
 }
 
+bool ApplicationBridge::RunAfterQueued(Napi::Env env,
+                                       std::function<void(Napi::Env)> fn) {
+  if (released_ || inactive_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  auto* data = new CallData();
+  data->type = CallType::kBarrier;
+  data->hasMessage = false;
+  data->barrier = std::move(fn);
+  napi_status status = tsfn_.NonBlockingCall(data);
+  if (status != napi_ok) {
+    delete data;
+    return false;
+  }
+  // The loop must not exit before the barrier has run even if the user
+  // unref()'d the engine; after Release() the TSFN closes as soon as its queue
+  // is drained, so this only keeps the loop alive for that drain. Ref'd only
+  // once the item is queued: a refused call leaves the TSFN exactly as the
+  // caller had it (JS thread, so nothing runs in between).
+  tsfn_.Ref(env);
+  return true;
+}
+
 void ApplicationBridge::Deactivate() {
   inactive_.store(true, std::memory_order_release);
   // Release any network thread already blocked in CallSync so the subsequent
@@ -104,12 +127,21 @@ void ApplicationBridge::Deactivate() {
   WakeAllPending();
 }
 
-std::uint64_t ApplicationBridge::RegisterChannel(
-    const std::shared_ptr<SyncChannel>& ch) {
+bool ApplicationBridge::RegisterChannel(const std::shared_ptr<SyncChannel>& ch,
+                                        std::uint64_t& id) {
   std::lock_guard<std::mutex> lock(pendingMtx_);
-  std::uint64_t id = nextChannelId_++;
+  // Checked under the lock: Deactivate()/Abort()/Release() store inactive_
+  // before they take pendingMtx_ for WakeAllPending(), so either this
+  // registration lands in pending_ before the wake loop iterates it, or it
+  // observes inactive_ here and is refused. Without this re-check a caller
+  // could pass CallSync's unlocked fast-path check, register after the wake
+  // loop ran, and wait until Abort() while the JS thread is blocked on it.
+  if (inactive_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  id = nextChannelId_++;
   pending_[id] = ch;
-  return id;
+  return true;
 }
 
 void ApplicationBridge::UnregisterChannel(std::uint64_t id) {
@@ -170,14 +202,21 @@ ApplicationBridge::Result ApplicationBridge::CallSync(CallType type,
   // Bridge is releasing/aborting: never call into the TSFN (its internals may be
   // torn down during finalize -> calling would abort the process). Return an
   // empty pass-through result so the QuickFIX thread proceeds without mutation
-  // or thrown exception.
+  // or thrown exception. This is only a cheap fast path; the authoritative
+  // check is the one RegisterChannel() makes under pendingMtx_.
   if (inactive_.load(std::memory_order_acquire)) {
     Result r;
     return r;
   }
 
   auto channel = std::make_shared<SyncChannel>();
-  std::uint64_t channelId = RegisterChannel(channel);
+  std::uint64_t channelId = 0;
+  if (!RegisterChannel(channel, channelId)) {
+    // Lost the race with Deactivate()/Abort(): the wake loop has already run
+    // (or is running) over pending_, so waiting now could block until Abort().
+    Result r;
+    return r;
+  }
 
   auto* data = new CallData();
   data->type = type;
@@ -298,6 +337,12 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
       delete data;
     }
   } guard{data, {}};
+
+  if (data->type == CallType::kBarrier) {
+    // Dropped (null env) or reached in FIFO order: either way, hand over.
+    if (data->barrier) data->barrier(env);
+    return;
+  }
 
   // env may be null during environment teardown; nothing safe to do.
   if (env == nullptr || context == nullptr) {

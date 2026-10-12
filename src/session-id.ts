@@ -78,3 +78,25 @@ export class SessionID {
     return this.#native.toString();
   }
 }
+
+/**
+ * @internal The native handle behind a {@link SessionID} argument.
+ *
+ * Duck-typed rather than `instanceof SessionID`: this package ships ESM and
+ * CJS builds, and a `SessionID` created by the other build is a different class
+ * with the same shape. Both builds load the same native addon, so its
+ * `SessionIDWrap` class is the one thing they share, and that is what the
+ * handle is checked against. Anything else -- `null`, `{}`, a `Session` -- is
+ * a `TypeError` naming the argument, rather than silently degrading to an
+ * `undefined` handle that the callee would read as "no session id given".
+ */
+export function toNativeSessionID(value: unknown, name: string): NativeSessionID {
+  const handle =
+    typeof value === 'object' && value !== null
+      ? (value as { nativeHandle?: unknown }).nativeHandle
+      : undefined;
+  if (!(handle instanceof native.SessionIDWrap)) {
+    throw new TypeError(`${name} must be a SessionID`);
+  }
+  return handle;
+}

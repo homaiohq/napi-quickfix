@@ -1,5 +1,6 @@
 #include "acceptor_wrap.h"
 
+#include <memory>
 #include <string>
 
 #include "quickfix/FileLog.h"
@@ -8,7 +9,10 @@
 #include "engine_common.h"
 #include "engine_workers.h"
 #include "errors.h"
+#include "session_id_wrap.h"
+#include "session_op_gate.h"
 #include "session_settings_wrap.h"
+#include "session_wrap.h"
 
 namespace napi_quickfix {
 
@@ -34,6 +38,8 @@ Napi::Object AcceptorWrap::Init(Napi::Env env, Napi::Object exports) {
           InstanceMethod("start", &AcceptorWrap::Start),
           InstanceMethod("stop", &AcceptorWrap::Stop),
           InstanceMethod("isLoggedOn", &AcceptorWrap::IsLoggedOn),
+          InstanceMethod("getSessions", &AcceptorWrap::GetSessions),
+          InstanceMethod("getSession", &AcceptorWrap::GetSession),
           InstanceMethod("ref", &AcceptorWrap::Ref),
           InstanceMethod("unref", &AcceptorWrap::Unref),
       });
@@ -76,16 +82,32 @@ AcceptorWrap::AcceptorWrap(const Napi::CallbackInfo& info)
       storeFactory_ = std::make_unique<FIX::FileStoreFactory>(settings);
     }
 
+    std::unique_ptr<FIX::LogFactory> logFactory;
     if (log == "none") {
-      logFactory_ = std::make_unique<NullLogFactory>();
+      logFactory = std::make_unique<NullLogFactory>();
     } else if (log == "file") {
-      logFactory_ = std::make_unique<FIX::FileLogFactory>(settings);
+      logFactory = std::make_unique<FIX::FileLogFactory>(settings);
     } else {
-      logFactory_ = std::make_unique<FIX::ScreenLogFactory>(settings);
+      logFactory = std::make_unique<FIX::ScreenLogFactory>(settings);
     }
+    logFactory_ = std::make_unique<TrackingLogFactory>(std::move(logFactory));
 
-    acceptor_ = std::make_unique<FIX::SocketAcceptor>(
-        *bridge_, *storeFactory_, settings, *logFactory_);
+    RejectDuplicateSessions(settings, "acceptor");
+    try {
+      acceptor_ = std::make_unique<FIX::SocketAcceptor>(
+          *bridge_, *storeFactory_, settings, *logFactory_);
+    } catch (...) {
+      // A [SESSION] after the first valid one threw: QuickFIX has leaked the
+      // sessions it had already created (see DestroyOrphanedSessions) and the
+      // engine-level Log it requested before creating any of them (see
+      // TrackingLogFactory). Both would otherwise only have been reclaimed by
+      // the engine destructor that never runs.
+      DestroyOrphanedSessions(settings, "acceptor");
+      logFactory_->DestroyOrphanedEngineLog();
+      throw;
+    }
+    sessionIDs_ = acceptor_->getSessions();
+    SessionOpGate::Register(sessionIDs_, gate_);
   } NQ_CATCH(env)
 
   // Deterministic teardown on env shutdown, before the TSFN is finalized. See
@@ -104,18 +126,28 @@ AcceptorWrap::~AcceptorWrap() {
     cleanupHook_.Remove(env_);
   }
   Teardown(true);
+  DestroyEngine();
 }
 
 void AcceptorWrap::Teardown(bool force) {
   // Runs on the MAIN thread. Ordering (see InitiatorWrap::Teardown for detail):
   //   1. Deactivate the bridge so callbacks during stop() pass through without
   //      touching the TSFN or waiting on the frozen JS loop (breaks deadlock).
-  //   2. stop(force): joins the QuickFIX network threads.
-  //   3. Abort the TSFN: safe now that no producer thread remains.
-  if (stopped_) return;
+  //   2. Join the stop() worker if one is in flight, so the engine is never
+  //      destroyed under its FIX::Acceptor::stop() / gate freeze. Hence the
+  //      early return is keyed on tornDown_, not on stopped_.
+  //   3. stop(force): joins the QuickFIX network threads (a no-op if the
+  //      worker's stop() completed).
+  //   4. Abort the TSFN: safe now that no producer thread remains.
+  if (tornDown_) return;
+  tornDown_ = true;
   stopped_ = true;
   if (bridge_) {
     bridge_->Deactivate();
+  }
+  if (stopSync_) {
+    stopSync_->Wait();
+    stopSync_.reset();
   }
   if (acceptor_ && started_) {
     try {
@@ -126,6 +158,32 @@ void AcceptorWrap::Teardown(bool force) {
   if (bridge_) {
     bridge_->Abort();
   }
+}
+
+// Destroy the FIX engine (and with it every FIX::Session it owns) on the JS
+// thread, with no session operation in flight on a libuv thread. Called from
+// the destructor only; stop() uses DestroyStoppedEngine() below instead, as
+// its worker has already Freeze()d the gate on the worker thread (see Stop()).
+// The gate is per engine, so Freeze() here only waits for operations on THIS
+// engine's sessions, and Teardown() has already deactivated its bridge and
+// joined its network threads: none of those operations can be blocked on the
+// JS thread (or on a session mutex), so Freeze() cannot deadlock. Operations
+// on other engines -- which may well be blocked in a BlockingCall that needs
+// this very thread -- are not waited for.
+void AcceptorWrap::DestroyEngine() {
+  if (!acceptor_) return;
+  gate_->Freeze();
+  SessionOpGate::Unregister(sessionIDs_, gate_.get());
+  acceptor_.reset();
+  gate_->Unfreeze();
+}
+
+// The stop() path: the gate was frozen by the stop worker; destroy and lift
+// the freeze. JS thread only.
+void AcceptorWrap::DestroyStoppedEngine() {
+  SessionOpGate::Unregister(sessionIDs_, gate_.get());
+  acceptor_.reset();
+  gate_->Unfreeze();
 }
 
 Napi::Value AcceptorWrap::Start(const Napi::CallbackInfo& info) {
@@ -153,9 +211,10 @@ Napi::Value AcceptorWrap::Start(const Napi::CallbackInfo& info) {
   auto* worker = new EngineOpWorker(
       env, info.This().As<Napi::Object>(),
       [acceptor]() { acceptor->start(); },
-      [self](bool ok) {
+      [self](bool ok, const std::shared_ptr<EngineOpWorker::Settlement>& s) {
         self->busy_ = false;
         if (!ok) self->started_ = false;
+        s->Settle();
       });
   Napi::Promise promise = worker->Promise();
   worker->Queue();
@@ -169,6 +228,14 @@ Napi::Value AcceptorWrap::Stop(const Napi::CallbackInfo& info) {
     force = info[0].ToBoolean().Value();
   }
   auto deferred = Napi::Promise::Deferred::New(env);
+  // A stop() is in flight (its worker is running, or a graceful stop is
+  // waiting for its queued 'logout' events to be dispatched before destroying
+  // the engine): join it. Resolving right away here -- `stopped_` is already
+  // set -- would break the README's promise that the sessions are gone once
+  // stop() settles. The first call's `force` applies to both.
+  if (!stopPromise_.IsEmpty()) {
+    return stopPromise_.Value();
+  }
   if (stopped_) {
     deferred.Resolve(env.Undefined());
     return deferred.Promise();
@@ -179,7 +246,8 @@ Napi::Value AcceptorWrap::Stop(const Napi::CallbackInfo& info) {
             .Value());
     return deferred.Promise();
   }
-  if (!acceptor_ || !started_) {
+  if (!acceptor_) {
+    // Already torn down: just release the TSFN and resolve.
     stopped_ = true;
     if (bridge_) bridge_->Release();
     deferred.Resolve(env.Undefined());
@@ -187,36 +255,201 @@ Napi::Value AcceptorWrap::Stop(const Napi::CallbackInfo& info) {
   }
   busy_ = true;
   stopped_ = true;
+  // Lets Teardown() wait for the worker's operation instead of destroying the
+  // engine under it; cleared in onSettled once the operation has returned.
+  auto stopDone = std::make_shared<StopCompletion>();
+  stopSync_ = stopDone;
 
+  // A never-started engine takes the same async path (minus the stop() call):
+  // its FIX::Session objects are registered from construction, so a session
+  // operation may already be in flight against them and the destruction below
+  // must wait for it just the same.
   FIX::SocketAcceptor* acceptor = acceptor_.get();
   ApplicationBridge* bridge = bridge_.get();
+  const bool started = started_;
+  std::shared_ptr<SessionOpGate> gate = gate_;
   auto* self = this;
   auto* worker = new EngineOpWorker(
       env, info.This().As<Napi::Object>(),
-      [acceptor, force]() { acceptor->stop(force); },
-      [self, bridge, force](bool /*ok*/) {
+      // Runs on the worker thread. stop()'s onLogout/toAdmin callbacks fire on
+      // QuickFIX threads while the main loop is free to service the TSFN.
+      [acceptor, gate, started, force, stopDone]() {
+        // Signal completion on every exit of this lambda, success or throw,
+        // and only after the gate freeze below has returned as well.
+        struct SignalOnExit {
+          std::shared_ptr<StopCompletion> done;
+          ~SignalOnExit() { done->Signal(); }
+        } signalOnExit{stopDone};
+        try {
+          if (started) acceptor->stop(force);
+        } catch (...) {
+          gate->Freeze();
+          throw;
+        }
+        // stop() has joined the network threads. Now block new session
+        // operations (SendToTargetWorker) on THIS engine's
+        // sessions and wait for the in-flight ones to finish: they hold raw
+        // FIX::Session pointers that the destruction below is about to
+        // invalidate. Waiting HERE, on the worker thread, keeps the JS loop
+        // free for any BlockingCall such an operation is still making (e.g.
+        // sendToTarget() -> toApp). Other engines' operations are unaffected.
+        gate->Freeze();
+      },
+      [self, bridge, env, force, gate](
+          bool ok, const std::shared_ptr<EngineOpWorker::Settlement>& s) {
         self->busy_ = false;
-        if (bridge) {
-          if (force) {
-            bridge->Abort();
-          } else {
-            bridge->Release();
+        self->stopSync_.reset();  // the worker's operation has returned
+        // Settles the promise and lets a later stop() start over (the
+        // in-flight stop is finished, successfully or not).
+        auto settle = [self, s]() {
+          self->stopPromise_.Reset();
+          s->Settle();
+        };
+        if (!ok) {
+          // stop() threw part-way: the network threads may still be running,
+          // so the engine is NOT safe to destroy. Keep it, let session
+          // operations through again and clear stopped_ so that a later
+          // stop() -- or the destructor's Teardown() -- retries. Mirrors
+          // Start() clearing started_ on failure. The bridge is released (or
+          // aborted) as on success, so a failed stop() does not keep the
+          // event loop alive: the TSFN holds a loop reference until it is
+          // released, and a script that catches the rejection and falls off
+          // the end would otherwise never exit. From here on the engine's
+          // callbacks pass through without reaching JS; the retried stop()
+          // then destroys the engine as soon as its worker settles, since
+          // RunAfterQueued() refuses a released bridge.
+          self->stopped_ = false;
+          self->gate_->Unfreeze();
+          if (bridge) {
+            if (force) {
+              bridge->Abort();
+            } else {
+              bridge->Release();
+            }
           }
+          settle();
+          return;
+        }
+        // stop() has completed: the network threads are joined and session
+        // operations are frozen. Destroy the engine on the JS thread rather
+        // than at GC: QuickFIX only deletes its FIX::Session objects -- and
+        // removes them from the process-wide registry that lookupSession() /
+        // sendToTarget() read -- in the engine destructor. Deferring that to GC
+        // would leave stale Session handles resolvable and make a new engine
+        // with the same SessionIDs fail with ConfigError "Duplicate Session"
+        // until the old wrap happened to be collected. A stopped engine cannot
+        // be restarted anyway (start() rejects once stopped_ is set).
+        if (force || bridge == nullptr) {
+          // Force: abort the TSFN, discarding any callback still queued (a
+          // 'logout' listener may therefore never run), and destroy right away.
+          if (bridge) bridge->Abort();
+          self->DestroyStoppedEngine();
+          settle();
+          return;
+        }
+        // Graceful: the 'logout' events stop() fired are still queued in the
+        // bridge, and their listeners may read the session they name
+        // (getSession() / Session handles are documented to stay live until
+        // stop() settles). Nothing orders the TSFN's dispatch of those events
+        // before this AsyncWorker completion, so destroy the engine -- and
+        // settle the promise -- only once they have been dispatched: queue the
+        // destruction through the bridge's own FIFO behind them, then release
+        // the TSFN so it closes once drained. The owner reference held by the
+        // settlement keeps this wrap alive until then.
+        const bool queued =
+            bridge->RunAfterQueued(env, [self, s, settle, gate](Napi::Env e) {
+              if (e == nullptr) {
+                // Discarded: the environment is being torn down. The wrap's
+                // own teardown (cleanup hook, then destructor) destroys the
+                // engine; touch nothing but the settlement and the gate,
+                // which this closure owns (the gate by shared_ptr). In
+                // particular do not reach through `self`: what keeps the
+                // wrap alive until here is the TSFN's reference on the
+                // napi_env (the env -- and with it every ObjectWrap
+                // finalizer -- is deleted only after the TSFN has dropped
+                // its queue), a Node internal this code must not lean on.
+                // The promise reference needs no special care: the wrap
+                // destructor deletes it, and runs with the env valid.
+                //
+                // The freeze the stop worker took is still held: lift it,
+                // as DestroyStoppedEngine() would have. A SendToTargetWorker
+                // parked in OpScope since then is otherwise never woken, and
+                // the destructor's own DestroyEngine() -- which nests its
+                // freeze inside this one -- never brings the count to zero
+                // either; the libuv pool thread it sits on would be parked
+                // for good, and whoever drains the pool at exit (a Worker's
+                // terminate(), the process teardown) would hang on it. Once
+                // woken it runs against the engine, still intact at this
+                // point (the bridge is inactive, so a callback it makes
+                // passes through), or is refused by Acquire() if the engine
+                // has already been unregistered; the destructor's Freeze()
+                // waits for it either way.
+                s->Abandon();
+                gate->Unfreeze();
+                return;
+              }
+              self->DestroyStoppedEngine();
+              settle();
+            });
+        bridge->Release();
+        if (!queued) {
+          self->DestroyStoppedEngine();
+          settle();
         }
       });
   Napi::Promise promise = worker->Promise();
+  stopPromise_ = Napi::Persistent(static_cast<Napi::Object>(promise));
   worker->Queue();
   return promise;
 }
 
+// isLoggedOn(sessionID?): with no argument, true if ANY session of this engine
+// is logged on (FIX::Initiator/Acceptor::isLoggedOn); with a SessionID, true
+// only if THAT session belongs to this engine and is logged on. Always false
+// before start() and once stop() has settled; while a graceful stop() is in
+// progress it still reports the live state (the engine is only destroyed when
+// the stop() promise settles).
 Napi::Value AcceptorWrap::IsLoggedOn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  if (!acceptor_ || !started_ || stopped_) {
+  const bool hasId = info.Length() >= 1 && !info[0].IsUndefined();
+  // Validate the argument even when the engine is down, for a stable API.
+  SessionIDWrap* id =
+      hasId ? SessionIDWrap::UnwrapArg(env, info[0], "sessionID") : nullptr;
+  if (!acceptor_ || !started_) {
     return Napi::Boolean::New(env, false);
   }
   NQ_TRY(env) {
-    return Napi::Boolean::New(env, acceptor_->isLoggedOn());
+    if (id == nullptr) {
+      return Napi::Boolean::New(env, acceptor_->isLoggedOn());
+    }
+    FIX::Session* session = acceptor_->getSession(id->SessionID());
+    return Napi::Boolean::New(env,
+                              session != nullptr && session->isLoggedOn());
   } NQ_CATCH(env)
+}
+
+// getSessions(): SessionID[] -- the sessions this engine was configured with.
+Napi::Value AcceptorWrap::GetSessions(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Array out = Napi::Array::New(env, sessionIDs_.size());
+  uint32_t i = 0;
+  for (const FIX::SessionID& sid : sessionIDs_) {
+    out.Set(i++, SessionIDWrap::NewInstance(env, sid));
+  }
+  return out;
+}
+
+// getSession(sessionID): Session | undefined -- undefined if the id is not one
+// of this engine's sessions or stop() has settled (its sessions are destroyed
+// then, see Stop()). While stop() is still in progress the sessions are alive
+// and a handle is returned, e.g. for a 'logout' listener reading final seq nums.
+Napi::Value AcceptorWrap::GetSession(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  SessionIDWrap* id = SessionIDWrap::UnwrapArg(env, info[0], "sessionID");
+  if (!acceptor_ || !acceptor_->has(id->SessionID())) {
+    return env.Undefined();
+  }
+  return SessionWrap::NewInstance(env, id->SessionID(), gate_);
 }
 
 Napi::Value AcceptorWrap::Ref(const Napi::CallbackInfo& info) {

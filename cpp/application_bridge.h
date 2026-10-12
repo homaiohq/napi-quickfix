@@ -6,6 +6,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -41,6 +42,10 @@ class ApplicationBridge : public FIX::Application {
     kToApp,
     kFromAdmin,
     kFromApp,
+    // Not an Application callback: a closure queued by the JS thread through
+    // the same FIFO, so it runs after every event queued before it (see
+    // RunAfterQueued).
+    kBarrier,
   };
 
   // Result returned from the JS trampoline for synchronous calls.
@@ -75,6 +80,9 @@ class ApplicationBridge : public FIX::Application {
     bool hasMessage = false;
     // For synchronous calls only: shared reply channel (null for fire-and-forget).
     std::shared_ptr<SyncChannel> channel;
+    // kBarrier only. Invoked with a null Env if the item is dropped (TSFN
+    // aborted / environment teardown): then it must not touch JS.
+    std::function<void(Napi::Env)> barrier;
   };
 
   // The JS-thread trampoline. Runs on the Node event-loop thread. Declared
@@ -103,6 +111,15 @@ class ApplicationBridge : public FIX::Application {
   void Deactivate();
   void Ref(Napi::Env env);
   void Unref(Napi::Env env);
+
+  // Queue `fn` to run on the JS thread AFTER every callback already queued
+  // (the TSFN queue is FIFO), and keep the event loop alive until it has run.
+  // JS thread only; call it before Release()/Abort(). Returns false, without
+  // queuing anything, if the bridge is no longer accepting work -- the caller
+  // then runs `fn` itself. `fn` receives a null Env if the queue is discarded
+  // before it is reached (Abort() / environment teardown) and must then do
+  // nothing that touches JS.
+  bool RunAfterQueued(Napi::Env env, std::function<void(Napi::Env)> fn);
 
   // FIX::Application overrides.
   void onCreate(const FIX::SessionID&) override;
@@ -137,11 +154,21 @@ class ApplicationBridge : public FIX::Application {
   // Wake all in-flight synchronous callers (used by Deactivate/Abort so a
   // network thread blocked in CallSync doesn't wait forever when the main loop
   // is frozen inside a cleanup hook). Registers each SyncChannel while pending.
+  //
+  // Invariant: every path that sets inactive_ stores it BEFORE taking
+  // pendingMtx_ to run WakeAllPending(), and RegisterChannel() re-checks
+  // inactive_ UNDER pendingMtx_. So a registration that saw inactive_ unset is
+  // already in pending_ when the wake loop runs, and one that lost the race is
+  // refused; either way no caller can start waiting after the wake. The JS
+  // thread relies on this when it blocks on a network thread after
+  // Deactivate() (Teardown's stop() join, DestroyEngine's gate freeze).
   std::mutex pendingMtx_;
   std::unordered_map<std::uint64_t, std::shared_ptr<SyncChannel>> pending_;
   std::uint64_t nextChannelId_ = 0;
 
-  std::uint64_t RegisterChannel(const std::shared_ptr<SyncChannel>& ch);
+  // Returns false (nothing registered) if the bridge is already inactive.
+  bool RegisterChannel(const std::shared_ptr<SyncChannel>& ch,
+                       std::uint64_t& id);
   void UnregisterChannel(std::uint64_t id);
   void WakeAllPending();
 };
