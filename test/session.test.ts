@@ -166,6 +166,11 @@ describe('Session control over a loopback (in-process)', () => {
         assert.equal(iniSession.isLogonTime(new Date(Date.now() - 86_400_000)), true);
 
         // --- sequence numbers advance after a send -----------------------------------
+        // Advancement is asserted from what the initiator's toApp handler saw go
+        // out (sentSeqNums) and what the acceptor's fromApp received, not by
+        // re-reading the live counters after a network round trip: on a loaded
+        // CI runner a transport hiccup can re-logon the session (ResetOnLogon=Y)
+        // between the send and such a read, winding the counters back to 2.
         const senderBefore = iniSession.getExpectedSenderNum();
         const targetBefore = accSession.getExpectedTargetNum();
         assert.equal(
@@ -175,12 +180,12 @@ describe('Session control over a loopback (in-process)', () => {
         );
         assert.ok(senderBefore >= 2, 'the Logon itself consumed seq num 1');
 
+        assert.equal(sentSeqNums.length, 0, 'no application message sent yet');
         assert.equal(await sendToTarget(newOrder(), INI_ID), true);
         assert.ok(await waitUntil(() => received.length >= 1, DELIVERY_TIMEOUT_MS), 'order delivered');
+        assert.equal(sentSeqNums[0], String(senderBefore), 'toApp saw the order go out with the expected seq num');
         assert.equal(received[0].msgType, MsgType.NewOrderSingle);
         assert.equal(received[0].seqNum, String(senderBefore));
-        assert.equal(iniSession.getExpectedSenderNum(), senderBefore + 1);
-        assert.equal(accSession.getExpectedTargetNum(), targetBefore + 1);
 
         // --- sendToTarget(message, qualifier?) resolves the session from the header --
         const byHeader = newOrder()
@@ -189,7 +194,12 @@ describe('Session control over a loopback (in-process)', () => {
           .setField(FIELD.TargetCompID, 'SERVER');
         assert.equal(await sendToTarget(byHeader), true);
         assert.ok(await waitUntil(() => received.length >= 2, DELIVERY_TIMEOUT_MS), 'second order delivered');
-        assert.equal(received[1].seqNum, String(senderBefore + 1));
+        // The second order going out with, and being accepted at, senderBefore+1
+        // is what shows both counters advanced by one after the first send
+        // (QuickFIX only hands a message to fromApp when its MsgSeqNum is the
+        // one the target expects).
+        assert.equal(sentSeqNums[1], String(senderBefore + 1), 'the sender seq num advanced by one');
+        assert.equal(received[1].seqNum, String(senderBefore + 1), 'the target seq num advanced by one');
         // A message whose header names no session rejects with SessionNotFound.
         await assert.rejects(
           () => sendToTarget(newOrder().setField(FIELD.SenderCompID, 'NOPE').setField(FIELD.TargetCompID, 'NADA')),
@@ -236,8 +246,12 @@ describe('Session control over a loopback (in-process)', () => {
         assert.ok(await waitUntil(() => received.length > receivedBefore, DELIVERY_TIMEOUT_MS));
         assert.equal(sentSeqNums[sentBefore], '50', 'toApp saw MsgSeqNum 50 on the outbound order');
         assert.equal(received[receivedBefore].seqNum, '50', 'acceptor received MsgSeqNum 50');
-        assert.equal(iniSession.getExpectedSenderNum(), 51);
-        assert.equal(accSession.getExpectedTargetNum(), 51);
+        // Same reasoning as above: prove the advance to 51 by the next message
+        // on the wire rather than by re-reading the live counters.
+        assert.equal(await sendToTarget(newOrder(), INI_ID), true);
+        assert.ok(await waitUntil(() => received.length > receivedBefore + 1, DELIVERY_TIMEOUT_MS));
+        assert.equal(sentSeqNums[sentBefore + 1], '51', 'toApp saw MsgSeqNum 51 on the following order');
+        assert.equal(received[receivedBefore + 1].seqNum, '51', 'acceptor received MsgSeqNum 51');
 
         assert.throws(() => iniSession!.setNextSenderMsgSeqNum(-1), RangeError);
         assert.throws(() => iniSession!.setNextTargetMsgSeqNum(1.5), RangeError);
