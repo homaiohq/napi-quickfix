@@ -288,6 +288,7 @@ e.g. `448 PartyID`). Groups nest through the same `addGroup`/`getGroup` API.
 
 ```ts
 new Group(field: number, delim: number, order?: number[]); // order: full entry field order, delimiter first
+                                                          // delim and order tags are capped at 2^20 (RangeError beyond that)
 group.field;  group.delim;                                  // read-only
 
 group.setField(tag, value: string | number): this;  group.getField(tag): string;

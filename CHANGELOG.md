@@ -80,7 +80,11 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   (and a `Group` count tag / delimiter / order entry) must be a positive integer,
   a tag passed to a reader and a group index must be an integer. Anything else
   throws a `TypeError` instead of being silently truncated (`1.5` → `1`,
-  `NaN` → `0`) or emitted on the wire (`setField(0, 'x')` → `0=x`).
+  `NaN` → `0`) or emitted on the wire (`setField(0, 'x')` → `0=x`). A `Group`
+  delimiter or order entry above 2^20 throws a `RangeError`, since QuickFIX
+  allocates `largestTag + 1` ints per group order. `replaceGroup(0, …)` throws
+  `FieldNotFound` and `hasGroup(0, tag)` is `false`: QuickFIX has no lower
+  bound on group indices and would silently drop the update.
 
 ### Changed
 

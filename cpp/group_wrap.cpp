@@ -68,7 +68,8 @@ FIX::Group GroupWrap::MakeGroup(const Napi::CallbackInfo& info) {
         env, "new Group(field: number, delim: number, order?: number[])");
   }
   const int field = fieldmap::CoerceSetTag(env, info[0]);
-  const int delim = fieldmap::CoerceSetTag(env, info[1]);
+  const int delim =
+      fieldmap::CheckOrderTag(env, fieldmap::CoerceSetTag(env, info[1]));
 
   if (info.Length() < 3 || fieldmap::IsNullish(info[2])) {
     return FIX::Group(field, delim);
@@ -87,7 +88,7 @@ FIX::Group GroupWrap::MakeGroup(const Napi::CallbackInfo& info) {
       throw Napi::TypeError::New(
           env, "order must contain only positive integer field tags");
     }
-    order.push_back(tag);
+    order.push_back(fieldmap::CheckOrderTag(env, tag));
   }
   if (order.empty()) {
     return FIX::Group(field, delim);

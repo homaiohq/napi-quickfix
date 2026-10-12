@@ -50,6 +50,19 @@ describe('Group', () => {
     assert.equal(new Group(453, 448, []).setField(452, 1).setField(448, 'A').toString(), `448=A${SOH}452=1${SOH}`);
   });
 
+  test('constructor bounds the delimiter and order tags', () => {
+    // QuickFIX allocates `largestTag + 1` ints per group order: left unbounded,
+    // a huge tag would allocate gigabytes (or overflow at INT_MAX) and abort.
+    const max = 1 << 20;
+    assert.throws(() => new Group(453, 2147483647), RangeError, 'delimiter at INT_MAX');
+    assert.throws(() => new Group(453, max + 1), RangeError);
+    assert.throws(() => new Group(453, 448, [448, 1_000_000_000]), RangeError, 'order tag');
+    assert.throws(() => new Group(453, 448, [448, max + 1]), RangeError);
+    assert.equal(new Group(2147483647, 448).field, 2147483647, 'the count tag is not part of the order allocation');
+    assert.equal(new Group(max, max, [max, 1]).delim, max, 'the bound itself is accepted');
+    assert.equal(new Group(453, 448, [448, max]).setField(max, 'x').setField(448, 'A').toString(), `448=A${SOH}${max}=x${SOH}`);
+  });
+
   test('tag validation: sets need a positive integer, reads accept any integer', () => {
     const g = new Group(NoPartyIDs, PartyID);
     assert.throws(() => g.setField(0, 'x'), TypeError, 'tag 0 would emit "0=x" on the wire');
@@ -169,6 +182,8 @@ describe('Group', () => {
   test('nested groups: addGroup / groupCount / hasGroup / getGroup', () => {
     const g = party('A', 1);
     assert.equal(g.hasGroup(NoPartySubIDs), false);
+    assert.equal(g.hasGroup(0, NoPartySubIDs), false, 'no entry at index 0 even when the tag is empty');
+    assert.equal(g.hasGroup(1, NoPartySubIDs), false);
     assert.equal(g.groupCount(NoPartySubIDs), 0);
 
     g.addGroup(new Group(NoPartySubIDs, PartySubID).setField(PartySubID, 'desk-1').setField(PartySubIDType, 2));
@@ -177,6 +192,8 @@ describe('Group', () => {
     assert.equal(g.hasGroup(NoPartySubIDs), true);
     assert.equal(g.hasGroup(2, NoPartySubIDs), true);
     assert.equal(g.hasGroup(3, NoPartySubIDs), false);
+    assert.equal(g.hasGroup(0, NoPartySubIDs), false, 'indices are 1-based');
+    assert.equal(g.hasGroup(-1, NoPartySubIDs), false);
     assert.equal(g.groupCount(NoPartySubIDs), 2);
     assert.equal(g.getField(NoPartySubIDs), '2', 'the count field is maintained');
 
@@ -254,6 +271,18 @@ describe('Group', () => {
     assert.throws(() => g.getGroup(2, NoPartySubIDs), isFieldNotFound, 'index out of range');
     assert.throws(() => g.getGroup(0, NoPartySubIDs), isFieldNotFound, 'indices are 1-based');
     assert.throws(() => g.getGroup(-1, NoPartySubIDs), isFieldNotFound);
+    // QuickFIX's replaceGroup(0, ...) silently returns; it must not be a way to
+    // drop an update (a 0-based loop is the obvious typo).
+    assert.throws(
+      () => g.replaceGroup(0, new Group(NoPartySubIDs, PartySubID).setField(PartySubID, 'y')),
+      isFieldNotFound,
+      'index 0 is not a slot',
+    );
+    assert.throws(
+      () => g.replaceGroup(-1, new Group(NoPartySubIDs, PartySubID).setField(PartySubID, 'y')),
+      isFieldNotFound,
+    );
+    assert.equal(g.getGroup(1, NoPartySubIDs).getField(PartySubID), 'x', 'entry 1 untouched');
     assert.throws(
       () => g.replaceGroup(2, new Group(NoPartySubIDs, PartySubID).setField(PartySubID, 'y')),
       isFieldNotFound,

@@ -73,8 +73,26 @@ inline int CoerceSetTag(Napi::Env env, Napi::Value v) {
   return tag;
 }
 
-// Group index (1-based): an integer. Range errors are left to QuickFIX, which
-// throws FieldNotFound for an index that does not exist.
+// The largest tag accepted in a group's field order (delimiter included).
+// QuickFIX's message_order allocates and zero-fills `largestTag + 1` ints per
+// group, so an unbounded tag would mean a multi-GB allocation (or a signed
+// overflow at INT_MAX) inside the Group constructor, where a std::bad_alloc
+// is not translated and aborts the process. 2^20 keeps that at 4 MiB while
+// leaving every standard and user-defined tag range (< 100000) usable.
+constexpr int kMaxOrderTag = 1 << 20;
+
+// A delimiter or group-order tag: a positive integer bounded by kMaxOrderTag.
+inline int CheckOrderTag(Napi::Env env, int tag) {
+  if (tag > kMaxOrderTag) {
+    throw Napi::RangeError::New(
+        env, "group order field tags must be at most " +
+                 std::to_string(kMaxOrderTag));
+  }
+  return tag;
+}
+
+// Group index (1-based): an integer. Range errors are handled per operation
+// (FieldNotFound, false, or a no-op) since QuickFIX does not bound index 0.
 inline int CoerceIndex(Napi::Env env, Napi::Value v) {
   int index;
   if (!ToInteger(v, index)) {
@@ -223,9 +241,16 @@ Napi::Value GetGroup(const Napi::CallbackInfo& info, Select select) {
   } NQ_CATCH(env)
 }
 
+// Whether the index-th entry (1-based) exists. QuickFIX's hasGroup(num, tag)
+// is `groupCount(tag) >= num` with no lower bound, so it answers true for
+// index 0 even on an empty tag; 0 is the typo a 1-based API must catch.
+inline bool HasGroupAt(const FIX::FieldMap& map, int index, int tag) {
+  return index >= 1 && map.hasGroup(index, tag);
+}
+
 // replaceGroup(index, group): overwrites the index-th entry (1-based) under
-// group.field(). QuickFIX silently ignores a missing slot; we throw
-// FieldNotFound instead so a typo cannot silently drop an update.
+// group.field(). QuickFIX silently ignores a missing slot (including index 0);
+// we throw FieldNotFound instead so a typo cannot silently drop an update.
 template <class Select>
 Napi::Value ReplaceGroup(const Napi::CallbackInfo& info, Select select) {
   Napi::Env env = info.Env();
@@ -234,7 +259,7 @@ Napi::Value ReplaceGroup(const Napi::CallbackInfo& info, Select select) {
   NQ_TRY(env) {
     int tag = group->Group().field();
     FIX::FieldMap& map = select(tag);
-    if (!map.hasGroup(index, tag)) {
+    if (!HasGroupAt(map, index, tag)) {
       throw FIX::FieldNotFound(tag);
     }
     map.replaceGroup(index, tag, group->Group());
@@ -283,7 +308,8 @@ Napi::Value HasGroup(const Napi::CallbackInfo& info, Select select) {
   NQ_TRY(env) {
     const FIX::FieldMap& map = select(args.tag);
     return Napi::Boolean::New(
-        env, args.hasIndex ? map.hasGroup(args.index, args.tag) : map.hasGroup(args.tag));
+        env, args.hasIndex ? HasGroupAt(map, args.index, args.tag)
+                           : map.hasGroup(args.tag));
   } NQ_CATCH(env)
 }
 

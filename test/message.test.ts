@@ -236,6 +236,7 @@ describe('Message repeating groups', () => {
     assert.equal(msg.hasGroup(FIELD.NoPartyIDs), true);
     assert.equal(msg.hasGroup(2, FIELD.NoPartyIDs), true);
     assert.equal(msg.hasGroup(3, FIELD.NoPartyIDs), false);
+    assert.equal(msg.hasGroup(0, FIELD.NoPartyIDs), false, 'indices are 1-based');
     assert.equal(msg.getField(FIELD.NoPartyIDs), '2', 'count field is maintained');
 
     const raw = msg.toString();
@@ -298,6 +299,7 @@ describe('Message repeating groups', () => {
     msg.addGroup(party('A', 1));
     assert.throws(() => msg.getGroup(2, FIELD.NoPartyIDs), isFieldNotFound, 'index out of range');
     assert.throws(() => msg.replaceGroup(2, party('C', 1)), isFieldNotFound, 'replace out of range');
+    assert.throws(() => msg.replaceGroup(0, party('C', 1)), isFieldNotFound, 'index 0 is not a slot');
   });
 
   test('parse with a dictionary reads each group back, nested groups included', () => {
