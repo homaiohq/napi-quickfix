@@ -26,9 +26,10 @@ namespace {
 // deadlock (main blocked in sendToTarget -> toApp -> BlockingCall -> waits for
 // main to run CallJs, which it can't).
 //
-// The FIX::Message and FIX::SessionID are COPIED BY VALUE on the JS thread
-// before Queue()ing, so Execute() never touches any JS object. toApp may mutate
-// the worker's private copy during send — that's fine, it's QuickFIX's business.
+// The FIX::Message (a fieldmap::CloneMessage, nested group entries kept
+// typed) and FIX::SessionID are COPIED on the JS thread before Queue()ing, so
+// Execute() never touches any JS object. toApp may mutate the worker's private
+// copy during send — that's fine, it's QuickFIX's business.
 //
 // Two upstream overloads are supported: by explicit SessionID, or by qualifier
 // (QuickFIX then resolves the session from the message's own header fields:

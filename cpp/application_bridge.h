@@ -79,10 +79,11 @@ class ApplicationBridge : public FIX::Application {
   struct CallData {
     CallType type;
     FIX::SessionID sessionID;  // copied by value — safe across threads
-    // A deep copy of the message for message-bearing calls (FIX::Message's
-    // copy constructor copies every nested group). Copied, not serialized:
-    // the engine parsed it with the session's dictionary, and only the
-    // structured copy keeps its repeating groups for the JS handler.
+    // A deep copy of the message for message-bearing calls (a
+    // fieldmap::CloneMessage, which keeps every nested group entry typed).
+    // Copied, not serialized: the engine parsed it with the session's
+    // dictionary, and only the structured copy keeps its repeating groups for
+    // the JS handler, which takes the copy over.
     FIX::Message message;
     bool hasMessage = false;
     // For synchronous calls only: shared reply channel (null for fire-and-forget).
