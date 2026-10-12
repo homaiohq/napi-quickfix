@@ -283,7 +283,9 @@ still live: a graceful `stop()` settles only after the `'logout'` events it
 triggered have been delivered, so a `'logout'` listener can still read the
 session, and a `sendToTarget()` that has already reached its session completes
 before the sessions go away. One that has not reached it by then is refused
-with `SessionNotFound` rather than run against the engine that is gone.
+with `SessionNotFound` rather than run against the engine that is gone; a send
+is bound to the engine that owns the session when it is called, never to one
+created later with the same id.
 `stop(true)` discards the events still queued and destroys the sessions right
 away. A `stop()` called while another is still in flight (from that `'logout'`
 listener, say) returns the same Promise, so it too settles only once the

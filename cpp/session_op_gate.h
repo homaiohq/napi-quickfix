@@ -37,13 +37,19 @@ namespace napi_quickfix {
 //   * Each engine wrap owns a `std::shared_ptr<SessionOpGate>` and registers
 //     it for its SessionIDs (Register) right after constructing the FIX engine,
 //     on the JS thread; it unregisters (Unregister) right before destroying it.
-//   * A worker calls Acquire(id) on its libuv thread to find the gate of the
-//     engine owning `id` and hold an OpScope on it for its whole Execute()
-//     -- lookupSession AND the operation. Constructing the OpScope blocks while
-//     that engine is between Freeze() and Unfreeze(). No registered gate means
-//     no engine owns the session: the worker reports SessionNotFound without
-//     touching the registry QuickFIX keeps. So does a gate that is no longer
-//     the registered owner once the scope is held (see below).
+//   * The JS-thread entry point of a session operation (SendToTarget) looks
+//     the gate of the engine owning `id` up (Lookup) BEFORE queuing its
+//     worker, so the operation is bound to the engine that owned the session
+//     when it was called: engines register and unregister on the JS thread
+//     only, so that lookup is exact, and an engine registered later for the
+//     same id can never be the one the operation runs on. No registered gate
+//     means no engine owns the session: SessionNotFound, without touching the
+//     registry QuickFIX keeps. The worker then calls Acquire(gate, id) on its
+//     libuv thread to hold an OpScope on that gate for its whole Execute()
+//     -- lookupSession AND the operation. Constructing the OpScope blocks
+//     while that engine is between Freeze() and Unfreeze(); a gate that is no
+//     longer the registered owner once the scope is held is SessionNotFound
+//     too (see below).
 //   * The engine's stop worker calls Freeze() on its libuv thread AFTER the FIX
 //     engine's own stop() has returned: it blocks new operations on this
 //     engine's sessions and waits for the in-flight ones to drain. The wrap
@@ -57,9 +63,9 @@ namespace napi_quickfix {
 //     so no in-flight operation on THIS engine's sessions can be waiting on the
 //     (now blocked) JS thread. Operations on other engines are not involved.
 //
-// The gate outlives its engine: a worker that looked it up just before the
-// engine was unregistered holds it by shared_ptr and passes the (now lifted)
-// freeze. By then a NEW engine may own the same id -- its sessions are what
+// The gate outlives its engine: a worker whose gate was resolved just before
+// the engine was unregistered holds it by shared_ptr and passes the (now
+// lifted) freeze. By then a NEW engine may own the same id -- its sessions are what
 // lookupSession() would now return -- while the worker holds the OLD gate, on
 // which the new engine's stop() never waits. Acquire() closes that window by
 // re-reading the registry after the OpScope is held: the scope is kept only if
@@ -155,16 +161,16 @@ class SessionOpGate {
     return it == r.gates.end() ? nullptr : it->second;
   }
 
-  // Hold an OpScope on the gate of the engine currently owning `id`, or
-  // return nullptr if no engine does (-> SessionNotFound). Constructing the
-  // scope may block (the owner is stopping); once it is held the registry is
-  // re-read, and the scope is kept only if the same gate is still registered.
-  // Otherwise the owner was destroyed while we waited -- possibly replaced by
-  // a new engine with the same id -- and the operation is refused (nullptr)
-  // rather than run against the new owner, mirroring SessionWrap::Resolve().
-  static std::unique_ptr<OpScope> Acquire(const FIX::SessionID& id) {
-    std::shared_ptr<SessionOpGate> gate = Lookup(id);
-    if (!gate) return nullptr;
+  // Hold an OpScope on `gate` -- the registered owner of `id` when the
+  // caller looked it up on the JS thread -- or return nullptr if it no longer
+  // is (-> SessionNotFound). Constructing the scope may block (the owner is
+  // stopping); once it is held the registry is re-read, and the scope is kept
+  // only if the same gate is still registered. Otherwise the owner was
+  // destroyed while we waited -- possibly replaced by a new engine with the
+  // same id -- and the operation is refused (nullptr) rather than run against
+  // the new owner, mirroring SessionWrap::Resolve().
+  static std::unique_ptr<OpScope> Acquire(
+      const std::shared_ptr<SessionOpGate>& gate, const FIX::SessionID& id) {
     auto scope = std::make_unique<OpScope>(gate);
     if (Lookup(id) != gate) return nullptr;
     return scope;

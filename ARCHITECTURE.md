@@ -230,16 +230,19 @@ on a failed construction they destroy it next to the orphaned sessions.
 That eager destruction races with the worker-thread operations above, which hold a raw `FIX::Session*` between
 `lookupSession` and the end of the operation. `session_op_gate.h` closes the race with a **per-engine** gate.
 Each wrap owns a `shared_ptr<SessionOpGate>` and registers it for its `SessionID`s at construction (the duplicate
-check above is what keeps the registry one-to-one). `SendToTargetWorker` calls `SessionOpGate::Acquire(id)` on
-the worker thread (deriving the id from the message header first, for the qualifier form of `sendToTarget`) and
-holds the returned `OpScope` for its whole `Execute()`; no registered gate
-means no engine owns the session, reported as `SessionNotFound`. `Acquire` re-reads the registry *after* the scope
-is held and keeps it only if the same gate is still the owner: constructing the scope may have blocked across the
-owner's destruction, and a new engine may own the id by then — holding the old gate would let the new engine's
-`stop()` destroy the session mid-operation. In that case the operation is refused (`SessionNotFound`), not retried
-against the new owner: it was queued for the engine that is gone, and sending it through the new engine's session
-(not logged on, so persisted in its store and sent on its first logon) would be the cross-over `SessionWrap::Resolve()`
-refuses for `Session` handles. The engine's stop worker — on its **own** libuv thread, after `stop()`
+check above is what keeps the registry one-to-one). `sendToTarget()` resolves the gate of the engine owning the
+id on the **JS thread**, before it queues its `SendToTargetWorker` (deriving the id from the message header first,
+for the qualifier form); engines register and unregister on that thread only, so the lookup is exact and the send
+is bound to the engine that owned the session when it was called — an engine registered later for the same id can
+never be the one it runs on, however long the worker sat in the libuv queue. No registered gate means no engine
+owns the session, refused as `SessionNotFound` without queuing anything. The worker then calls
+`SessionOpGate::Acquire(gate, id)` on its thread and holds the returned `OpScope` for its whole `Execute()`.
+`Acquire` re-reads the registry *after* the scope is held and keeps it only if the same gate is still the owner:
+constructing the scope may have blocked across the owner's destruction, and a new engine may own the id by then —
+holding the old gate would let the new engine's `stop()` destroy the session mid-operation. In that case the
+operation is refused (`SessionNotFound`), not retried against the new owner: it was queued for the engine that is
+gone, and sending it through the new engine's session (not logged on, so persisted in its store and sent on its
+first logon) would be the cross-over `SessionWrap::Resolve()` refuses for `Session` handles. The engine's stop worker — on its **own** libuv thread, after `stop()`
 has joined the network threads — calls `Freeze()` on *its* gate, which blocks new operations on *its* sessions and
 waits for the in-flight ones to drain. Waiting on the worker thread rather than on the JS thread matters: an
 in-flight `sendToTarget()` may be blocked in a `toApp` `BlockingCall`, which needs the JS loop free. A never-started

@@ -36,45 +36,35 @@ namespace {
 // Session::sendToTarget looks the session up in the process-wide registry and
 // uses the raw pointer, so Execute() runs under the owning engine's
 // SessionOpGate::OpScope to keep that engine alive until the send has returned.
-// For the qualifier form the SessionID is derived from the message header
-// first (exactly as the upstream overload does) so the right gate can be found.
+// That gate is resolved by SendToTarget() on the JS thread, before the worker
+// is queued (for the qualifier form after deriving the SessionID from the
+// message header, exactly as the upstream overload does): the send is thereby
+// bound to the engine that owned the session when it was called, and can
+// never run through an engine registered for the same id afterwards -- not
+// even if it sat in the libuv queue across the owner's stop() and that
+// engine's construction. Execute() only re-checks that the gate is still the
+// owner once the scope is held (see session_op_gate.h).
 class SendToTargetWorker : public Napi::AsyncWorker {
  public:
-  SendToTargetWorker(Napi::Env env, FIX::Message message, FIX::SessionID id)
+  SendToTargetWorker(Napi::Env env, FIX::Message message, FIX::SessionID id,
+                     std::shared_ptr<SessionOpGate> gate)
       : Napi::AsyncWorker(env),
         deferred_(Napi::Promise::Deferred::New(env)),
         message_(std::move(message)),
-        byId_(true),
-        id_(std::move(id)) {}
-
-  SendToTargetWorker(Napi::Env env, FIX::Message message, std::string qualifier)
-      : Napi::AsyncWorker(env),
-        deferred_(Napi::Promise::Deferred::New(env)),
-        message_(std::move(message)),
-        byId_(false),
-        qualifier_(std::move(qualifier)) {}
+        id_(std::move(id)),
+        gate_(std::move(gate)) {}
 
   Napi::Promise Promise() { return deferred_.Promise(); }
 
   // Worker thread. NO Napi/JS access.
   void Execute() override {
     try {
-      FIX::SessionID id = id_;
-      if (!byId_) {
-        // Mirrors FIX::Session::sendToTarget(Message&, const std::string&):
-        // a header missing tag 8/49/56 is a SessionNotFound.
-        try {
-          id = message_.getSessionID(qualifier_);
-        } catch (const FIX::FieldNotFound&) {
-          throw FIX::SessionNotFound();
-        }
-      }
       std::unique_ptr<SessionOpGate::OpScope> inflight =
-          SessionOpGate::Acquire(id);
+          SessionOpGate::Acquire(gate_, id_);
       if (!inflight) {
-        throw FIX::SessionNotFound(id.toString());
+        throw FIX::SessionNotFound(id_.toString());
       }
-      result_ = FIX::Session::sendToTarget(message_, id);
+      result_ = FIX::Session::sendToTarget(message_, id_);
     } catch (const std::exception& e) {
       err_.Capture(e);
     } catch (...) {
@@ -102,9 +92,8 @@ class SendToTargetWorker : public Napi::AsyncWorker {
  private:
   Napi::Promise::Deferred deferred_;
   FIX::Message message_;
-  bool byId_;
   FIX::SessionID id_;
-  std::string qualifier_;
+  std::shared_ptr<SessionOpGate> gate_;
   bool result_ = false;
   CapturedError err_;
 };
@@ -117,16 +106,45 @@ Napi::Value SendToTarget(const Napi::CallbackInfo& info) {
 
   // Copy the message (and session id) by value on the JS thread so the worker
   // never touches JS-owned objects.
-  SendToTargetWorker* worker = nullptr;
-  if (info.Length() < 2 || info[1].IsUndefined()) {
-    worker = new SendToTargetWorker(env, msg->Message(), std::string());
-  } else if (info[1].IsString()) {
-    worker = new SendToTargetWorker(env, msg->Message(),
-                                    info[1].As<Napi::String>().Utf8Value());
-  } else {
-    SessionIDWrap* id = SessionIDWrap::UnwrapArg(env, info[1], "sessionID");
-    worker = new SendToTargetWorker(env, msg->Message(), id->SessionID());
+  FIX::Message message = msg->Message();
+  const bool byQualifier = info.Length() < 2 || info[1].IsUndefined() ||
+                           info[1].IsString();
+  FIX::SessionID id;
+  if (!byQualifier) {
+    id = SessionIDWrap::UnwrapArg(env, info[1], "sessionID")->SessionID();
   }
+
+  // Resolve the owning engine HERE, on the JS thread (see the worker's
+  // comment): a session that no engine owns is refused right away, with the
+  // same error the worker reports when the engine goes away under it.
+  std::shared_ptr<SessionOpGate> gate;
+  try {
+    if (byQualifier) {
+      // Mirrors FIX::Session::sendToTarget(Message&, const std::string&):
+      // a header missing tag 8/49/56 is a SessionNotFound.
+      const std::string qualifier =
+          info[1].IsString() ? info[1].As<Napi::String>().Utf8Value()
+                             : std::string();
+      try {
+        id = message.getSessionID(qualifier);
+      } catch (const FIX::FieldNotFound&) {
+        throw FIX::SessionNotFound();
+      }
+    }
+    gate = SessionOpGate::Lookup(id);
+    if (!gate) {
+      throw FIX::SessionNotFound(id.toString());
+    }
+  } catch (const FIX::Exception& e) {
+    CapturedError err;
+    err.Capture(e);
+    auto deferred = Napi::Promise::Deferred::New(env);
+    deferred.Reject(err.ToError(env).Value());
+    return deferred.Promise();
+  }
+
+  auto* worker = new SendToTargetWorker(env, std::move(message), std::move(id),
+                                        std::move(gate));
   Napi::Promise promise = worker->Promise();
   worker->Queue();
   return promise;

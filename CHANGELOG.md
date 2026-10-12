@@ -93,7 +93,9 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   stopped again) rather than destroyed with its network thread possibly still running.
   A `sendToTarget()` that has already reached its session when `stop()` is called
   completes before the sessions are destroyed; one that has not reached it by then is
-  refused with `SessionNotFound` rather than run against the engine that is gone.
+  refused with `SessionNotFound` rather than run against the engine that is gone. A
+  send is bound to the engine that owns the session when it is called, so it never
+  runs through a new engine created with the same `SessionID` afterwards.
   `engine.getSession()` / `engine.isLoggedOn(id)` keep
   answering until `stop()` settles (e.g. from a `'logout'` listener fired by a graceful
   stop). A `stop()` called while one is in flight returns that stop's Promise, so it

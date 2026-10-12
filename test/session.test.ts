@@ -629,6 +629,13 @@ StartDay=Monday
     assert.ok(doesSessionExist(ACC_ID), 'constructing an engine registers its sessions');
     const stale = first.getSession(ACC_ID)!;
     const staleLookup = lookupSession(ACC_ID)!;
+    // A send queued against `first` and not awaited: it is bound to `first`
+    // at the call, so whatever the libuv pool does with it, it must never run
+    // through the session of the engine constructed below for the same id.
+    const staleSend = sendToTarget(newOrder(), ACC_ID).then(
+      () => 'resolved',
+      (e) => (isSessionNotFound(e), 'rejected'),
+    );
     await first.stop(); // never started
     assert.equal(doesSessionExist(ACC_ID), false, 'stop() unregisters them, even if never started');
     assert.throws(() => stale.isEnabled(), isSessionNotFound);
@@ -639,6 +646,10 @@ StartDay=Monday
     const fresh = second.getSession(ACC_ID);
     assert.ok(fresh);
     assert.equal(fresh.isAcceptor(), true);
+    assert.ok(['resolved', 'rejected'].includes(await staleSend));
+    // A send delivered through `second`'s (not logged on) session would have
+    // been persisted in its store and bumped its sender seq num.
+    assert.equal(fresh.getExpectedSenderNum(), 1, "the send queued for `first` did not reach `second`");
     // A handle is bound to the engine it came from, not just to the id: the
     // registry QuickFIX keeps is keyed by SessionID alone, so without that
     // binding `first`'s handles would now silently operate on `second`'s session.
