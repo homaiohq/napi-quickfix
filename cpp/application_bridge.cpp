@@ -227,6 +227,12 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
   // FIX::Group with the session dictionary, and a plain copy would slice
   // their delimiter away.
   fieldmap::CloneMessage(data->message, message);
+  if (type == CallType::kToAdmin || type == CallType::kToApp) {
+    // An outbound message gets BodyLength (9) and CheckSum (10) only when
+    // Session::sendRaw serializes it, after toAdmin/toApp: serialize the
+    // clone so the handler sees them too. The engine recomputes both anyway.
+    data->message.toString();
+  }
   data->sessionDictionary = SessionDictionary(id);
   data->hasMessage = true;
   data->channel = channel;  // shared: trampoline gets its own owning copy

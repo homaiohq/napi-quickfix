@@ -135,10 +135,28 @@ TargetCompID=SERVER
         },
       });
 
+      // The initiator's toAdmin/toApp record the outbound framing fields, which
+      // QuickFIX only sets when it serializes the message after these handlers.
+      const framing: { msgType: string; bodyLength: string; checkSum: string; raw: string }[] = [];
+      const frame = (msg: Message) => ({
+        msgType: msg.getMsgType(),
+        bodyLength: msg.getHeaderField(FIELD.BodyLength),
+        checkSum: msg.getTrailerField(FIELD.CheckSum),
+        raw: msg.toString(),
+      });
+
       const ini = new Initiator({
         settings: SessionSettings.fromString(initiatorCfg),
         store: 'memory',
         log: 'none',
+        handlers: {
+          toAdmin(msg) {
+            framing.push(frame(msg));
+          },
+          toApp(msg) {
+            framing.push(frame(msg));
+          },
+        },
       });
 
       // Also observe the acceptor's 'fromApp' EVENT independently of the handler.
@@ -198,6 +216,17 @@ TargetCompID=SERVER
           eventMsgTypes.includes(MsgType.NewOrderSingle),
           "acceptor 'fromApp' event should also have fired with 35=D",
         );
+
+        // toAdmin (the Logon) and toApp (the orders) saw BodyLength and
+        // CheckSum, consistent with the message they were handed.
+        assert.ok(framing.some((f) => f.msgType === MsgType.Logon), 'toAdmin should have seen the Logon');
+        assert.ok(framing.some((f) => f.msgType === MsgType.NewOrderSingle), 'toApp should have seen the order');
+        for (const f of framing) {
+          const start = f.raw.indexOf('\x0135=') + 1;
+          const end = f.raw.lastIndexOf('\x0110=') + 1;
+          assert.equal(Number(f.bodyLength), end - start, `BodyLength of ${f.raw.replace(/\x01/g, '|')}`);
+          assert.ok(f.raw.endsWith(`\x0110=${f.checkSum}\x01`), `CheckSum of ${f.raw.replace(/\x01/g, '|')}`);
+        }
 
         // --- SendingTime clock parity across libc -------------------------------
         //
