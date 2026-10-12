@@ -209,8 +209,13 @@ Napi::Value SessionWrap::TimeCheck(const Napi::CallbackInfo& info,
                          : "isSessionTime(nowMs?: number)");
     }
     nowMs = info[0].As<Napi::Number>().DoubleValue();
-    if (!std::isfinite(nowMs)) {
-      throw Napi::TypeError::New(env, "nowMs must be a finite number");
+    // Bound to the range a JS Date can hold (+/- 100M days around the epoch)
+    // before the floating-to-integer cast below: converting a finite double
+    // that does not fit in time_t is undefined behaviour, not a saturation.
+    constexpr double kMaxDateMs = 8.64e15;
+    if (!std::isfinite(nowMs) || std::fabs(nowMs) > kMaxDateMs) {
+      throw Napi::RangeError::New(
+          env, "nowMs must be an epoch-millisecond number in the Date range");
     }
   }
   NQ_TRY(env) {

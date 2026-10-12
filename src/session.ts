@@ -109,7 +109,8 @@ export class Session {
 
   /**
    * Whether `now` (default: the current time) falls inside the session's
-   * configured `StartTime`/`EndTime` window.
+   * configured `StartTime`/`EndTime` window. Throws `RangeError` for an
+   * invalid `Date`.
    */
   isSessionTime(now?: Date): boolean {
     return this.#native.isSessionTime(now?.getTime());
@@ -117,7 +118,8 @@ export class Session {
 
   /**
    * Whether `now` (default: the current time) falls inside the session's
-   * configured `LogonTime`/`LogoutTime` window.
+   * configured `LogonTime`/`LogoutTime` window. Throws `RangeError` for an
+   * invalid `Date`.
    */
   isLogonTime(now?: Date): boolean {
     return this.#native.isLogonTime(now?.getTime());

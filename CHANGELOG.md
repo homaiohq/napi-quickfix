@@ -106,7 +106,10 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 - `Session` int option setters (`setLogonTimeout`, `setLogoutTimeout`, `setMaxLatency`)
   throw `RangeError` for a non-integer or a value outside the int32 range, consistent
   with `setNextSenderMsgSeqNum` / `setTimestampPrecision` (previously `TypeError` for a
-  non-integer and undefined behaviour for an out-of-range value).
+  non-integer and undefined behaviour for an out-of-range value). `isSessionTime(now)` /
+  `isLogonTime(now)` likewise throw `RangeError` for an invalid `Date` or a time outside
+  the `Date` range, instead of `TypeError` for the former and undefined behaviour for
+  the latter.
 
 ### Fixed
 

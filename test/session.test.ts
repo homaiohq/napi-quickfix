@@ -164,6 +164,14 @@ describe('Session control over a loopback (in-process)', () => {
         assert.equal(iniSession.isSessionTime(new Date()), true);
         assert.equal(iniSession.isLogonTime(), true);
         assert.equal(iniSession.isLogonTime(new Date(Date.now() - 86_400_000)), true);
+        // An invalid Date, or a finite value no Date can hold (the native layer
+        // casts to time_t, which must not see one), is a RangeError, not a
+        // garbage timestamp.
+        assert.throws(() => iniSession!.isSessionTime(new Date(NaN)), RangeError);
+        assert.throws(() => iniSession!.isLogonTime(new Date(NaN)), RangeError);
+        const beyondDateRange = { getTime: () => 1e300 } as unknown as Date;
+        assert.throws(() => iniSession!.isSessionTime(beyondDateRange), RangeError);
+        assert.throws(() => iniSession!.isLogonTime(beyondDateRange), RangeError);
 
         // --- sequence numbers advance after a send -----------------------------------
         // Advancement is asserted from what the initiator's toApp handler saw go
