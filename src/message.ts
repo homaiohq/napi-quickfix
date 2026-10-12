@@ -216,6 +216,9 @@ export class Message {
    * is stored and the count field is updated. Header groups (e.g. `NoHops`)
    * auto-route to the header. Returns `this` for chaining.
    *
+   * @throws `TypeError` when `group.delim` differs from the delimiter of the
+   *   entries already stored under `group.field`.
+   *
    * @example
    * ```ts
    * order.addGroup(new Group(FIELD.NoPartyIDs, FIELD.PartyID).setField(FIELD.PartyID, 'X'));

@@ -226,6 +226,17 @@ describe('Group', () => {
     assert.equal(g.getGroup(2, NoPartySubIDs).toString(), `523=desk-2${SOH}803=2${SOH}`);
   });
 
+  test('addGroup / replaceGroup reject a nested entry with another delimiter', () => {
+    const g = party('A', 1).addGroup(new Group(NoPartySubIDs, PartySubID).setField(PartySubID, 'x'));
+    const other = new Group(NoPartySubIDs, PartySubIDType).setField(PartySubIDType, 2);
+    assert.throws(() => g.addGroup(other), TypeError);
+    assert.throws(() => g.replaceGroup(1, other), TypeError);
+    assert.equal(g.groupCount(NoPartySubIDs), 1, 'nothing added');
+    assert.equal(g.getGroup(1, NoPartySubIDs).getField(PartySubID), 'x', 'entry untouched');
+    g.addGroup(new Group(NoPartySubIDs, PartySubID).setField(PartySubID, 'y'));
+    assert.equal(g.groupCount(NoPartySubIDs), 2, 'same delimiter is accepted');
+  });
+
   test('replaceGroup with the group itself replaces the entry with a copy taken beforehand', () => {
     // g holds a copy of itself; replacing that entry with g copies g first,
     // so the copy is never read while it is being overwritten.

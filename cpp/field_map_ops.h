@@ -273,18 +273,50 @@ Napi::Value GetFieldIfSet(const Napi::CallbackInfo& info, Select select) {
 
 // --- repeating-group ops (tag-routed) ---------------------------------------
 
+// The delimiter of the first typed entry stored under `tag`, 0 when there is
+// none: no entry, or only plain FieldMap entries, whose delimiter is unknown
+// (see DelimOf).
+inline int StoredDelim(const FIX::FieldMap& map, int tag) {
+  for (auto groups = map.g_begin(); groups != map.g_end(); ++groups) {
+    if (groups->first != tag) {
+      continue;
+    }
+    for (const FIX::FieldMap* entry : groups->second) {
+      if (const auto* typed = dynamic_cast<const FIX::Group*>(entry)) {
+        return typed->delim();
+      }
+    }
+    break;
+  }
+  return 0;
+}
+
 // addGroup(group: Group): appends a COPY of `group` under its own count tag and
 // bumps the count field. The copy is typed down to the last nested entry (see
 // Clone); the map takes ownership of the pointer.
+// As in ReplaceGroup, an entry whose delimiter differs from the typed entries
+// already stored under the tag is rejected: it would serialize as part of the
+// previous entry, leaving the count field wrong.
 template <class Select>
 Napi::Value AddGroup(const Napi::CallbackInfo& info, Select select) {
   Napi::Env env = info.Env();
   GroupWrap* group = GroupWrap::UnwrapArg(env, info[0], "group");
+  const int delim = group->Group().delim();
+  int storedDelim = 0;
   NQ_TRY(env) {
     int tag = group->Group().field();
-    select(tag).addGroupPtr(tag, CloneEntry(tag, group->Group()), true);
+    FIX::FieldMap& map = select(tag);
+    storedDelim = StoredDelim(map, tag);
+    if (storedDelim == 0 || storedDelim == delim) {
+      map.addGroupPtr(tag, CloneEntry(tag, group->Group()), true);
+      return env.Undefined();
+    }
   } NQ_CATCH(env)
-  return env.Undefined();
+  // Thrown outside NQ_TRY so it stays a TypeError.
+  throw Napi::TypeError::New(
+      env, "group delimiter " + std::to_string(delim) +
+               " does not match the stored entries' delimiter " +
+               std::to_string(storedDelim));
 }
 
 // getGroup(index, tag): Group — a snapshot copy of the index-th entry

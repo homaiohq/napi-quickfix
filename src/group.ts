@@ -143,6 +143,8 @@ export class Group {
   /**
    * Append a nested group entry under its own count tag (a copy is stored; the
    * count field is updated). Returns `this` for chaining.
+   * @throws `TypeError` when `group.delim` differs from the delimiter of the
+   *   entries already stored under `group.field`.
    */
   addGroup(group: Group): this {
     this.#native.addGroup(group.nativeHandle);

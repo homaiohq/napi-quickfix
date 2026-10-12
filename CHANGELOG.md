@@ -86,10 +86,12 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   missing entry, index 0 included, and `hasGroup(0, tag)` is `false`: QuickFIX
   has no lower bound on group indices and would silently drop the call.
   `replaceGroup` throws a `TypeError` when the replacement's delimiter differs
-  from the stored entry's; an entry QuickFIX copied as a plain field map (a
-  message it queued out of order) has no known delimiter and takes any
-  replacement. `g.replaceGroup(1, g)` replaces the entry with a copy of `g`
-  taken before the entry is touched.
+  from the stored entry's, and `addGroup` when the new entry's delimiter differs
+  from the stored entries' (it would serialize as part of the previous entry,
+  leaving the count wrong); an entry QuickFIX copied as a plain field map (a
+  message it queued out of order) has no known delimiter and takes any entry.
+  `g.replaceGroup(1, g)` replaces the entry with a copy of `g` taken before the
+  entry is touched.
 
 ### Changed
 

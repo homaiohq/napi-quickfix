@@ -233,7 +233,7 @@ message.isEmpty(): boolean;  message.totalFields(): number;  message.clear(): th
 
 // Tags must be integers (positive for setters) and group indices integers: anything else throws a TypeError.
 // Repeating groups (indices are 1-based, as in QuickFIX)
-message.addGroup(group: Group): this;               // appends a copy, maintains the count field
+message.addGroup(group: Group): this;               // appends a copy, maintains the count field; TypeError if group.delim differs from the stored entries'
 message.getGroup(index: number, tag: number): Group; // snapshot copy; throws FieldNotFound if absent
 message.replaceGroup(index: number, group: Group): this; // throws FieldNotFound if absent, TypeError if group.delim differs
 message.removeGroup(tag: number): this;  message.removeGroup(index: number, tag: number): this; // (index, tag) throws FieldNotFound if absent

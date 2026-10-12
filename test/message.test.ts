@@ -324,6 +324,20 @@ describe('Message repeating groups', () => {
     assert.equal(msg.getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID), 'B', 'same delimiter is accepted');
   });
 
+  test('addGroup rejects an entry with another delimiter', () => {
+    // A 447-delimited entry after a 448-delimited one would serialize as part
+    // of the first entry (453=2|448=A|447=D|), so the count would be wrong.
+    const msg = newOrderSingle().addGroup(party('A', 1));
+    const other = new Group(FIELD.NoPartyIDs, FIELD.PartyIDSource).setField(FIELD.PartyIDSource, 'D');
+    assert.throws(() => msg.addGroup(other), TypeError);
+    assert.equal(msg.groupCount(FIELD.NoPartyIDs), 1, 'nothing added');
+    msg.addGroup(party('B', 2));
+    assert.equal(msg.groupCount(FIELD.NoPartyIDs), 2, 'same delimiter is accepted');
+    // Another count tag is another group, whatever its delimiter.
+    msg.addGroup(new Group(FIELD.NoAllocs, FIELD.AllocAccount).setField(FIELD.AllocAccount, 'X'));
+    assert.equal(msg.groupCount(FIELD.NoAllocs), 1);
+  });
+
   test('parse with a dictionary reads each group back, nested groups included', () => {
     const dd = loadFix44Mini();
     const source = newOrderSingle()
