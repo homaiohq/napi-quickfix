@@ -184,7 +184,7 @@ wait on a thread that is waiting on the main thread — deadlock. Every exposed 
 | Members | Thread | Why |
 | --- | --- | --- |
 | `isLoggedOn` · `isEnabled` · `sentLogon` · `sentLogout` · `receivedLogon` · `isInitiator` · `isAcceptor` · `isSessionTime` · `isLogonTime` · option getters/setters | sync, main | Read/write plain members of `FIX::Session`; no lock, no callback. |
-| `getExpectedSenderNum` · `getExpectedTargetNum` · `setNextSenderMsgSeqNum` · `setNextTargetMsgSeqNum` | sync, main | Touch the `MessageStore` under `SessionState`'s own mutex, which QuickFIX never holds across a callback. May throw `IOException` (mapped to `QuickFixError`). |
+| `getExpectedSenderNum` · `getExpectedTargetNum` · `setNextSenderMsgSeqNum` · `setNextTargetMsgSeqNum` | sync, main | Touch the `MessageStore` under `SessionState`'s own mutex, which QuickFIX never holds across a callback. May throw `IOException` (mapped to `QuickFixError`). Not serialised against the engine, though: `Session::sendRaw` holds `m_mutex` across `fill()` (reads the next sender num into the header), `toApp`/`toAdmin` and `persist()` (`incrNextSenderMsgSeqNum`), and `Session::next()` across the target-num check, `fromApp`/`fromAdmin` and `incrNextTargetMsgSeqNum`; a setter landing inside that window is overwritten by the increment and the session ends up one off from the peer. The setters are for a quiescent session (before `start()`, from a `'logout'` event, never from a handler); `m_mutex` is private and could not be taken from the JS thread anyway. |
 | `logon` · `logout` · `refresh` | sync, main | Only touch `SessionState` (`enabled`/`logoutReason`, and the store for `refresh`); no `m_mutex`, no callback, so no deadlock. `logoutReason` and the store are under `SessionState`'s own mutex; `enabled` is a plain `bool` written with **no lock** while the network thread reads it in `Session::next()` — formally a data race (TSan reports it), the same one `Initiator::stop()` makes from the stopping thread, benign in practice (the flag is picked up on the next pass). Running them inline also keeps them **ordered**: as AsyncWorkers, `logout(); logon();` could land on two pool threads in either order. |
 
 `FIX::Session::disconnect()` and `reset()` (which calls it) are **not exposed**, and not only because they take
@@ -199,8 +199,15 @@ what `Initiator::stop()` itself does — and to renumber it, the sequence-number
 
 **Lifetime.** `FIX::Session` objects are owned by the engine and `FIX::Session::lookupSession` returns a raw,
 non-owning pointer, so `SessionWrap` never caches it: it stores the `FIX::SessionID` by value and re-resolves on
-**every** call (on the worker thread for async ops), throwing/rejecting `QuickFixError{fixErrorName:
-'SessionNotFound'}` when the session is gone. QuickFIX only deletes sessions — and removes them from the registry
+**every** call, throwing `QuickFixError{fixErrorName: 'SessionNotFound'}` when the session is gone. The registry
+`lookupSession` reads is keyed by `SessionID` alone, and a stopped engine's ids may be taken by a new engine (below),
+so re-resolving the id is not enough: a handle also holds the `shared_ptr<SessionOpGate>` of the engine that owned
+the session when it was created (`NewInstance`; `engine.getSession` passes its own gate, `lookupSession` the
+registered one) and `Resolve()` requires `SessionOpGate::Lookup(id)` to still return that gate before it calls
+`lookupSession`. Engines are created and destroyed on the JS thread, as is `Resolve()`, so the check cannot race;
+the gate stays registered until the engine is destroyed, so a `'logout'` listener fired by a graceful `stop()`
+still resolves. A handle not created through `NewInstance` (the exported constructor) has no gate and always
+throws. QuickFIX only deletes sessions — and removes them from the registry
 `lookupSession` reads — in the engine destructor, so `InitiatorWrap`/`AcceptorWrap` destroy their engine as soon
 as `stop()` settles (all network threads are joined by then) rather than waiting for GC. That is what makes a stale
 `Session` handle fail deterministically after `stop()`, and lets a new engine reuse the same `SessionID`s right

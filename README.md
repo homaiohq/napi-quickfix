@@ -297,10 +297,13 @@ QuickFIX had already opened for it.
 ### Session
 
 A handle on one **live** session, obtained from `engine.getSession(id)` or the
-module-level `lookupSession(id)`. It stores only the `SessionID` and re-resolves
-the engine-owned `FIX::Session` on every call, so it never dangles — once the
-session is gone (its engine was stopped) every method throws, or rejects with, a
-`QuickFixError` whose `fixErrorName` is `'SessionNotFound'`.
+module-level `lookupSession(id)`. It stores only the `SessionID` and the identity
+of the engine it came from, and re-resolves the engine-owned `FIX::Session` on
+every call, so it never dangles — once the session is gone (its engine was
+stopped) every method throws a `QuickFixError` whose `fixErrorName` is
+`'SessionNotFound'`, even after a new engine has been created with the same id.
+A handle never crosses over to another engine's session; get a new one from the
+new engine.
 
 ```ts
 session.sessionID: SessionID;
@@ -311,7 +314,7 @@ session.sentLogon(): boolean;    session.sentLogout(): boolean;   session.receiv
 session.isInitiator(): boolean;  session.isAcceptor(): boolean;
 session.isSessionTime(now?: Date): boolean;   session.isLogonTime(now?: Date): boolean;
 
-// Sequence numbers (sync; setters write to the message store)
+// Sequence numbers (sync; setters write to the message store -- on a quiet session, see below)
 session.getExpectedSenderNum(): number;         session.getExpectedTargetNum(): number;
 session.setNextSenderMsgSeqNum(n: number): void; session.setNextTargetMsgSeqNum(n: number): void;
 
@@ -335,7 +338,15 @@ while it runs your handlers, so they cannot deadlock the main thread — and
 because they run inline, `session.logout('x'); session.logon();` takes effect in
 that order. (`logon()`/`logout()` flip a plain flag the engine's network thread
 reads without a lock, exactly as QuickFIX's own `Initiator::stop()` does from
-the stopping thread; the engine picks the change up on its next pass.) QuickFIX's `Session::disconnect()` and `reset()` are deliberately **not**
+the stopping thread; the engine picks the change up on its next pass.) The
+sequence-number setters are likewise not serialised against a message the
+engine is sending or receiving on that session at the same moment: QuickFIX
+reads the number, runs your handler, then increments from the store under a
+lock the setters do not take, so a value set in that window — from a handler,
+or while a `sendToTarget()` or a heartbeat is in flight — is overwritten and the
+session ends up one off from its counterparty. Renumber a **quiet** session:
+before `start()`, from a `'logout'` event, or when you know nothing is in
+flight. QuickFIX's `Session::disconnect()` and `reset()` are deliberately **not**
 exposed: they drop the transport through the engine's socket monitor, which is
 only safe from the engine's own network thread (QuickFIX itself never calls them
 from anywhere else). Bring a session down with `logout()` and renumber it with
@@ -343,10 +354,12 @@ the sequence-number setters. Observe the outcome through the engine's
 `'logon'` / `'logout'` events:
 
 ```ts
-initiator.on('logon', async (id) => {
-  const session = initiator.getSession(id)!;
-  console.log('next outbound seq', session.getExpectedSenderNum());
-  session.setNextTargetMsgSeqNum(1); // e.g. after the counterparty reset
+initiator.on('logon', (id) => {
+  console.log('next outbound seq', initiator.getSession(id)!.getExpectedSenderNum());
+});
+initiator.on('logout', (id) => {
+  // The session is quiet now: renumber it, e.g. after the counterparty reset.
+  initiator.getSession(id)?.setNextTargetMsgSeqNum(1);
 });
 
 lookupSession(id)?.logout('maintenance');   // -> 'logout' event, isLoggedOn() === false

@@ -627,16 +627,30 @@ StartDay=Monday
     const settings = SessionSettings.fromString(acceptorCfg(port));
     const first = new Acceptor({ settings, store: 'memory', log: 'none' });
     assert.ok(doesSessionExist(ACC_ID), 'constructing an engine registers its sessions');
+    const stale = first.getSession(ACC_ID)!;
+    const staleLookup = lookupSession(ACC_ID)!;
     await first.stop(); // never started
     assert.equal(doesSessionExist(ACC_ID), false, 'stop() unregisters them, even if never started');
+    assert.throws(() => stale.isEnabled(), isSessionNotFound);
 
     // Had `first` still been alive this would have thrown ConfigError ("Duplicate
     // Session"); it is stop() settling -- not GC -- that releases the ids.
     const second = new Acceptor({ settings, store: 'memory', log: 'none' });
-    assert.ok(second.getSession(ACC_ID));
-    assert.equal(second.getSession(ACC_ID)!.isAcceptor(), true);
+    const fresh = second.getSession(ACC_ID);
+    assert.ok(fresh);
+    assert.equal(fresh.isAcceptor(), true);
+    // A handle is bound to the engine it came from, not just to the id: the
+    // registry QuickFIX keeps is keyed by SessionID alone, so without that
+    // binding `first`'s handles would now silently operate on `second`'s session.
+    assert.throws(() => stale.isEnabled(), isSessionNotFound);
+    assert.throws(() => stale.logout('from a stale handle'), isSessionNotFound);
+    assert.throws(() => staleLookup.setNextSenderMsgSeqNum(7), isSessionNotFound);
+    assert.equal(fresh.isEnabled(), true, "the stale logout() did not reach second's session");
+    assert.equal(fresh.getExpectedSenderNum(), 1, "nor did the stale setter");
+    assert.equal(lookupSession(ACC_ID)!.isEnabled(), true, 'a fresh lookup resolves the new owner');
     await second.stop();
     assert.equal(second.getSession(ACC_ID), undefined);
+    assert.throws(() => fresh.isEnabled(), isSessionNotFound);
   });
 
   test('two live engines cannot share a SessionID', { timeout: 20_000 }, async () => {

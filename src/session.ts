@@ -12,10 +12,13 @@ import { SessionID, toNativeSessionID } from './session-id.js';
  * cannot be constructed directly.
  *
  * **Lifetime.** The underlying `FIX::Session` is owned by its engine. This
- * handle stores only the {@link SessionID} and re-resolves the session on every
- * call, so it never dangles: once the owning engine has been stopped (which
- * destroys its sessions) every method throws a {@link QuickFixError} whose
- * `fixErrorName` is `'SessionNotFound'`.
+ * handle stores only the {@link SessionID} and the identity of the engine it
+ * was obtained from, and re-resolves the session on every call, so it never
+ * dangles: once that engine has been stopped (which destroys its sessions)
+ * every method throws a {@link QuickFixError} whose `fixErrorName` is
+ * `'SessionNotFound'` -- also after a new engine has been created with the
+ * same id. A handle never crosses over to another engine's session; obtain a
+ * new one from the new engine.
  *
  * **Everything is synchronous.** State queries, sequence-number access, the
  * runtime option getters/setters, {@link Session.logon}, {@link Session.logout}
@@ -28,7 +31,8 @@ import { SessionID, toNativeSessionID } from './session-id.js';
  * `Session::disconnect()` / `reset()` are deliberately not exposed: they are
  * only safe on the engine's own network thread (see ARCHITECTURE.md §5). Use
  * {@link Session.logout} to bring a session down, and the sequence-number
- * setters to reset its numbering.
+ * setters to reset its numbering -- on a quiet session; see
+ * {@link Session.setNextSenderMsgSeqNum}.
  *
  * @example
  * ```ts
@@ -135,6 +139,18 @@ export class Session {
    * Set the MsgSeqNum the next outbound message will carry (writes to the
    * message store; a file store may throw `IOException`).
    *
+   * **Call it on a quiet session.** The setter is not serialised against a
+   * message the engine is sending or receiving on this session at the same
+   * time: QuickFIX reads the next number into the outbound header, runs your
+   * `toApp`/`toAdmin` handler, then increments from the store, all under a
+   * lock this call does not (and must not) take. A value set inside that
+   * window -- from a handler, or while a {@link sendToTarget} promise or a
+   * heartbeat is in flight on this session -- is overwritten by the increment,
+   * and the session ends up one off from its counterparty (a Resend Request or
+   * a "MsgSeqNum too low" Logout). Set it before {@link Engine.start}, from a
+   * `'logout'` event, or when you know nothing is in flight; never from a
+   * handler.
+   *
    * @throws `RangeError` if `seqNum` is not a positive safe integer (MsgSeqNum is
    * 1-based).
    */
@@ -145,6 +161,14 @@ export class Session {
   /**
    * Set the MsgSeqNum expected on the next inbound message (writes to the
    * message store; a file store may throw `IOException`).
+   *
+   * **Call it on a quiet session.** Like {@link Session.setNextSenderMsgSeqNum},
+   * it is not serialised against a message the engine is processing on this
+   * session: QuickFIX checks the inbound number, runs your `fromApp`/`fromAdmin`
+   * handler, then increments the expected number from the store under a lock
+   * this call does not take, so a value set meanwhile is overwritten. Set it
+   * before {@link Engine.start}, from a `'logout'` event, or when you know
+   * nothing is in flight; never from a handler.
    *
    * @throws `RangeError` if `seqNum` is not a positive safe integer (MsgSeqNum is
    * 1-based).

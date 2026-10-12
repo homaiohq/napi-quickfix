@@ -38,7 +38,10 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   order); QuickFIX's `Session::disconnect()`/`reset()` are deliberately not exposed, as
   they are only safe on the engine's own network thread. The handle re-resolves the
   session on every call and throws `QuickFixError{fixErrorName: 'SessionNotFound'}`
-  once the owning engine has been stopped.
+  once the engine it was obtained from has been stopped — also after a new engine has
+  been created with the same `SessionID`; it never crosses over to another engine's
+  session. The sequence-number setters are for a quiet session: they are not
+  serialised against a message in flight on that session (see the `Session` docs).
 - Module functions `lookupSession(id)`, `doesSessionExist(id)`, `getSessions()` and
   `numSessions()` over every session in the process.
 - `Initiator`/`Acceptor`: `getSessions()` (the configured `[SESSION]`s),

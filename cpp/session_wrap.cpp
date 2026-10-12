@@ -3,7 +3,9 @@
 #include <cmath>
 #include <ctime>
 #include <limits>
+#include <memory>
 #include <string>
+#include <utility>
 
 #include "errors.h"
 #include "quickfix/Exceptions.h"
@@ -96,9 +98,11 @@ Napi::Object SessionWrap::Init(Napi::Env env, Napi::Object exports) {
   return exports;
 }
 
-Napi::Object SessionWrap::NewInstance(Napi::Env env,
-                                      const FIX::SessionID& id) {
-  return constructor_.New({SessionIDWrap::NewInstance(env, id)});
+Napi::Object SessionWrap::NewInstance(Napi::Env env, const FIX::SessionID& id,
+                                      std::shared_ptr<SessionOpGate> gate) {
+  Napi::Object obj = constructor_.New({SessionIDWrap::NewInstance(env, id)});
+  Unwrap(obj)->gate_ = std::move(gate);
+  return obj;
 }
 
 SessionWrap::SessionWrap(const Napi::CallbackInfo& info)
@@ -114,7 +118,15 @@ SessionWrap::SessionWrap(const Napi::CallbackInfo& info)
   id_ = SessionIDWrap::UnwrapArg(env, info[0], "sessionID")->SessionID();
 }
 
+// Engines are created and destroyed on the JS thread only, and so is this
+// call, so the owner check and the lookup cannot interleave with an engine
+// stop. During a graceful stop() the gate stays registered until the engine is
+// destroyed (Freeze() -> Unregister() -> delete, all before stop() settles), so
+// a 'logout' listener fired by the stop still resolves the session.
 FIX::Session& SessionWrap::Resolve() {
+  if (!gate_ || SessionOpGate::Lookup(id_) != gate_) {
+    throw FIX::SessionNotFound(id_.toString());
+  }
   FIX::Session* session = FIX::Session::lookupSession(id_);
   if (session == nullptr) {
     throw FIX::SessionNotFound(id_.toString());
@@ -235,7 +247,19 @@ Napi::Value SessionWrap::SeqNumSet(const Napi::CallbackInfo& info, bool sender,
   const FIX::SEQNUM num = static_cast<FIX::SEQNUM>(raw);
   NQ_TRY(env) {
     // These touch the MessageStore (may throw IOException) but take only the
-    // SessionState mutex, which QuickFIX never holds across a callback.
+    // SessionState mutex, which QuickFIX never holds across a callback -- that
+    // is what makes them safe to run here. It also means they are NOT
+    // serialised against the engine: Session::sendRaw holds m_mutex across
+    // fill() (reads the next sender num into the header), toApp/toAdmin and
+    // persist() (incrNextSenderMsgSeqNum from the store), and Session::next()
+    // likewise across the target-num verification, fromApp/fromAdmin and
+    // incrNextTargetMsgSeqNum. A setter landing inside that window -- from a
+    // handler, or while a sendToTarget() / heartbeat is in flight on this
+    // session -- is overwritten by the increment that follows, and the wire
+    // is left one off from the peer. The setters are meant for a quiescent
+    // session (before start(), from a 'logout' event, or when the caller
+    // knows nothing is in flight); documented on the JS API, not fixable here
+    // (m_mutex is private and must not be taken from the JS thread anyway).
     if (sender) {
       Resolve().setNextSenderMsgSeqNum(num);
     } else {

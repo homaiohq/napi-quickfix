@@ -137,10 +137,15 @@ Napi::Value LookupSession(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   SessionIDWrap* id = SessionIDWrap::UnwrapArg(env, info[0], "sessionID");
   NQ_TRY(env) {
-    if (!FIX::Session::doesSessionExist(id->SessionID())) {
+    // The gate of the engine owning the id; registered by every wrap
+    // constructor right after it created its sessions, unregistered right
+    // before they are destroyed, so (both on the JS thread) a session that
+    // exists has exactly one. No gate means no session.
+    std::shared_ptr<SessionOpGate> gate = SessionOpGate::Lookup(id->SessionID());
+    if (!gate || !FIX::Session::doesSessionExist(id->SessionID())) {
       return env.Undefined();
     }
-    return SessionWrap::NewInstance(env, id->SessionID());
+    return SessionWrap::NewInstance(env, id->SessionID(), std::move(gate));
   } NQ_CATCH(env)
 }
 

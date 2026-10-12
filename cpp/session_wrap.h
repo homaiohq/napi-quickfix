@@ -3,8 +3,11 @@
 
 #include <napi.h>
 
+#include <memory>
+
 #include "quickfix/Session.h"
 #include "quickfix/SessionID.h"
+#include "session_op_gate.h"
 
 namespace napi_quickfix {
 
@@ -12,13 +15,21 @@ namespace napi_quickfix {
 //
 // Lifetime: FIX::Session objects are OWNED BY THE ENGINE (Initiator/Acceptor)
 // and FIX::Session::lookupSession returns a raw, non-owning pointer. This wrap
-// therefore never caches that pointer: it stores the FIX::SessionID by value and
-// re-resolves it with lookupSession on EVERY call, throwing a QuickFixError with
+// therefore never caches that pointer: it stores the FIX::SessionID by value
+// plus the SessionOpGate of the engine that owned the session when the handle
+// was created, and re-resolves on EVERY call, throwing a QuickFixError with
 // fixErrorName 'SessionNotFound' once the engine has been stopped (which
-// destroys its sessions) or if the id never matched a session.
+// destroys its sessions). The gate is what ties the handle to ONE engine: the
+// process-wide registry lookupSession() reads is keyed by SessionID alone, so
+// after the owner is stopped a new engine may register the same id, and a
+// handle that only re-resolved the id would silently operate on the new
+// engine's session. Resolve() therefore also requires the registered owner of
+// the id (SessionOpGate::Lookup) to still be the gate captured at creation.
 //
 //   new SessionWrap(sessionID: SessionIDWrap)   -- internal; JS reaches a
-//   Session through lookupSession() / engine.getSession().
+//   Session through lookupSession() / engine.getSession(), which bind the
+//   gate via NewInstance(). A handle built any other way has no gate and
+//   always throws SessionNotFound.
 //
 // Every member is synchronous and safe on the JS thread: none takes
 // FIX::Session::m_mutex, which QuickFIX holds across application callbacks.
@@ -33,9 +44,12 @@ class SessionWrap : public Napi::ObjectWrap<SessionWrap> {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
 
-  // Build a JS Session bound to a copy of `id`. Does NOT check that the
-  // session exists; callers (lookupSession / engine.getSession) do.
-  static Napi::Object NewInstance(Napi::Env env, const FIX::SessionID& id);
+  // Build a JS Session bound to a copy of `id` and to `gate`, the
+  // SessionOpGate of the engine owning the session (SessionOpGate::Lookup(id)
+  // or the engine wrap's own gate_). Does NOT check that the session exists;
+  // callers (lookupSession / engine.getSession) do.
+  static Napi::Object NewInstance(Napi::Env env, const FIX::SessionID& id,
+                                  std::shared_ptr<SessionOpGate> gate);
 
   explicit SessionWrap(const Napi::CallbackInfo& info);
 
@@ -44,8 +58,10 @@ class SessionWrap : public Napi::ObjectWrap<SessionWrap> {
  private:
   static Napi::FunctionReference constructor_;
 
-  // Resolve the live FIX::Session or throw FIX::SessionNotFound. Must be called
-  // inside NQ_TRY so the exception maps to a QuickFixError.
+  // Resolve the live FIX::Session of the engine this handle was created for,
+  // or throw FIX::SessionNotFound (session gone, or the id now belongs to a
+  // different engine). Must be called inside NQ_TRY so the exception maps to a
+  // QuickFixError.
   FIX::Session& Resolve();
 
   Napi::Value GetSessionID(const Napi::CallbackInfo& info);
@@ -117,6 +133,10 @@ class SessionWrap : public Napi::ObjectWrap<SessionWrap> {
                         const char* name);
 
   FIX::SessionID id_;
+  // The owning engine's gate at creation; held by shared_ptr so the object
+  // stays alive (and its address unique) as long as the handle does. nullptr
+  // for a handle not created through NewInstance().
+  std::shared_ptr<SessionOpGate> gate_;
 };
 
 }  // namespace napi_quickfix

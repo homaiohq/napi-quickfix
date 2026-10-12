@@ -439,7 +439,7 @@ Napi::Value InitiatorWrap::GetSession(const Napi::CallbackInfo& info) {
   if (!initiator_ || !initiator_->has(id->SessionID())) {
     return env.Undefined();
   }
-  return SessionWrap::NewInstance(env, id->SessionID());
+  return SessionWrap::NewInstance(env, id->SessionID(), gate_);
 }
 
 Napi::Value InitiatorWrap::Ref(const Napi::CallbackInfo& info) {
