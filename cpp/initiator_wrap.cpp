@@ -334,11 +334,24 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
           // stop() threw part-way: the network threads may still be running,
           // so the engine is NOT safe to destroy. Keep it, let session
           // operations through again and clear stopped_ so that a later
-          // stop() -- or the destructor's Teardown() -- retries; the bridge
-          // stays active so those threads' callbacks keep reaching JS. Mirrors
-          // Start() clearing started_ on failure.
+          // stop() -- or the destructor's Teardown() -- retries. Mirrors
+          // Start() clearing started_ on failure. The bridge is released (or
+          // aborted) as on success, so a failed stop() does not keep the
+          // event loop alive: the TSFN holds a loop reference until it is
+          // released, and a script that catches the rejection and falls off
+          // the end would otherwise never exit. From here on the engine's
+          // callbacks pass through without reaching JS; the retried stop()
+          // then destroys the engine as soon as its worker settles, since
+          // RunAfterQueued() refuses a released bridge.
           self->stopped_ = false;
           self->gate_->Unfreeze();
+          if (bridge) {
+            if (force) {
+              bridge->Abort();
+            } else {
+              bridge->Release();
+            }
+          }
           settle();
           return;
         }

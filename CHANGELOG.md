@@ -90,7 +90,9 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   triggered have been delivered, so a `'logout'` listener can still reach the session
   (`engine.getSession(id)`); `stop(true)` discards the events still queued and destroys
   the engine immediately. If `stop()` fails, the engine is left intact (so it can be
-  stopped again) rather than destroyed with its network thread possibly still running.
+  stopped again) rather than destroyed with its network thread possibly still running;
+  as before, its events stop being delivered and it no longer keeps the event loop
+  alive.
   A `sendToTarget()` that has already reached its session when `stop()` is called
   completes before the sessions are destroyed; one that has not reached it by then is
   refused with `SessionNotFound` rather than run against the engine that is gone. A
