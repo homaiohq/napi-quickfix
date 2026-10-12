@@ -14,6 +14,8 @@ import type { Message } from './message.js';
  * ```ts
  * const dd = DataDictionary.fromFile('./spec/FIX44.xml');
  * dd.validate(msg); // throws QuickFixError if invalid
+ * dd.getFieldName(35); // 'MsgType'
+ * Message.parse(raw, { dictionary: dd }); // structural parse (repeating groups)
  * ```
  */
 export class DataDictionary {
@@ -73,10 +75,42 @@ export class DataDictionary {
    * Validate a message against this dictionary.
    *
    * @param msg The message to validate.
+   * @param bodyOnly When `true`, validate only as the *application* dictionary
+   *   (QuickFIX's `validate(msg, true)`): the BeginString version check and the
+   *   tag/value validation of the header and trailer fields are skipped. It is
+   *   not a check of a draft body: `BeginString` and `MsgType` must be set, and
+   *   every field the dictionary requires, header and trailer included (e.g.
+   *   `BodyLength`, `CheckSum`), must be present. Defaults to `false`.
    * @throws A `QuickFixError` on any validation failure (e.g.
-   *   `fixError: 'InvalidMessage'` / `'FieldNotFound'` / `'IncorrectTagValue'`).
+   *   `fixErrorName: 'InvalidMessage'` / `'RequiredTagMissing'` /
+   *   `'IncorrectTagValue'` / `'UnsupportedVersion'`).
    */
-  validate(msg: Message): void {
-    this.#native.validate(msg.nativeHandle);
+  validate(msg: Message, bodyOnly = false): void {
+    this.#native.validate(msg.nativeHandle, bodyOnly);
+  }
+
+  /** The BeginString the spec declares (e.g. `'FIX.4.4'`), or `''` if it has none. */
+  getVersion(): string {
+    return this.#native.getVersion();
+  }
+
+  /** The name of a field tag (e.g. `35` → `'MsgType'`), or `undefined` if the spec does not define it. */
+  getFieldName(tag: number): string | undefined {
+    return this.#native.getFieldName(tag);
+  }
+
+  /** The tag of a field name (e.g. `'MsgType'` → `35`), or `undefined` if the spec does not define it. */
+  getFieldTag(name: string): number | undefined {
+    return this.#native.getFieldTag(name);
+  }
+
+  /** Whether the spec defines a field with this tag. */
+  isField(tag: number): boolean {
+    return this.#native.isField(tag);
+  }
+
+  /** Whether the spec defines a message with this MsgType (e.g. `'D'`). */
+  isMsgType(msgType: string): boolean {
+    return this.#native.isMsgType(msgType);
   }
 }

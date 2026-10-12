@@ -21,7 +21,7 @@ graph TD
   subgraph JS["JavaScript / TypeScript  (src/)"]
     APP["Your application"]
     IDX["index.ts — public barrel"]
-    MSG["Message · SessionID<br/>SessionSettings · DataDictionary"]
+    MSG["Message · Group · SessionID<br/>SessionSettings · DataDictionary"]
     ENG["Engine (EventEmitter)<br/>Initiator · Acceptor · Session"]
     NAT["native.ts — typed NativeModule"]
     LOAD["load-native.cjs<br/>(node-gyp-build loader)"]
@@ -29,7 +29,7 @@ graph TD
 
   subgraph ADDON["C++ Node-API addon  (cpp/ → napi_quickfix.node)"]
     REG["addon.cpp — module init"]
-    WRAPS["ObjectWrap classes<br/>MessageWrap · SessionIDWrap<br/>SessionSettingsWrap · DataDictionaryWrap<br/>InitiatorWrap · AcceptorWrap · SessionWrap"]
+    WRAPS["ObjectWrap classes<br/>MessageWrap · GroupWrap · SessionIDWrap<br/>SessionSettingsWrap · DataDictionaryWrap<br/>InitiatorWrap · AcceptorWrap · SessionWrap"]
     BRIDGE["ApplicationBridge<br/>(FIX::Application + TSFN)"]
     WORKERS["engine_workers.h<br/>AsyncWorkers (start/stop/send/session ops)"]
     ERR["errors.h — FIX::Exception → QuickFixError"]
@@ -129,14 +129,21 @@ sequenceDiagram
   TSFN-->>JS: CallJs trampoline (wrap Message + SessionID)
   JS->>H: handler(msg, sid)
   H-->>JS: mutate msg / throw FixReject
-  JS-->>BR: fulfill SyncChannel (edited raw / error)
-  BR->>QF: re-parse msg or throw FIX exception
+  JS-->>BR: fulfill SyncChannel (edited message copy / error)
+  BR->>QF: assign edited copy or throw FIX exception
 ```
 
 - **Fire-and-forget** callbacks never block the QuickFIX thread.
 - **Synchronous** callbacks (which may mutate the outbound message or throw to reject) use a `BlockingCall` plus a
   shared `SyncChannel` (mutex + condition variable). An RAII guard **always** fulfils the channel — even if the JS
   handler throws — so the QuickFIX thread can never deadlock waiting on it.
+- The message crosses the bridge as a **deep copy of the `FIX::Message`** in both directions, never as its wire
+  string. QuickFIX parsed it with the session's data dictionary, so its repeating groups are structured; re-parsing
+  a string without that dictionary would flatten them, and `getGroup` in a handler (or a group added in `toApp`)
+  would be lost.
+- The message also carries the **session dictionary**, so `setField` & co. route its header/trailer fields as the
+  parser does. The bridge caches, per session, a copy of the session's `DataDictionaryProvider` (which shares its
+  dictionaries' ownership) taken on the QuickFIX thread, so a message kept by JS can outlive its session safely.
 
 ---
 
@@ -337,13 +344,13 @@ musl entries and link musl objects into a glibc addon.
 
 | Area | Files |
 | --- | --- |
-| Public TS API | `src/index.ts`, `message.ts`, `session-id.ts`, `session-settings.ts`, `data-dictionary.ts`, `enums.ts` |
+| Public TS API | `src/index.ts`, `message.ts`, `group.ts`, `session-id.ts`, `session-settings.ts`, `data-dictionary.ts`, `enums.ts` |
 | Generated FIX constants | `scripts/gen-fields.mjs` → `src/generated/fields.ts` (`FIELD`), `scripts/gen-values.mjs` → `src/generated/values.ts` (value groups, `VALUES`) — both from the QuickFIX headers at the pinned tag |
 | Engine + handlers | `src/engine.ts`, `initiator.ts`, `acceptor.ts`, `application.ts` |
 | Per-session control | `src/session.ts` (`Session`, `lookupSession`, `doesSessionExist`, `getSessions`, `numSessions`), `cpp/session_wrap.{h,cpp}` |
 | Native loader | `src/native.ts`, `src/load-native.cjs` |
-| Addon entry / wraps | `cpp/addon.cpp`, `cpp/*_wrap.{h,cpp}`, `cpp/session_static.cpp` (`sendToTarget` + session lookups) |
+| Addon entry / wraps | `cpp/addon.cpp`, `cpp/*_wrap.{h,cpp}`, `cpp/field_map_ops.h` (field/group ops shared by `MessageWrap` and `GroupWrap`), `cpp/session_static.cpp` (`sendToTarget` + session lookups) |
 | Bridge / async / errors | `cpp/application_bridge.{h,cpp}`, `cpp/engine_workers.h` (`EngineOpWorker`), `cpp/session_static.cpp` (`SendToTargetWorker`), `cpp/errors.h` |
 | Build / dist | `CMakeLists.txt`, `scripts/prebuild.mjs`, `tsconfig.*.json`, `package.json` |
-| Tests | `test/*.test.ts`, `test/helpers.ts` (loopback harness) |
+| Tests | `test/*.test.ts`, `test/helpers.ts` (loopback harness), `test/fixtures/` (reduced FIX 4.4 dictionary + loader) |
 | CI | `.github/workflows/ci.yml`, `.github/workflows/release.yml` |

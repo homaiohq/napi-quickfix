@@ -1,10 +1,14 @@
 #include "application_bridge.h"
 
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
 
+#include "field_map_ops.h"
 #include "message_wrap.h"
+#include "quickfix/DataDictionaryProvider.h"
+#include "quickfix/Session.h"
 #include "session_id_wrap.h"
 
 namespace napi_quickfix {
@@ -196,9 +200,8 @@ void ApplicationBridge::FireAndForget(CallType type, const FIX::SessionID& id) {
   }
 }
 
-ApplicationBridge::Result ApplicationBridge::CallSync(CallType type,
-                                                      const FIX::SessionID& id,
-                                                      const std::string& raw) {
+ApplicationBridge::Result ApplicationBridge::CallSync(
+    CallType type, const FIX::SessionID& id, const FIX::Message& message) {
   // Bridge is releasing/aborting: never call into the TSFN (its internals may be
   // torn down during finalize -> calling would abort the process). Return an
   // empty pass-through result so the QuickFIX thread proceeds without mutation
@@ -209,6 +212,26 @@ ApplicationBridge::Result ApplicationBridge::CallSync(CallType type,
     return r;
   }
 
+  // Everything that can throw (the copy, its serialization, the dictionary
+  // lookup) runs before the channel is registered, and `data` is owned until
+  // the TSFN takes it: an exception (std::bad_alloc) leaks nothing and leaves
+  // no channel in pending_.
+  auto data = std::make_unique<CallData>();
+  data->type = type;
+  data->sessionID = id;
+  // Deep copy, nested entries kept typed: the engine parsed them as
+  // FIX::Group with the session dictionary, and a plain copy would slice
+  // their delimiter away.
+  fieldmap::CloneMessage(data->message, message);
+  if (type == CallType::kToAdmin || type == CallType::kToApp) {
+    // An outbound message gets BodyLength (9) and CheckSum (10) only when
+    // Session::sendRaw serializes it, after toAdmin/toApp: serialize the
+    // clone so the handler sees them too. The engine recomputes both anyway.
+    data->message.toString();
+  }
+  data->sessionDictionary = SessionDictionary(id);
+  data->hasMessage = true;
+
   auto channel = std::make_shared<SyncChannel>();
   std::uint64_t channelId = 0;
   if (!RegisterChannel(channel, channelId)) {
@@ -217,23 +240,18 @@ ApplicationBridge::Result ApplicationBridge::CallSync(CallType type,
     Result r;
     return r;
   }
-
-  auto* data = new CallData();
-  data->type = type;
-  data->sessionID = id;
-  data->rawMessage = raw;
-  data->hasMessage = true;
   data->channel = channel;  // shared: trampoline gets its own owning copy
 
-  napi_status status = tsfn_.BlockingCall(data);
+  napi_status status = tsfn_.BlockingCall(data.get());
   if (status != napi_ok) {
     // TSFN is closing/aborted: it won't take ownership and won't fulfill the
-    // channel. Clean up and return a pass-through result.
-    delete data;
+    // channel. Clean up (`data` frees itself) and return a pass-through
+    // result.
     UnregisterChannel(channelId);
     Result r;
     return r;
   }
+  data.release();  // the trampoline owns it now
 
   // Wait for the trampoline (normal completion) or Abort/Deactivate (teardown)
   // to signal the channel. Never blocks forever: WakeAllPending() sets done.
@@ -246,7 +264,30 @@ ApplicationBridge::Result ApplicationBridge::CallSync(CallType type,
   return channel->result;
 }
 
+std::shared_ptr<const FIX::DataDictionary> ApplicationBridge::SessionDictionary(
+    const FIX::SessionID& id) {
+  std::lock_guard<std::mutex> lock(dictionariesMtx_);
+  auto found = dictionaries_.find(id);
+  if (found != dictionaries_.end()) {
+    return found->second;
+  }
+  FIX::Session* session = FIX::Session::lookupSession(id);
+  if (session == nullptr) {
+    return nullptr;
+  }
+  auto provider = std::make_shared<const FIX::DataDictionaryProvider>(
+      session->getDataDictionaryProvider());
+  std::shared_ptr<const FIX::DataDictionary> dictionary(
+      provider, &provider->getSessionDataDictionary(id.getBeginString()));
+  dictionaries_.emplace(id, dictionary);
+  return dictionary;
+}
+
 void ApplicationBridge::onCreate(const FIX::SessionID& id) {
+  {
+    std::lock_guard<std::mutex> lock(dictionariesMtx_);
+    dictionaries_.erase(id);
+  }
   FireAndForget(CallType::kOnCreate, id);
 }
 
@@ -260,22 +301,22 @@ void ApplicationBridge::onLogout(const FIX::SessionID& id) {
 
 void ApplicationBridge::toAdmin(FIX::Message& message,
                                 const FIX::SessionID& id) {
-  Result r = CallSync(CallType::kToAdmin, id, message.toString());
+  Result r = CallSync(CallType::kToAdmin, id, message);
   if (r.mutated) {
-    message.setString(r.editedMessage, false);
+    message = r.editedMessage;
   }
   // toAdmin doesn't throw in the FIX interface; ignore r.threw here.
 }
 
 void ApplicationBridge::toApp(FIX::Message& message, const FIX::SessionID& id)
     EXCEPT(FIX::DoNotSend) {
-  Result r = CallSync(CallType::kToApp, id, message.toString());
+  Result r = CallSync(CallType::kToApp, id, message);
   if (r.threw) {
     // toApp may throw DoNotSend.
     throw FIX::DoNotSend();
   }
   if (r.mutated) {
-    message.setString(r.editedMessage, false);
+    message = r.editedMessage;
   }
 }
 
@@ -283,7 +324,7 @@ void ApplicationBridge::fromAdmin(const FIX::Message& message,
                                   const FIX::SessionID& id)
     EXCEPT(FIX::FieldNotFound, FIX::IncorrectDataFormat, FIX::IncorrectTagValue,
            FIX::RejectLogon) {
-  Result r = CallSync(CallType::kFromAdmin, id, message.toString());
+  Result r = CallSync(CallType::kFromAdmin, id, message);
   if (r.threw) {
     if (r.errorName == "RejectLogon") throw FIX::RejectLogon(r.errorMessage);
     if (r.errorName == "IncorrectDataFormat") throw FIX::IncorrectDataFormat(0);
@@ -298,7 +339,7 @@ void ApplicationBridge::fromApp(const FIX::Message& message,
                                 const FIX::SessionID& id)
     EXCEPT(FIX::FieldNotFound, FIX::IncorrectDataFormat, FIX::IncorrectTagValue,
            FIX::UnsupportedMessageType) {
-  Result r = CallSync(CallType::kFromApp, id, message.toString());
+  Result r = CallSync(CallType::kFromApp, id, message);
   if (r.threw) {
     if (r.errorName == "UnsupportedMessageType")
       throw FIX::UnsupportedMessageType();
@@ -369,13 +410,11 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
   Napi::Object msgObj;
   bool haveMsg = false;
   if (data->hasMessage) {
-    FIX::Message msg;
-    try {
-      msg.setString(data->rawMessage, false);
-    } catch (...) {
-      // Leave msg default-constructed if parse fails; still hand it to JS.
-    }
-    msgObj = MessageWrap::NewInstance(env, msg);
+    // Hand the structured copy over to the wrapper (data is deleted by the
+    // guard below): no string round-trip and no second copy, so the repeating
+    // groups the engine parsed stay intact for the handler.
+    msgObj = MessageWrap::NewInstance(env, std::move(data->message),
+                                      std::move(data->sessionDictionary));
     haveMsg = true;
   }
 
@@ -415,7 +454,7 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
   if (isSync && IsMutating(data->type) && haveMsg && !guard.result.threw) {
     try {
       MessageWrap* w = Napi::ObjectWrap<MessageWrap>::Unwrap(msgObj);
-      guard.result.editedMessage = w->Message().toString();
+      guard.result.editedMessage = w->Message();
       guard.result.mutated = true;
     } catch (...) {
       guard.result.mutated = false;

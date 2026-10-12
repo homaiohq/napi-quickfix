@@ -5,6 +5,8 @@ import { createServer } from 'node:net';
 import {
   Acceptor,
   Initiator,
+  Group,
+  Message,
   SessionSettings,
   SessionID,
   createMessage,
@@ -13,6 +15,7 @@ import {
   MsgType,
   Side,
 } from '../dist/esm/index.js';
+import { FIX44_MINI_PATH } from './fixtures/dictionary.js';
 
 // End-to-end loopback integration test — fully IN-PROCESS.
 //
@@ -132,10 +135,28 @@ TargetCompID=SERVER
         },
       });
 
+      // The initiator's toAdmin/toApp record the outbound framing fields, which
+      // QuickFIX only sets when it serializes the message after these handlers.
+      const framing: { msgType: string; bodyLength: string; checkSum: string; raw: string }[] = [];
+      const frame = (msg: Message) => ({
+        msgType: msg.getMsgType(),
+        bodyLength: msg.getHeaderField(FIELD.BodyLength),
+        checkSum: msg.getTrailerField(FIELD.CheckSum),
+        raw: msg.toString(),
+      });
+
       const ini = new Initiator({
         settings: SessionSettings.fromString(initiatorCfg),
         store: 'memory',
         log: 'none',
+        handlers: {
+          toAdmin(msg) {
+            framing.push(frame(msg));
+          },
+          toApp(msg) {
+            framing.push(frame(msg));
+          },
+        },
       });
 
       // Also observe the acceptor's 'fromApp' EVENT independently of the handler.
@@ -196,6 +217,17 @@ TargetCompID=SERVER
           "acceptor 'fromApp' event should also have fired with 35=D",
         );
 
+        // toAdmin (the Logon) and toApp (the orders) saw BodyLength and
+        // CheckSum, consistent with the message they were handed.
+        assert.ok(framing.some((f) => f.msgType === MsgType.Logon), 'toAdmin should have seen the Logon');
+        assert.ok(framing.some((f) => f.msgType === MsgType.NewOrderSingle), 'toApp should have seen the order');
+        for (const f of framing) {
+          const start = f.raw.indexOf('\x0135=') + 1;
+          const end = f.raw.lastIndexOf('\x0110=') + 1;
+          assert.equal(Number(f.bodyLength), end - start, `BodyLength of ${f.raw.replace(/\x01/g, '|')}`);
+          assert.ok(f.raw.endsWith(`\x0110=${f.checkSum}\x01`), `CheckSum of ${f.raw.replace(/\x01/g, '|')}`);
+        }
+
         // --- SendingTime clock parity across libc -------------------------------
         //
         // Guards the HAVE_GETTIMEOFDAY definition in CMakeLists.txt (see the long
@@ -239,6 +271,204 @@ TargetCompID=SERVER
         }
       } finally {
         // Tear down both live sessions; awaiting stop() must not hang.
+        await ini.stop().catch(() => {});
+        await acc.stop().catch(() => {});
+      }
+    },
+  );
+});
+
+// Repeating groups across the engine. Both sessions use a data dictionary, so
+// QuickFIX parses inbound messages structurally and the bridge must hand the
+// structured message (not a flat re-parse of its wire string) to the handlers.
+//
+// The CompIDs differ from the test above on purpose: QuickFIX keys its
+// process-wide session registry by SessionID, and the engines of the previous
+// test stay registered until they are garbage-collected, so reusing
+// CLIENT/SERVER here would route sendToTarget to the stale session.
+describe('loopback integration: repeating groups', () => {
+  function party(id: string, role: number): Group {
+    return new Group(FIELD.NoPartyIDs, FIELD.PartyID)
+      .setField(FIELD.PartyID, id)
+      .setField(FIELD.PartyIDSource, 'D')
+      .setField(FIELD.PartyRole, role);
+  }
+
+  test(
+    'a NewOrderSingle with NoPartyIDs round-trips through the engine with its groups intact',
+    { timeout: HANDSHAKE_TIMEOUT_MS + 6000 },
+    async () => {
+      const port = await freePort();
+
+      const common = `UseDataDictionary=Y
+DataDictionary=${FIX44_MINI_PATH}
+StartTime=00:00:00
+EndTime=00:00:00
+ResetOnLogon=Y
+`;
+      const acceptorCfg = `[DEFAULT]
+ConnectionType=acceptor
+SocketAcceptPort=${port}
+${common}
+[SESSION]
+BeginString=FIX.4.4
+SenderCompID=GRP-SERVER
+TargetCompID=GRP-CLIENT
+`;
+      const initiatorCfg = `[DEFAULT]
+ConnectionType=initiator
+SocketConnectHost=127.0.0.1
+SocketConnectPort=${port}
+HeartBtInt=2
+ReconnectInterval=1
+${common}
+[SESSION]
+BeginString=FIX.4.4
+SenderCompID=GRP-CLIENT
+TargetCompID=GRP-SERVER
+`;
+
+      interface Seen {
+        partyCount: number;
+        parties: { id: string; role: string; subs: { id: string | undefined; delim: number }[] }[];
+        text: string | undefined;
+        // 5001 is a header field per the mini dictionary only; read with the
+        // plain getter, which must find it where the engine put it.
+        customHeader: string | undefined;
+        raw: string;
+      }
+      const snapshot = (msg: Message): Seen => {
+        const partyCount = msg.groupCount(FIELD.NoPartyIDs);
+        const parties: Seen['parties'] = [];
+        for (let i = 1; i <= partyCount; i++) {
+          const p = msg.getGroup(i, FIELD.NoPartyIDs);
+          const subs: Seen['parties'][number]['subs'] = [];
+          for (let j = 1; j <= p.groupCount(FIELD.NoPartySubIDs); j++) {
+            const sub = p.getGroup(j, FIELD.NoPartySubIDs);
+            subs.push({ id: sub.getFieldIfSet(FIELD.PartySubID), delim: sub.delim });
+          }
+          parties.push({ id: p.getField(FIELD.PartyID), role: p.getField(FIELD.PartyRole), subs });
+        }
+        return {
+          partyCount,
+          parties,
+          text: msg.getFieldIfSet(FIELD.Text),
+          customHeader: msg.getFieldIfSet(5001),
+          raw: msg.toString(),
+        };
+      };
+
+      // The acceptor's handler and event see the inbound message with groups.
+      const received: Seen[] = [];
+      const acc = new Acceptor({
+        settings: SessionSettings.fromString(acceptorCfg),
+        store: 'memory',
+        log: 'none',
+        handlers: {
+          fromApp(msg) {
+            received.push(snapshot(msg));
+          },
+        },
+      });
+      const eventSeen: Seen[] = [];
+      acc.on('fromApp', (msg) => eventSeen.push(snapshot(msg)));
+
+      // The initiator's toApp sees the OUTBOUND message with groups and may
+      // mutate it: a party added here, a plain field set here and the
+      // dictionary-declared header field, removed and set again, must all
+      // reach the acceptor (the last one in the header: the message routes by
+      // the session's dictionary, not by where the field happens to be).
+      const outbound: Seen[] = [];
+      const ini = new Initiator({
+        settings: SessionSettings.fromString(initiatorCfg),
+        store: 'memory',
+        log: 'none',
+        handlers: {
+          toApp(msg) {
+            outbound.push(snapshot(msg));
+            msg
+              .addGroup(party('ADDED-IN-TOAPP', 3))
+              .setField(FIELD.Text, 'edited-in-toApp')
+              .removeField(5001)
+              .setField(5001, 'edited-in-toApp');
+          },
+        },
+      });
+
+      try {
+        const accLogon = waitForEvent(acc, 'logon', 'acceptor logon', HANDSHAKE_TIMEOUT_MS);
+        const iniLogon = waitForEvent(ini, 'logon', 'initiator logon', HANDSHAKE_TIMEOUT_MS);
+        await acc.start();
+        await ini.start();
+        await Promise.all([accLogon, iniLogon]);
+
+        const order = createMessage()
+          .setField(FIELD.MsgType, MsgType.NewOrderSingle)
+          .setField(FIELD.ClOrdID, 'grp-1')
+          .setField(FIELD.Symbol, 'AAPL')
+          .setField(FIELD.Side, Side.Buy)
+          .setField(FIELD.TransactTime, '20260101-00:00:00')
+          .setField(FIELD.OrdType, '1')
+          .setHeaderField(5001, 'hdr')
+          // A sub-ID entry without its delimiter field: only the dictionary
+          // (and the Group it was built from) knows the delimiter is 523.
+          .addGroup(
+            party('TRADER-1', 11).addGroup(
+              new Group(FIELD.NoPartySubIDs, FIELD.PartySubID).setField(FIELD.PartySubIDType, 7),
+            ),
+          )
+          .addGroup(
+            party('FIRM-7', 1).addGroup(
+              new Group(FIELD.NoPartySubIDs, FIELD.PartySubID)
+                .setField(FIELD.PartySubID, 'desk-7')
+                .setField(FIELD.PartySubIDType, 2),
+            ),
+          );
+
+        const accepted = await sendToTarget(order, new SessionID('FIX.4.4', 'GRP-CLIENT', 'GRP-SERVER'));
+        assert.equal(accepted, true);
+
+        const deadline = Date.now() + 5000;
+        while (received.length < 1 && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        assert.equal(received.length, 1, 'acceptor fromApp should have received the order');
+
+        // Outbound: toApp saw the two parties we built, structurally (the
+        // delimiter-less sub entry included), the header field, and no Text
+        // yet.
+        assert.equal(outbound.length, 1);
+        assert.equal(outbound[0].partyCount, 2);
+        assert.deepEqual(outbound[0].parties, [
+          { id: 'TRADER-1', role: '11', subs: [{ id: undefined, delim: FIELD.PartySubID }] },
+          { id: 'FIRM-7', role: '1', subs: [{ id: 'desk-7', delim: FIELD.PartySubID }] },
+        ]);
+        assert.equal(outbound[0].text, undefined);
+        assert.equal(outbound[0].customHeader, 'hdr');
+
+        // Inbound: the acceptor sees all three parties (two built + one added
+        // in toApp), each with its fields and the nested sub-ID group, and
+        // the header field as edited in toApp (in place: once on the wire).
+        const seen = received[0];
+        assert.equal(seen.partyCount, 3);
+        assert.equal(seen.text, 'edited-in-toApp', 'the plain-field edit in toApp reached the wire too');
+        assert.equal(seen.customHeader, 'edited-in-toApp');
+        assert.equal(seen.raw.split('\x015001=').length, 2, `5001 once, got ${seen.raw.replace(/\x01/g, '|')}`);
+        assert.ok(seen.raw.indexOf('\x015001=') < seen.raw.indexOf('\x0111='), 'in the header');
+        assert.deepEqual(seen.parties, [
+          { id: 'TRADER-1', role: '11', subs: [{ id: undefined, delim: FIELD.PartySubID }] },
+          { id: 'FIRM-7', role: '1', subs: [{ id: 'desk-7', delim: FIELD.PartySubID }] },
+          { id: 'ADDED-IN-TOAPP', role: '3', subs: [] },
+        ]);
+        assert.ok(
+          seen.raw.includes(
+            '\x01453=3\x01448=TRADER-1\x01447=D\x01452=11\x01802=1\x01803=7\x01448=FIRM-7\x01447=D\x01452=1\x01802=1\x01523=desk-7\x01803=2\x01448=ADDED-IN-TOAPP\x01447=D\x01452=3\x01',
+          ),
+          `expected the group block contiguous on the wire, got ${seen.raw.replace(/\x01/g, '|')}`,
+        );
+        // The observe-only event got the same structured message.
+        assert.deepEqual(eventSeen, received);
+      } finally {
         await ini.stop().catch(() => {});
         await acc.stop().catch(() => {});
       }

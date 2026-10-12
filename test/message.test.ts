@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 
 import {
   Message,
+  Group,
   createMessage,
   parseMessage,
   FIELD,
   MsgType,
   Side,
 } from '../dist/esm/index.js';
+import { loadFix44Mini } from './fixtures/dictionary.js';
 
 const SOH = '\x01';
 
@@ -24,6 +26,35 @@ describe('Message', () => {
     msg.setField(FIELD.OrderQty ?? 38, 100);
     // FIX is string-on-the-wire; numbers are stringified.
     assert.equal(msg.getField(FIELD.OrderQty ?? 38), '100');
+  });
+
+  test('writes numbers without exponent notation, in every section', () => {
+    // FIX numeric fields allow no exponent; String(1e-7) is '1e-7'.
+    const cases: [number, string][] = [
+      [123.45, '123.45'],
+      [-7, '-7'],
+      [1e-7, '0.0000001'],
+      [-1.5e-9, '-0.0000000015'],
+      [1.23e-7, '0.000000123'],
+      [1e21, '1000000000000000000000'],
+      [-2.5e22, '-25000000000000000000000'],
+    ];
+    for (const [value, wire] of cases) {
+      const msg = new Message().setField(44, value).setHeaderField(5000, value).setTrailerField(93, value);
+      assert.equal(msg.getField(44), wire, `body ${value}`);
+      assert.equal(msg.getHeaderField(5000), wire, `header ${value}`);
+      assert.equal(msg.getTrailerField(93), wire, `trailer ${value}`);
+    }
+  });
+
+  test('rejects NaN and Infinity field values', () => {
+    const msg = new Message();
+    for (const value of [NaN, Infinity, -Infinity]) {
+      assert.throws(() => msg.setField(44, value), RangeError, `body ${value}`);
+      assert.throws(() => msg.setHeaderField(5000, value), RangeError, `header ${value}`);
+      assert.throws(() => msg.setTrailerField(93, value), RangeError, `trailer ${value}`);
+    }
+    assert.equal(msg.isEmpty(), true, 'nothing was written');
   });
 
   test('setField is chainable (returns this)', () => {
@@ -142,5 +173,405 @@ describe('Message', () => {
     assert.equal(json.msgType, MsgType.NewOrderSingle);
     assert.equal(json.raw, msg.toString());
     assert.ok(json.raw.includes(SOH));
+  });
+});
+
+// Builds a complete NewOrderSingle (with every field the mini dictionary
+// requires) so the serialized form can be parsed back structurally.
+function newOrderSingle(): Message {
+  return createMessage()
+    .setField(FIELD.BeginString, 'FIX.4.4')
+    .setField(FIELD.MsgType, MsgType.NewOrderSingle)
+    .setField(FIELD.SenderCompID, 'S')
+    .setField(FIELD.TargetCompID, 'T')
+    .setField(FIELD.MsgSeqNum, 1)
+    .setField(FIELD.SendingTime, '20260101-00:00:00')
+    .setField(FIELD.ClOrdID, 'order-1')
+    .setField(FIELD.Symbol, 'AAPL')
+    .setField(FIELD.Side, Side.Buy)
+    .setField(FIELD.TransactTime, '20260101-00:00:00')
+    .setField(FIELD.OrdType, '1');
+}
+
+function party(id: string, role: number): Group {
+  return new Group(FIELD.NoPartyIDs, FIELD.PartyID)
+    .setField(FIELD.PartyID, id)
+    .setField(FIELD.PartyIDSource, 'D')
+    .setField(FIELD.PartyRole, role);
+}
+
+const isFieldNotFound = (err: any) => {
+  assert.equal(err.name, 'QuickFixError');
+  assert.equal(err.fixErrorName, 'FieldNotFound');
+  return true;
+};
+
+describe('Message field-map API', () => {
+  test('isSetField / getFieldIfSet / removeField with header auto-routing', () => {
+    const msg = createMessage().setField(FIELD.MsgType, MsgType.Heartbeat).setField(112, 'ping');
+    assert.equal(msg.isSetField(112), true);
+    assert.equal(msg.isSetField(FIELD.MsgType), true, 'routed to the header');
+    assert.equal(msg.isSetField(58), false);
+    assert.equal(msg.getFieldIfSet(112), 'ping');
+    assert.equal(msg.getFieldIfSet(58), undefined);
+
+    msg.removeField(112);
+    assert.equal(msg.isSetField(112), false);
+    assert.doesNotThrow(() => msg.removeField(112), 'removing an absent field is a no-op');
+    msg.removeField(FIELD.MsgType);
+    assert.equal(msg.isSetField(FIELD.MsgType), false, 'header removal is routed too');
+  });
+
+  test('tag validation: sets need a positive integer, reads accept any integer', () => {
+    const msg = createMessage();
+    assert.throws(() => msg.setField(0, 'x'), TypeError);
+    assert.throws(() => msg.setField(1.5, 'x'), TypeError);
+    assert.throws(() => msg.setHeaderField(-1, 'x'), TypeError);
+    assert.throws(() => msg.setTrailerField(Number.NaN, 'x'), TypeError);
+    assert.equal(msg.isEmpty(), true);
+    assert.deepEqual(msg.headerFields(), []);
+
+    assert.throws(() => msg.getField(0), isFieldNotFound);
+    assert.throws(() => msg.getField(2000000), isFieldNotFound);
+    assert.equal(msg.isSetField(-5), false);
+    assert.throws(() => msg.getField(1.5), TypeError);
+    assert.throws(() => msg.getHeaderField('35' as unknown as number), TypeError);
+  });
+
+  test('isEmpty / totalFields / fields / iteration / headerFields / trailerFields / clear', () => {
+    const msg = createMessage();
+    assert.equal(msg.isEmpty(), true);
+    msg.setField(FIELD.MsgType, MsgType.NewOrderSingle).setField(55, 'AAPL').setField(38, 100);
+    assert.equal(msg.isEmpty(), false);
+    assert.equal(msg.totalFields(), 2, 'body fields only');
+    assert.deepEqual(msg.fields(), [
+      [38, '100'],
+      [55, 'AAPL'],
+    ]);
+    assert.deepEqual([...msg], msg.fields());
+    assert.deepEqual(msg.headerFields(), [[35, 'D']]);
+    assert.deepEqual(msg.trailerFields(), []);
+
+    msg.clear();
+    assert.equal(msg.isEmpty(), true);
+    assert.deepEqual(msg.headerFields(), []);
+  });
+
+  test('isEmpty covers the header and trailer, like clear', () => {
+    const headerOnly = createMessage().setField(FIELD.MsgType, MsgType.NewOrderSingle).setField(FIELD.SenderCompID, 'ME');
+    assert.equal(headerOnly.isEmpty(), false);
+    assert.equal(createMessage().setTrailerField(FIELD.Signature, 'x').isEmpty(), false);
+    headerOnly.clear();
+    assert.equal(headerOnly.isEmpty(), true);
+  });
+});
+
+describe('Message repeating groups', () => {
+  test('addGroup emits entries after the count field, in insertion order', () => {
+    const msg = newOrderSingle().addGroup(party('A', 1)).addGroup(party('B', 11));
+    assert.equal(msg.groupCount(FIELD.NoPartyIDs), 2);
+    assert.equal(msg.hasGroup(FIELD.NoPartyIDs), true);
+    assert.equal(msg.hasGroup(2, FIELD.NoPartyIDs), true);
+    assert.equal(msg.hasGroup(3, FIELD.NoPartyIDs), false);
+    assert.equal(msg.hasGroup(0, FIELD.NoPartyIDs), false, 'indices are 1-based');
+    assert.equal(msg.getField(FIELD.NoPartyIDs), '2', 'count field is maintained');
+
+    const raw = msg.toString();
+    assert.ok(
+      raw.includes(`${SOH}453=2${SOH}448=A${SOH}447=D${SOH}452=1${SOH}448=B${SOH}447=D${SOH}452=11${SOH}`),
+      `expected the group block in wire order, got ${msg.toPretty()}`,
+    );
+    assert.equal(msg.totalFields(), 5 + 1 + 6, 'body fields + count + every entry field');
+  });
+
+  test('getGroup returns a snapshot; replaceGroup writes it back; removeGroup', () => {
+    const msg = newOrderSingle().addGroup(party('A', 1)).addGroup(party('B', 11));
+
+    const first = msg.getGroup(1, FIELD.NoPartyIDs);
+    assert.equal(first.field, 453);
+    assert.equal(first.delim, 448);
+    assert.equal(first.getField(FIELD.PartyID), 'A');
+    first.setField(FIELD.PartyID, 'Z');
+    assert.equal(msg.getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID), 'A', 'snapshot is detached');
+
+    msg.replaceGroup(1, first);
+    assert.equal(msg.getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID), 'Z');
+
+    msg.removeGroup(1, FIELD.NoPartyIDs);
+    assert.equal(msg.groupCount(FIELD.NoPartyIDs), 1);
+    assert.equal(msg.getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID), 'B');
+    msg.removeGroup(FIELD.NoPartyIDs);
+    assert.equal(msg.hasGroup(FIELD.NoPartyIDs), false);
+    assert.equal(msg.isSetField(FIELD.NoPartyIDs), false, 'the count field goes with the last entry');
+  });
+
+  test('header groups (NoHops) route to the header, like header fields', () => {
+    const hop = (id: string) => new Group(FIELD.NoHops, FIELD.HopCompID).setField(FIELD.HopCompID, id);
+    const msg = newOrderSingle().addGroup(hop('HOP-1')).addGroup(hop('HOP-2'));
+    assert.equal(msg.groupCount(FIELD.NoHops), 2);
+    assert.equal(msg.hasGroup(FIELD.NoHops), true);
+    assert.equal(msg.getHeaderField(FIELD.NoHops), '2', 'the count field lives in the header');
+    assert.equal(msg.getField(FIELD.NoHops), '2', 'and auto-routes');
+    assert.equal(msg.getGroup(2, FIELD.NoHops).getField(FIELD.HopCompID), 'HOP-2');
+    assert.deepEqual(msg.fields().map(([tag]) => tag).includes(FIELD.NoHops), false, 'not a body field');
+    assert.ok(
+      msg.toString().includes(`${SOH}56=T${SOH}627=2${SOH}628=HOP-1${SOH}628=HOP-2${SOH}11=order-1${SOH}`),
+      `expected the hops after the header fields, got ${msg.toPretty()}`,
+    );
+    msg.removeGroup(FIELD.NoHops);
+    assert.equal(msg.isSetField(FIELD.NoHops), false);
+  });
+
+  test('addGroup / replaceGroup reject anything that is not a Group', () => {
+    const msg = newOrderSingle().addGroup(party('A', 1));
+    assert.throws(() => msg.addGroup({} as unknown as Group), TypeError);
+    assert.throws(() => msg.addGroup({ field: 453, delim: 448 } as unknown as Group), TypeError);
+    assert.throws(() => msg.replaceGroup(1, {} as unknown as Group), TypeError);
+    assert.equal(msg.groupCount(FIELD.NoPartyIDs), 1);
+  });
+
+  test('getGroup on a missing group throws QuickFixError FieldNotFound', () => {
+    const msg = newOrderSingle();
+    assert.throws(() => msg.getGroup(1, FIELD.NoPartyIDs), isFieldNotFound, 'no such group');
+    msg.addGroup(party('A', 1));
+    assert.throws(() => msg.getGroup(2, FIELD.NoPartyIDs), isFieldNotFound, 'index out of range');
+    assert.throws(() => msg.replaceGroup(2, party('C', 1)), isFieldNotFound, 'replace out of range');
+    assert.throws(() => msg.replaceGroup(0, party('C', 1)), isFieldNotFound, 'index 0 is not a slot');
+    assert.throws(() => msg.removeGroup(0, FIELD.NoPartyIDs), isFieldNotFound, 'remove index 0');
+    assert.throws(() => msg.removeGroup(2, FIELD.NoPartyIDs), isFieldNotFound, 'remove out of range');
+    assert.equal(msg.groupCount(FIELD.NoPartyIDs), 1, 'nothing removed');
+  });
+
+  test('replaceGroup rejects a replacement with another delimiter', () => {
+    // An entry with another delimiter does not belong to the same repeating
+    // group.
+    const msg = newOrderSingle().addGroup(party('A', 1));
+    const other = new Group(FIELD.NoPartyIDs, FIELD.PartyIDSource).setField(FIELD.PartyIDSource, 'D');
+    assert.throws(() => msg.replaceGroup(1, other), TypeError);
+    assert.equal(msg.getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID), 'A', 'entry untouched');
+    msg.replaceGroup(1, party('B', 2));
+    assert.equal(msg.getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID), 'B', 'same delimiter is accepted');
+  });
+
+  test('addGroup rejects an entry with another delimiter', () => {
+    // A 447-delimited entry after a 448-delimited one would serialize as part
+    // of the first entry (453=2|448=A|447=D|), so the count would be wrong.
+    const msg = newOrderSingle().addGroup(party('A', 1));
+    const other = new Group(FIELD.NoPartyIDs, FIELD.PartyIDSource).setField(FIELD.PartyIDSource, 'D');
+    assert.throws(() => msg.addGroup(other), TypeError);
+    assert.equal(msg.groupCount(FIELD.NoPartyIDs), 1, 'nothing added');
+    msg.addGroup(party('B', 2));
+    assert.equal(msg.groupCount(FIELD.NoPartyIDs), 2, 'same delimiter is accepted');
+    // Another count tag is another group, whatever its delimiter.
+    msg.addGroup(new Group(FIELD.NoAllocs, FIELD.AllocAccount).setField(FIELD.AllocAccount, 'X'));
+    assert.equal(msg.groupCount(FIELD.NoAllocs), 1);
+  });
+
+  test('parse with a dictionary reads each group back, nested groups included', () => {
+    const dd = loadFix44Mini();
+    const source = newOrderSingle()
+      .addGroup(party('A', 1))
+      .addGroup(
+        party('B', 11).addGroup(
+          new Group(FIELD.NoPartySubIDs, FIELD.PartySubID)
+            .setField(FIELD.PartySubID, 'desk-7')
+            .setField(FIELD.PartySubIDType, 2),
+        ),
+      );
+    const raw = source.toString();
+
+    const parsed = Message.parse(raw, { dictionary: dd });
+    assert.equal(parsed.groupCount(FIELD.NoPartyIDs), 2);
+    const a = parsed.getGroup(1, FIELD.NoPartyIDs);
+    assert.equal(a.getField(FIELD.PartyID), 'A');
+    assert.equal(a.getField(FIELD.PartyRole), '1');
+    assert.equal(a.delim, FIELD.PartyID, 'delimiter recovered from the dictionary');
+    assert.deepEqual(a.fields(), [
+      [448, 'A'],
+      [447, 'D'],
+      [452, '1'],
+    ]);
+    const b = parsed.getGroup(2, FIELD.NoPartyIDs);
+    assert.equal(b.getField(FIELD.PartyID), 'B');
+    assert.equal(b.groupCount(FIELD.NoPartySubIDs), 1);
+    assert.equal(b.getGroup(1, FIELD.NoPartySubIDs).getField(FIELD.PartySubID), 'desk-7');
+
+    // Structural parse is lossless on the wire and validates.
+    assert.equal(parsed.toString(), raw);
+    assert.doesNotThrow(() => dd.validate(parsed));
+    assert.equal(parsed.getField(FIELD.Symbol), 'AAPL', 'plain fields still readable');
+  });
+
+  test('parse with a dictionary re-emits entries in dictionary order, whatever the wire order', () => {
+    const dd = loadFix44Mini();
+    // Built with an explicit order that puts PartyRole before PartyIDSource,
+    // the opposite of the dictionary (448, 447, 452, then the sub group).
+    const raw = newOrderSingle()
+      .addGroup(
+        new Group(FIELD.NoPartyIDs, FIELD.PartyID, [448, 452, 447])
+          .setField(FIELD.PartyID, 'A')
+          .setField(FIELD.PartyRole, 1)
+          .setField(FIELD.PartyIDSource, 'D')
+          .addGroup(new Group(FIELD.NoPartySubIDs, FIELD.PartySubID).setField(FIELD.PartySubID, 'sub')),
+      )
+      .addGroup(new Group(FIELD.NoPartyIDs, FIELD.PartyID).setField(FIELD.PartyID, 'B'))
+      .toString();
+    assert.ok(raw.includes(`448=A${SOH}452=1${SOH}447=D${SOH}802=1${SOH}`), 'the wire has the custom order');
+
+    const parsed = Message.parse(raw, { dictionary: dd });
+    assert.ok(
+      parsed.toString().includes(`${SOH}453=2${SOH}448=A${SOH}447=D${SOH}452=1${SOH}802=1${SOH}523=sub${SOH}448=B${SOH}10=`),
+      `expected dictionary order, got ${parsed.toPretty()}`,
+    );
+    assert.deepEqual(parsed.getGroup(1, FIELD.NoPartyIDs).fields(), [
+      [448, 'A'],
+      [447, 'D'],
+      [452, '1'],
+      [802, '1'],
+    ]);
+
+    // A snapshot of a parsed entry keeps the dictionary order for fields added
+    // afterwards, so it can be edited and written back without reordering.
+    const b = parsed.getGroup(2, FIELD.NoPartyIDs).setField(FIELD.PartyRole, 7).setField(FIELD.PartyIDSource, 'D');
+    assert.equal(b.delim, FIELD.PartyID);
+    assert.equal(b.toString(), `448=B${SOH}447=D${SOH}452=7${SOH}`);
+    parsed.replaceGroup(2, b);
+    assert.ok(parsed.toString().includes(`448=B${SOH}447=D${SOH}452=7${SOH}10=`));
+    assert.doesNotThrow(() => dd.validate(parsed));
+  });
+
+  test('parse with a session/application dictionary pair (and validate: true)', () => {
+    const dd = loadFix44Mini();
+    const raw = newOrderSingle().addGroup(party('A', 1)).toString();
+    const parsed = Message.parse(raw, {
+      validate: true,
+      sessionDictionary: dd,
+      applicationDictionary: dd,
+    });
+    assert.equal(parsed.groupCount(FIELD.NoPartyIDs), 1);
+    assert.equal(parsed.getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID), 'A');
+  });
+
+  test('fields a dictionary declares in the header/trailer are found and edited there', () => {
+    // 5001 / 5002 are header / trailer fields only per the mini dictionary:
+    // the engine (and a dictionary-aware parse) stores them in that section,
+    // and the message routes by the session dictionary it was parsed with.
+    const dd = loadFix44Mini();
+    const raw = newOrderSingle().setHeaderField(5001, 'hdr').setTrailerField(5002, 'trl').toString();
+    const parsed = Message.parse(raw, { dictionary: dd });
+    assert.equal(parsed.getHeaderField(5001), 'hdr', 'parsed into the header');
+    assert.equal(parsed.getTrailerField(5002), 'trl', 'parsed into the trailer');
+
+    // Reads look past the body.
+    assert.equal(parsed.getField(5001), 'hdr');
+    assert.equal(parsed.getField(5002), 'trl');
+    assert.equal(parsed.isSetField(5001), true);
+    assert.equal(parsed.getFieldIfSet(5002), 'trl');
+
+    // Writes edit the field where it is, rather than adding a body duplicate.
+    parsed.setField(5001, 'edited').setField(5002, 'edited-too');
+    assert.equal(parsed.getHeaderField(5001), 'edited');
+    assert.equal(parsed.getTrailerField(5002), 'edited-too');
+    assert.deepEqual(
+      parsed.fields().filter(([tag]) => tag === 5001 || tag === 5002),
+      [],
+      'no body copy',
+    );
+    const out = parsed.toString();
+    assert.equal(out.split(`${SOH}5001=`).length, 2, `5001 once on the wire, got ${parsed.toPretty()}`);
+    assert.equal(out.split(`${SOH}5002=`).length, 2, `5002 once on the wire, got ${parsed.toPretty()}`);
+    assert.doesNotThrow(() => dd.validate(parsed));
+
+    parsed.removeField(5001);
+    assert.equal(parsed.isSetField(5001), false);
+    assert.deepEqual(parsed.headerFields().filter(([tag]) => tag === 5001), []);
+
+    // Removed and set again, it goes back to the header: the dictionary, not
+    // where the field happens to be, decides.
+    parsed.setField(5001, 'again');
+    assert.deepEqual(parsed.headerFields().filter(([tag]) => tag === 5001), [[5001, 'again']]);
+    assert.deepEqual(parsed.fields().filter(([tag]) => tag === 5001), [], 'no body copy');
+    assert.doesNotThrow(() => dd.validate(parsed));
+  });
+
+  test('without a session dictionary, a tag held nowhere is a body field', () => {
+    const dd = loadFix44Mini();
+    const raw = newOrderSingle().setHeaderField(5001, 'hdr').toString();
+
+    // Parsed flat: no dictionary to route by, so 5001 stays where the parse
+    // put it (the body), and is edited there.
+    const flat = Message.parse(raw);
+    assert.equal(flat.getField(5001), 'hdr');
+    assert.deepEqual(flat.headerFields().filter(([tag]) => tag === 5001), []);
+
+    // An application dictionary alone does not route the header either.
+    const appOnly = Message.parse(raw, { applicationDictionary: dd });
+    appOnly.removeField(5001).setField(5001, 'body');
+    assert.deepEqual(appOnly.fields().filter(([tag]) => tag === 5001), [[5001, 'body']]);
+
+    // A message built in JS: setField puts an unknown tag in the body, and
+    // setHeaderField is how a custom header field gets into the header.
+    const built = createMessage().setField(5001, 'body');
+    assert.deepEqual(built.fields(), [[5001, 'body']]);
+    built.removeField(5001).setHeaderField(5001, 'hdr');
+    assert.equal(built.getField(5001), 'hdr', 'found in the header');
+  });
+
+  test('nested entries keep their delimiter through copies (addGroup, getGroup, replaceGroup, parse)', () => {
+    // Every copy QuickFIX makes of a field map (addGroup, replaceGroup, a
+    // snapshot) stores nested entries as plain field maps, which know their
+    // fields but not their delimiter. An entry that is empty, or lacks its
+    // delimiter field, must still report it after a copy.
+    const inner = party('A', 1)
+      .addGroup(new Group(FIELD.NoPartySubIDs, FIELD.PartySubID))
+      .addGroup(new Group(FIELD.NoPartySubIDs, FIELD.PartySubID).setField(FIELD.PartySubIDType, 2));
+    const check = (entry: Group, label: string) => {
+      assert.equal(entry.groupCount(FIELD.NoPartySubIDs), 2, label);
+      const empty = entry.getGroup(1, FIELD.NoPartySubIDs);
+      assert.equal(empty.isEmpty(), true, label);
+      assert.equal(empty.delim, FIELD.PartySubID, `${label}: empty entry`);
+      const noDelim = entry.getGroup(2, FIELD.NoPartySubIDs);
+      assert.equal(noDelim.delim, FIELD.PartySubID, `${label}: entry without its delimiter`);
+      assert.equal(noDelim.setField(FIELD.PartySubID, 'late').toString(), `523=late${SOH}803=2${SOH}`, label);
+    };
+
+    const msg = createMessage().addGroup(inner);
+    check(msg.getGroup(1, FIELD.NoPartyIDs), 'addGroup + getGroup');
+    msg.replaceGroup(1, inner.setField(FIELD.PartyID, 'B'));
+    check(msg.getGroup(1, FIELD.NoPartyIDs), 'replaceGroup + getGroup');
+
+    // Through the parser, where the dictionary names the delimiter. An empty
+    // entry cannot travel the wire, so only the delimiter-less one does.
+    const raw = newOrderSingle()
+      .addGroup(party('A', 1).addGroup(new Group(FIELD.NoPartySubIDs, FIELD.PartySubID).setField(FIELD.PartySubIDType, 2)))
+      .toString();
+    assert.ok(raw.includes(`802=1${SOH}803=2${SOH}`));
+    const parsed = Message.parse(raw, { dictionary: loadFix44Mini() });
+    const sub = parsed.getGroup(1, FIELD.NoPartyIDs).getGroup(1, FIELD.NoPartySubIDs);
+    assert.equal(sub.delim, FIELD.PartySubID);
+    assert.equal(sub.getField(FIELD.PartySubIDType), '2');
+  });
+
+  test('a flat parse (no dictionary) behaves as before: no groups, fields kept flat', () => {
+    const raw = newOrderSingle().addGroup(party('A', 1)).addGroup(party('B', 11)).toString();
+    const flat = Message.parse(raw);
+    assert.equal(flat.hasGroup(FIELD.NoPartyIDs), false);
+    assert.equal(flat.groupCount(FIELD.NoPartyIDs), 0);
+    assert.equal(flat.getField(FIELD.NoPartyIDs), '2', 'the count is just a body field');
+    assert.equal(flat.isSetField(FIELD.PartyID), true, 'group fields are plain body fields');
+    assert.equal(flat.getField(FIELD.Symbol), 'AAPL');
+    assert.throws(() => flat.getGroup(1, FIELD.NoPartyIDs), isFieldNotFound);
+
+    // The repeated tags are all kept (QuickFIX keeps duplicates on a flat
+    // parse) and survive an edit + re-serialisation, sorted by tag number.
+    const tags = flat.fields().map(([tag]) => tag);
+    assert.deepEqual(
+      tags.filter((t) => t === FIELD.PartyID),
+      [448, 448],
+      'both PartyIDs are there',
+    );
+    assert.equal(flat.totalFields(), 5 + 1 + 6, 'the same number of fields as the structured message');
+    const out = flat.setField(FIELD.Text, 'hi').toString();
+    assert.ok(out.includes(`447=D${SOH}448=A${SOH}448=B${SOH}452=1${SOH}452=11${SOH}453=2${SOH}`), `got ${flat.toPretty()}`);
   });
 });

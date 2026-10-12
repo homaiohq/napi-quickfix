@@ -3,6 +3,8 @@
 
 #include <napi.h>
 
+#include <memory>
+
 #include "quickfix/DataDictionary.h"
 
 namespace napi_quickfix {
@@ -11,15 +13,29 @@ namespace napi_quickfix {
 //
 //   DataDictionary.fromFile(path): DataDictionary
 //   DataDictionary.fromString(xml): DataDictionary
-//   dd.validate(message: Message): void   (throws QuickFixError if invalid)
+//   dd.validate(message: Message, bodyOnly?: boolean): void
+//     (throws QuickFixError if invalid)
+//   dd.getVersion(): string
+//   dd.getFieldName(tag): string | undefined
+//   dd.getFieldTag(name): number | undefined
+//   dd.isField(tag): boolean
+//   dd.isMsgType(msgType): boolean
 class DataDictionaryWrap : public Napi::ObjectWrap<DataDictionaryWrap> {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
 
   explicit DataDictionaryWrap(const Napi::CallbackInfo& info);
 
-  FIX::DataDictionary& Dictionary() { return dict_; }
-  const FIX::DataDictionary& Dictionary() const { return dict_; }
+  FIX::DataDictionary& Dictionary() { return *dict_; }
+  const FIX::DataDictionary& Dictionary() const { return *dict_; }
+  // Shared ownership, for a Message that routes its fields by this dictionary
+  // and may outlive the JS DataDictionary.
+  std::shared_ptr<const FIX::DataDictionary> Shared() const { return dict_; }
+
+  // Unwrap a JS value that must be a DataDictionaryWrap; throws
+  // Napi::TypeError if not.
+  static DataDictionaryWrap* UnwrapArg(Napi::Env env, Napi::Value value,
+                                       const char* argName);
 
  private:
   static Napi::FunctionReference constructor_;
@@ -28,8 +44,14 @@ class DataDictionaryWrap : public Napi::ObjectWrap<DataDictionaryWrap> {
   static Napi::Value FromString(const Napi::CallbackInfo& info);
 
   Napi::Value Validate(const Napi::CallbackInfo& info);
+  Napi::Value GetVersion(const Napi::CallbackInfo& info);
+  Napi::Value GetFieldName(const Napi::CallbackInfo& info);
+  Napi::Value GetFieldTag(const Napi::CallbackInfo& info);
+  Napi::Value IsField(const Napi::CallbackInfo& info);
+  Napi::Value IsMsgType(const Napi::CallbackInfo& info);
 
-  FIX::DataDictionary dict_;
+  std::shared_ptr<FIX::DataDictionary> dict_ =
+      std::make_shared<FIX::DataDictionary>();
 };
 
 }  // namespace napi_quickfix

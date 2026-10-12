@@ -62,6 +62,39 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   failed construction does not lock those ids out for the rest of the process, and
   closes the engine-level log QuickFIX had already opened for it (with `log: 'file'`,
   two file streams per failed construction, which QuickFIX also leaks).
+- Repeating groups. New `Group` class (one entry of a repeating group, built from
+  its count tag and delimiter, with an optional explicit field order) and group
+  methods on `Message` and `Group`: `addGroup`, `getGroup`, `replaceGroup`,
+  `removeGroup`, `hasGroup`, `groupCount`. Groups nest. Indices are 1-based as in
+  QuickFIX; `getGroup` returns a snapshot copy, so edits are written back with
+  `replaceGroup`.
+- Dictionary-aware parsing: `Message.parse(raw, { dictionary })` and the
+  `{ sessionDictionary, applicationDictionary }` pair parse repeating groups
+  structurally. A parse without a dictionary stays flat, as before.
+- `FieldMap` surface on `Message` (and `Group`): `isSetField`, `removeField`,
+  `getFieldIfSet`, `isEmpty`, `totalFields`, `clear`, `fields()` (plus
+  `headerFields()` / `trailerFields()` on `Message`) and `[Symbol.iterator]`.
+  `Message.isEmpty()` and `clear()` cover the header, body and trailer, as in
+  QuickFIX.
+- `DataDictionary.validate(msg, bodyOnly?)`, and the introspection methods
+  `getVersion`, `getFieldName`, `getFieldTag`, `isField`, `isMsgType`. `bodyOnly`
+  is QuickFIX's `validate(msg, true)`: it skips the BeginString version check and
+  the tag/value checks of header and trailer fields, but still requires every
+  field the dictionary marks required, header and trailer included.
+- Group argument checks. A `Group` delimiter or order entry above 2^20 throws a
+  `RangeError`, since QuickFIX allocates `largestTag + 1` ints per group order,
+  and an order that lists a tag twice throws a `TypeError` (QuickFIX would rank
+  it by its last position, which can move the delimiter off the front).
+  `replaceGroup` and `removeGroup(index, tag)` throw `FieldNotFound` for a
+  missing entry, index 0 included, and `hasGroup(0, tag)` is `false`: QuickFIX
+  has no lower bound on group indices and would silently drop the call.
+  `replaceGroup` throws a `TypeError` when the replacement's delimiter differs
+  from the stored entry's, and `addGroup` when the new entry's delimiter differs
+  from the stored entries' (it would serialize as part of the previous entry,
+  leaving the count wrong); an entry QuickFIX copied as a plain field map (a
+  message it queued out of order) has no known delimiter and takes any entry.
+  `g.replaceGroup(1, g)` replaces the entry with a copy of `g` taken before the
+  entry is touched.
 
 ### Changed
 
@@ -110,9 +143,40 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   `isLogonTime(now)` likewise throw `RangeError` for an invalid `Date` or a time outside
   the `Date` range, instead of `TypeError` for the former and undefined behaviour for
   the latter.
+- **Breaking:** messages handed to engine handlers (`fromApp`, `toApp`, ...) now
+  keep the repeating groups QuickFIX parsed with the session's dictionary, and
+  groups added to an outbound message in `toApp` / `toAdmin` reach the wire. The
+  bridge used to round-trip every message through its wire string without a
+  dictionary, which flattened them. With the default `UseDataDictionary=Y`, a
+  field inside a group (e.g. `PartyID` under `NoPartyIDs`) is no longer a body
+  field: `getField(448)` now throws `FieldNotFound`; read it with
+  `getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID)`.
+- **Breaking:** a `NaN` or `±Infinity` field value (`Message.setField` /
+  `setHeaderField` / `setTrailerField`, `Group.setField`) throws a `RangeError`
+  instead of being written as `NaN` / `Infinity`.
+- **Breaking:** field tags and group indices are validated. A tag passed to a
+  setter (and a `Group` count tag / delimiter / order entry) must be a positive
+  integer; a tag passed to a reader (`Message`, `Group`, and
+  `DataDictionary.getFieldName` / `isField`) and a group index must be an
+  integer. Anything else throws a `TypeError` instead of being silently
+  truncated (`1.5` → `1`, `NaN` → `0`) or emitted on the wire
+  (`setField(0, 'x')` → `0=x`).
+- **Breaking:** `getField` / `isSetField` / `getFieldIfSet` / `setField` /
+  `removeField` route a field that only the session dictionary declares as a
+  header or trailer field (a user-defined tag, say) to that section, as the
+  parser does, instead of to the body. The dictionary is the one a message was
+  parsed with (`sessionDictionary` / `dictionary`) or, for a message handed to
+  an engine handler, the session's; such a field removed and set again in
+  `toApp` goes back to the header. On a message without one, a field the header
+  or trailer already holds is edited in place instead of getting a body
+  duplicate; a tag held nowhere is still a body field.
 
 ### Fixed
 
+- `Message.setField` / `setHeaderField` / `setTrailerField` (and `Group.setField`)
+  wrote very small or very large numbers in exponent notation (`44=1e-7`,
+  `44=1e+21`), which FIX numeric fields do not allow. Numbers are now written in
+  plain decimal (`0.0000001`).
 - A `toApp`/`toAdmin`/`fromApp`/`fromAdmin` callback that started on a network thread at
   the same instant the engine was torn down could register its reply channel after the
   teardown had woken the pending callbacks, and then wait on the frozen event loop
@@ -125,6 +189,11 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   now owns that shutdown alone, which also stops listening sockets from being closed
   twice. In exchange, stopping an acceptor now takes up to one second longer: the network
   thread notices the stop on its next 1 s poll timeout, as QuickFIX's initiator already does.
+- A nested group entry keeps its delimiter through every copy (`addGroup`,
+  `replaceGroup`, `getGroup`, the handler and `sendToTarget` paths), so an entry
+  that is empty or lacks its delimiter field reports the right `delim` and
+  `getGroup` no longer throws on it. QuickFIX copies nested entries as plain field
+  maps; the binding now rebuilds them typed.
 
 ## [0.1.0] - 2026-10-08
 
