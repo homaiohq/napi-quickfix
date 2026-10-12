@@ -244,6 +244,8 @@ export class Message {
    * `group`. Returns `this` for chaining.
    * @throws A `QuickFixError` (`fixErrorName: 'FieldNotFound'`) when that
    *   entry does not exist.
+   * @throws `TypeError` when `group.delim` differs from the stored entry's
+   *   delimiter.
    */
   replaceGroup(index: number, group: Group): this {
     this.#native.replaceGroup(index, group.nativeHandle);
@@ -252,7 +254,11 @@ export class Message {
 
   /**
    * Remove every entry of the repeating group `tag` (and its count field), or
-   * only the `index`-th entry (1-based). No-op when absent. Returns `this`.
+   * only the `index`-th entry (1-based). Returns `this`.
+   *
+   * Removing every entry of a tag that has none is a no-op.
+   * @throws A `QuickFixError` (`fixErrorName: 'FieldNotFound'`) when the
+   *   `index`-th entry does not exist.
    */
   removeGroup(tag: number): this;
   removeGroup(index: number, tag: number): this;

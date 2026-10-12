@@ -235,8 +235,8 @@ message.isEmpty(): boolean;  message.totalFields(): number;  message.clear(): th
 // Repeating groups (indices are 1-based, as in QuickFIX)
 message.addGroup(group: Group): this;               // appends a copy, maintains the count field
 message.getGroup(index: number, tag: number): Group; // snapshot copy; throws FieldNotFound if absent
-message.replaceGroup(index: number, group: Group): this;
-message.removeGroup(tag: number): this;  message.removeGroup(index: number, tag: number): this;
+message.replaceGroup(index: number, group: Group): this; // throws FieldNotFound if absent, TypeError if group.delim differs
+message.removeGroup(tag: number): this;  message.removeGroup(index: number, tag: number): this; // (index, tag) throws FieldNotFound if absent
 message.hasGroup(tag: number): boolean;  message.hasGroup(index: number, tag: number): boolean;
 message.groupCount(tag: number): number;
 
@@ -290,7 +290,7 @@ One entry of a repeating group, identified by its **count tag** (`field`, e.g.
 e.g. `448 PartyID`). Groups nest through the same `addGroup`/`getGroup` API.
 
 ```ts
-new Group(field: number, delim: number, order?: number[]); // order: full entry field order, delimiter first
+new Group(field: number, delim: number, order?: number[]); // order: full entry field order, delimiter first, no tag twice
                                                           // delim and order tags are capped at 2^20 (RangeError beyond that)
 group.field;  group.delim;                                  // read-only
 

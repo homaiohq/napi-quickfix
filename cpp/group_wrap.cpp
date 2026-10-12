@@ -1,6 +1,7 @@
 #include "group_wrap.h"
 
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "errors.h"
@@ -94,15 +95,23 @@ FIX::Group GroupWrap::MakeGroup(const Napi::CallbackInfo& info) {
     throw Napi::TypeError::New(env, "order must be an array of field tags");
   }
   // QuickFIX reads the order array up to a 0 terminator, so 0 is not a valid
-  // entry; the delimiter must come first for the sort to be meaningful.
+  // entry; the delimiter must come first for the sort to be meaningful. A tag
+  // listed twice takes its last position (message_order::setOrder overwrites
+  // its rank), which could move the delimiter off the front: rejected.
   Napi::Array arr = info[2].As<Napi::Array>();
   std::vector<int> order;
+  std::unordered_set<int> seen;
   order.reserve(arr.Length() + 1);
   for (uint32_t i = 0; i < arr.Length(); i++) {
     int tag;
     if (!fieldmap::ToInteger(arr.Get(i), tag) || tag <= 0) {
       throw Napi::TypeError::New(
           env, "order must contain only positive integer field tags");
+    }
+    if (!seen.insert(tag).second) {
+      throw Napi::TypeError::New(
+          env, "order must not list field tag " + std::to_string(tag) +
+                   " twice");
     }
     order.push_back(fieldmap::CheckOrderTag(env, tag));
   }

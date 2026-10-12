@@ -309,23 +309,37 @@ inline bool HasGroupAt(const FIX::FieldMap& map, int index, int tag) {
 
 // replaceGroup(index, group): overwrites the index-th entry (1-based) under
 // group.field() with a typed copy (FieldMap::replaceGroup would slice the
-// nested entries). The stored entry keeps its own delimiter. QuickFIX silently
-// ignores a missing slot (including index 0); we throw FieldNotFound instead
-// so a typo cannot silently drop an update.
+// nested entries). QuickFIX silently ignores a missing slot (including index
+// 0); we throw FieldNotFound instead so a typo cannot silently drop an update.
+// The stored entry keeps its own delimiter while taking the replacement's
+// field order, so a replacement with another delimiter is rejected: the entry
+// would report one delimiter and lead with another on the wire.
 template <class Select>
 Napi::Value ReplaceGroup(const Napi::CallbackInfo& info, Select select) {
   Napi::Env env = info.Env();
   int index = CoerceIndex(env, info[0]);
   GroupWrap* group = GroupWrap::UnwrapArg(env, info[1], "group");
+  const int delim = group->Group().delim();
+  int storedDelim = 0;
   NQ_TRY(env) {
     int tag = group->Group().field();
     FIX::FieldMap& map = select(tag);
     if (!HasGroupAt(map, index, tag)) {
       throw FIX::FieldNotFound(tag);
     }
-    Clone(map.getGroupRef(index, tag), group->Group());
+    FIX::FieldMap& stored = map.getGroupRef(index, tag);
+    storedDelim = DelimOf(stored);
+    // 0: an empty plain-FieldMap entry, whose delimiter is unknown
+    if (storedDelim == 0 || storedDelim == delim) {
+      Clone(stored, group->Group());
+      return env.Undefined();
+    }
   } NQ_CATCH(env)
-  return env.Undefined();
+  // Thrown outside NQ_TRY so it stays a TypeError.
+  throw Napi::TypeError::New(
+      env, "group delimiter " + std::to_string(delim) +
+               " does not match the stored entry's delimiter " +
+               std::to_string(storedDelim));
 }
 
 // The `(tag)` / `(index, tag)` argument shapes of removeGroup and hasGroup.
@@ -346,16 +360,22 @@ inline IndexAndTag CoerceIndexAndTag(const Napi::CallbackInfo& info) {
   return {true, index, CoerceTag(env, info[1])};
 }
 
-// removeGroup(tag) | removeGroup(index, tag). No-op when absent (as QuickFIX).
+// removeGroup(tag) | removeGroup(index, tag). Removing every entry of a tag
+// that has none is a no-op (as QuickFIX); removing a missing entry throws
+// FieldNotFound, as replaceGroup does, where QuickFIX would silently ignore it
+// (index 0, the 0-based typo, included).
 template <class Select>
 Napi::Value RemoveGroup(const Napi::CallbackInfo& info, Select select) {
   Napi::Env env = info.Env();
   const IndexAndTag args = CoerceIndexAndTag(info);
   NQ_TRY(env) {
-    if (args.hasIndex) {
-      select(args.tag).removeGroup(args.index, args.tag);
+    FIX::FieldMap& map = select(args.tag);
+    if (!args.hasIndex) {
+      map.removeGroup(args.tag);
+    } else if (HasGroupAt(map, args.index, args.tag)) {
+      map.removeGroup(args.index, args.tag);
     } else {
-      select(args.tag).removeGroup(args.tag);
+      throw FIX::FieldNotFound(args.tag);
     }
   } NQ_CATCH(env)
   return env.Undefined();

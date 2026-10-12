@@ -46,6 +46,10 @@ describe('Group', () => {
     assert.throws(() => new Group(453, 448, [448, 1.5]), /positive integer/);
     assert.throws(() => new Group(453, 448, [448, 'x' as unknown as number]), /positive integer/);
     assert.throws(() => new Group(453, 448, 'x' as unknown as number[]), /must be an array/);
+    // QuickFIX ranks a repeated tag by its last position, so the delimiter
+    // would no longer lead the entry on the wire.
+    assert.throws(() => new Group(453, 448, [448, 447, 448]), TypeError, 'repeated delimiter');
+    assert.throws(() => new Group(453, 448, [448, 447, 452, 447]), /twice/);
     // An empty order means "no order": delimiter first, then by tag number.
     assert.equal(new Group(453, 448, []).setField(452, 1).setField(448, 'A').toString(), `448=A${SOH}452=1${SOH}`);
   });
@@ -330,7 +334,8 @@ describe('Group', () => {
     assert.throws(() => g.removeGroup(1.5, NoPartySubIDs), TypeError);
     assert.throws(() => g.replaceGroup(1.5, new Group(NoPartySubIDs, PartySubID)), TypeError);
     assert.equal(g.groupCount(NoPartySubIDs), 1, 'nothing changed');
-    assert.doesNotThrow(() => g.removeGroup(0, NoPartySubIDs), 'an out-of-range index is a no-op, as in QuickFIX');
+    assert.throws(() => g.removeGroup(0, NoPartySubIDs), isFieldNotFound, 'index 0 is not a slot');
+    assert.throws(() => g.removeGroup(2, NoPartySubIDs), isFieldNotFound, 'index past the last entry');
     assert.equal(g.groupCount(NoPartySubIDs), 1);
   });
 
@@ -349,5 +354,6 @@ describe('Group', () => {
     assert.equal(g.hasGroup(NoPartySubIDs), false);
     assert.equal(g.isSetField(NoPartySubIDs), false, 'the count field goes with the last entry');
     assert.doesNotThrow(() => g.removeGroup(NoPartySubIDs), 'removing an absent group is a no-op');
+    assert.throws(() => g.removeGroup(1, NoPartySubIDs), isFieldNotFound, 'removing an absent entry throws');
   });
 });

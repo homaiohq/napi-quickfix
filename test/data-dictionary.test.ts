@@ -126,6 +126,14 @@ describe('DataDictionary', () => {
     assert.equal(dd.isMsgType('ZZ'), false);
   });
 
+  test('getFieldName / isField reject a tag that is not an integer', () => {
+    const dd = loadFix44Mini();
+    assert.throws(() => dd.isField(35.5), TypeError, 'must not silently check tag 35');
+    assert.throws(() => dd.isField(Number.NaN), TypeError, 'must not silently check tag 0');
+    assert.throws(() => dd.getFieldName(2 ** 32 + 35), TypeError, 'must not wrap to tag 35');
+    assert.throws(() => dd.getFieldName('35' as unknown as number), TypeError);
+  });
+
   test('fromString: the version is derived from the major/minor attributes', () => {
     const dd = DataDictionary.fromString(DICT);
     assert.equal(dd.getVersion(), 'FIX.4.4');

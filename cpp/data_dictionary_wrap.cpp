@@ -4,6 +4,7 @@
 #include <string>
 
 #include "errors.h"
+#include "field_map_ops.h"
 #include "message_wrap.h"
 
 namespace napi_quickfix {
@@ -90,7 +91,7 @@ Napi::Value DataDictionaryWrap::Validate(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   MessageWrap* msg = MessageWrap::UnwrapArg(env, info[0], "message");
   bool bodyOnly = false;
-  if (info.Length() >= 2 && !info[1].IsUndefined() && !info[1].IsNull()) {
+  if (info.Length() >= 2 && !fieldmap::IsNullish(info[1])) {
     bodyOnly = info[1].ToBoolean().Value();
   }
   NQ_TRY(env) {
@@ -112,7 +113,7 @@ Napi::Value DataDictionaryWrap::GetFieldName(const Napi::CallbackInfo& info) {
   if (info.Length() < 1 || !info[0].IsNumber()) {
     throw Napi::TypeError::New(env, "getFieldName(tag: number)");
   }
-  int tag = info[0].As<Napi::Number>().Int32Value();
+  int tag = fieldmap::CoerceTag(env, info[0]);
   NQ_TRY(env) {
     std::string name;
     if (!dict_.getFieldName(tag, name)) {
@@ -142,7 +143,7 @@ Napi::Value DataDictionaryWrap::IsField(const Napi::CallbackInfo& info) {
   if (info.Length() < 1 || !info[0].IsNumber()) {
     throw Napi::TypeError::New(env, "isField(tag: number)");
   }
-  int tag = info[0].As<Napi::Number>().Int32Value();
+  int tag = fieldmap::CoerceTag(env, info[0]);
   NQ_TRY(env) {
     return Napi::Boolean::New(env, dict_.isField(tag));
   } NQ_CATCH(env)

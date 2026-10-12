@@ -300,6 +300,21 @@ describe('Message repeating groups', () => {
     assert.throws(() => msg.getGroup(2, FIELD.NoPartyIDs), isFieldNotFound, 'index out of range');
     assert.throws(() => msg.replaceGroup(2, party('C', 1)), isFieldNotFound, 'replace out of range');
     assert.throws(() => msg.replaceGroup(0, party('C', 1)), isFieldNotFound, 'index 0 is not a slot');
+    assert.throws(() => msg.removeGroup(0, FIELD.NoPartyIDs), isFieldNotFound, 'remove index 0');
+    assert.throws(() => msg.removeGroup(2, FIELD.NoPartyIDs), isFieldNotFound, 'remove out of range');
+    assert.equal(msg.groupCount(FIELD.NoPartyIDs), 1, 'nothing removed');
+  });
+
+  test('replaceGroup rejects a replacement with another delimiter', () => {
+    // The stored entry keeps its delimiter but takes the replacement's field
+    // order, so a different delimiter would lead the entry on the wire while
+    // delim still reported the stored one.
+    const msg = newOrderSingle().addGroup(party('A', 1));
+    const other = new Group(FIELD.NoPartyIDs, FIELD.PartyIDSource).setField(FIELD.PartyIDSource, 'D');
+    assert.throws(() => msg.replaceGroup(1, other), TypeError);
+    assert.equal(msg.getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID), 'A', 'entry untouched');
+    msg.replaceGroup(1, party('B', 2));
+    assert.equal(msg.getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID), 'B', 'same delimiter is accepted');
   });
 
   test('parse with a dictionary reads each group back, nested groups included', () => {
