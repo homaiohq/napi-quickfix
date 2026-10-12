@@ -141,6 +141,9 @@ sequenceDiagram
   string. QuickFIX parsed it with the session's data dictionary, so its repeating groups are structured; re-parsing
   a string without that dictionary would flatten them, and `getGroup` in a handler (or a group added in `toApp`)
   would be lost.
+- The message also carries the **session dictionary**, so `setField` & co. route its header/trailer fields as the
+  parser does. The bridge caches, per session, a copy of the session's `DataDictionaryProvider` (which shares its
+  dictionaries' ownership) taken on the QuickFIX thread, so a message kept by JS can outlive its session safely.
 
 ---
 

@@ -74,6 +74,8 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 - `FieldMap` surface on `Message` (and `Group`): `isSetField`, `removeField`,
   `getFieldIfSet`, `isEmpty`, `totalFields`, `clear`, `fields()` (plus
   `headerFields()` / `trailerFields()` on `Message`) and `[Symbol.iterator]`.
+  `Message.isEmpty()` and `clear()` cover the header, body and trailer, as in
+  QuickFIX.
 - `DataDictionary.validate(msg, bodyOnly?)`, and the introspection methods
   `getVersion`, `getFieldName`, `getFieldTag`, `isField`, `isMsgType`.
 - Group argument checks. A `Group` delimiter or order entry above 2^20 throws a
@@ -160,9 +162,6 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   `toApp` goes back to the header. On a message without one, a field the header
   or trailer already holds is edited in place instead of getting a body
   duplicate; a tag held nowhere is still a body field.
-- **Breaking:** `Message.isEmpty()` covers the header and trailer as well as the
-  body (QuickFIX's `Message::isEmpty`), matching `clear()`; a message with only
-  header fields is no longer empty.
 
 ### Fixed
 
