@@ -227,6 +227,14 @@ describe('Message field-map API', () => {
     assert.equal(msg.isEmpty(), true);
     assert.deepEqual(msg.headerFields(), []);
   });
+
+  test('isEmpty covers the header and trailer, like clear', () => {
+    const headerOnly = createMessage().setField(FIELD.MsgType, MsgType.NewOrderSingle).setField(FIELD.SenderCompID, 'ME');
+    assert.equal(headerOnly.isEmpty(), false);
+    assert.equal(createMessage().setTrailerField(FIELD.Signature, 'x').isEmpty(), false);
+    headerOnly.clear();
+    assert.equal(headerOnly.isEmpty(), true);
+  });
 });
 
 describe('Message repeating groups', () => {
@@ -306,9 +314,8 @@ describe('Message repeating groups', () => {
   });
 
   test('replaceGroup rejects a replacement with another delimiter', () => {
-    // The stored entry keeps its delimiter but takes the replacement's field
-    // order, so a different delimiter would lead the entry on the wire while
-    // delim still reported the stored one.
+    // An entry with another delimiter does not belong to the same repeating
+    // group.
     const msg = newOrderSingle().addGroup(party('A', 1));
     const other = new Group(FIELD.NoPartyIDs, FIELD.PartyIDSource).setField(FIELD.PartyIDSource, 'D');
     assert.throws(() => msg.replaceGroup(1, other), TypeError);
@@ -405,7 +412,7 @@ describe('Message repeating groups', () => {
   test('fields a dictionary declares in the header/trailer are found and edited there', () => {
     // 5001 / 5002 are header / trailer fields only per the mini dictionary:
     // the engine (and a dictionary-aware parse) stores them in that section,
-    // and the message has no dictionary of its own to know it.
+    // and the message routes by the session dictionary it was parsed with.
     const dd = loadFix44Mini();
     const raw = newOrderSingle().setHeaderField(5001, 'hdr').setTrailerField(5002, 'trl').toString();
     const parsed = Message.parse(raw, { dictionary: dd });
@@ -436,11 +443,35 @@ describe('Message repeating groups', () => {
     assert.equal(parsed.isSetField(5001), false);
     assert.deepEqual(parsed.headerFields().filter(([tag]) => tag === 5001), []);
 
-    // A tag held nowhere is a body field, as always: the message cannot know
-    // the dictionary declares it elsewhere. Use setHeaderField for that.
+    // Removed and set again, it goes back to the header: the dictionary, not
+    // where the field happens to be, decides.
     parsed.setField(5001, 'again');
-    assert.deepEqual(parsed.headerFields().filter(([tag]) => tag === 5001), []);
-    assert.equal(parsed.fields().some(([tag, value]) => tag === 5001 && value === 'again'), true);
+    assert.deepEqual(parsed.headerFields().filter(([tag]) => tag === 5001), [[5001, 'again']]);
+    assert.deepEqual(parsed.fields().filter(([tag]) => tag === 5001), [], 'no body copy');
+    assert.doesNotThrow(() => dd.validate(parsed));
+  });
+
+  test('without a session dictionary, a tag held nowhere is a body field', () => {
+    const dd = loadFix44Mini();
+    const raw = newOrderSingle().setHeaderField(5001, 'hdr').toString();
+
+    // Parsed flat: no dictionary to route by, so 5001 stays where the parse
+    // put it (the body), and is edited there.
+    const flat = Message.parse(raw);
+    assert.equal(flat.getField(5001), 'hdr');
+    assert.deepEqual(flat.headerFields().filter(([tag]) => tag === 5001), []);
+
+    // An application dictionary alone does not route the header either.
+    const appOnly = Message.parse(raw, { applicationDictionary: dd });
+    appOnly.removeField(5001).setField(5001, 'body');
+    assert.deepEqual(appOnly.fields().filter(([tag]) => tag === 5001), [[5001, 'body']]);
+
+    // A message built in JS: setField puts an unknown tag in the body, and
+    // setHeaderField is how a custom header field gets into the header.
+    const built = createMessage().setField(5001, 'body');
+    assert.deepEqual(built.fields(), [[5001, 'body']]);
+    built.removeField(5001).setHeaderField(5001, 'hdr');
+    assert.equal(built.getField(5001), 'hdr', 'found in the header');
   });
 
   test('nested entries keep their delimiter through copies (addGroup, getGroup, replaceGroup, parse)', () => {

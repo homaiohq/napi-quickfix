@@ -126,8 +126,9 @@ inline std::string CoerceValue(Napi::Env env, Napi::Value v) {
 // (the ones QuickFIX parses with a dictionary, the ones AddGroup stores and
 // the ones Clone rebuilds), so the dynamic type normally carries it. The
 // fallback covers a plain-FieldMap entry QuickFIX itself stored (e.g. with
-// FieldMap::addGroup): its first field, which is the delimiter by definition
-// since every group order sorts it first.
+// FieldMap::addGroup, or by copying a message it queued out of order): its
+// first field, which is the delimiter when the entry holds it (every group
+// order sorts it first), and only a guess when it does not.
 inline int DelimOf(const FIX::FieldMap& stored) {
   if (const auto* g = dynamic_cast<const FIX::Group*>(&stored)) {
     return g->delim();
@@ -307,13 +308,27 @@ inline bool HasGroupAt(const FIX::FieldMap& map, int index, int tag) {
   return index >= 1 && map.hasGroup(index, tag);
 }
 
-// replaceGroup(index, group): overwrites the index-th entry (1-based) under
-// group.field() with a typed copy (FieldMap::replaceGroup would slice the
-// nested entries). QuickFIX silently ignores a missing slot (including index
-// 0); we throw FieldNotFound instead so a typo cannot silently drop an update.
-// The stored entry keeps its own delimiter while taking the replacement's
-// field order, so a replacement with another delimiter is rejected: the entry
-// would report one delimiter and lead with another on the wire.
+// The stored pointer of the index-th entry (1-based) of `tag`, which must
+// exist (HasGroupAt).
+inline FIX::FieldMap*& SlotOf(FIX::FieldMap& map, int index, int tag) {
+  FIX::FieldMap::g_iterator entries = map.g_begin();
+  while (entries->first != tag) {
+    ++entries;
+  }
+  return entries->second[index - 1];
+}
+
+// replaceGroup(index, group): swaps the index-th entry (1-based) under
+// group.field() for a typed copy of `group` (FieldMap::replaceGroup would
+// slice the nested entries). The copy is complete before the stored entry is
+// touched, so `group` may contain that entry (`g.replaceGroup(1, g)`).
+// QuickFIX silently ignores a missing slot (including index 0); we throw
+// FieldNotFound instead so a typo cannot silently drop an update.
+// A replacement whose delimiter differs from a typed stored entry's is
+// rejected, as it would not belong to the same repeating group. A plain
+// FieldMap entry (one QuickFIX copied, e.g. a message it queued out of order)
+// has no known delimiter, DelimOf's first-field fallback being a guess, so
+// any replacement is taken.
 template <class Select>
 Napi::Value ReplaceGroup(const Napi::CallbackInfo& info, Select select) {
   Napi::Env env = info.Env();
@@ -327,11 +342,13 @@ Napi::Value ReplaceGroup(const Napi::CallbackInfo& info, Select select) {
     if (!HasGroupAt(map, index, tag)) {
       throw FIX::FieldNotFound(tag);
     }
-    FIX::FieldMap& stored = map.getGroupRef(index, tag);
-    storedDelim = DelimOf(stored);
-    // 0: an empty plain-FieldMap entry, whose delimiter is unknown
-    if (storedDelim == 0 || storedDelim == delim) {
-      Clone(stored, group->Group());
+    FIX::FieldMap*& slot = SlotOf(map, index, tag);
+    const auto* typed = dynamic_cast<const FIX::Group*>(slot);
+    storedDelim = typed != nullptr ? typed->delim() : delim;
+    if (storedDelim == delim) {
+      std::unique_ptr<FIX::FieldMap> copy(CloneEntry(tag, group->Group()));
+      delete slot;
+      slot = copy.release();
       return env.Undefined();
     }
   } NQ_CATCH(env)

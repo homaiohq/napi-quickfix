@@ -59,9 +59,9 @@ DataDictionaryWrap::DataDictionaryWrap(const Napi::CallbackInfo& info)
   NQ_TRY(env) {
     if (kind == "string") {
       std::istringstream stream(payload);
-      dict_.readFromStream(stream);
+      dict_->readFromStream(stream);
     } else {  // "file"
-      dict_.readFromURL(payload);
+      dict_->readFromURL(payload);
     }
   } NQ_CATCH(env)
 }
@@ -95,7 +95,7 @@ Napi::Value DataDictionaryWrap::Validate(const Napi::CallbackInfo& info) {
     bodyOnly = info[1].ToBoolean().Value();
   }
   NQ_TRY(env) {
-    dict_.validate(msg->Message(), bodyOnly);
+    dict_->validate(msg->Message(), bodyOnly);
   } NQ_CATCH(env)
   return env.Undefined();
 }
@@ -104,7 +104,7 @@ Napi::Value DataDictionaryWrap::Validate(const Napi::CallbackInfo& info) {
 Napi::Value DataDictionaryWrap::GetVersion(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   NQ_TRY(env) {
-    return Napi::String::New(env, dict_.getVersion());
+    return Napi::String::New(env, dict_->getVersion());
   } NQ_CATCH(env)
 }
 
@@ -116,7 +116,7 @@ Napi::Value DataDictionaryWrap::GetFieldName(const Napi::CallbackInfo& info) {
   int tag = fieldmap::CoerceTag(env, info[0]);
   NQ_TRY(env) {
     std::string name;
-    if (!dict_.getFieldName(tag, name)) {
+    if (!dict_->getFieldName(tag, name)) {
       return env.Undefined();
     }
     return Napi::String::New(env, name);
@@ -131,7 +131,7 @@ Napi::Value DataDictionaryWrap::GetFieldTag(const Napi::CallbackInfo& info) {
   std::string name = info[0].As<Napi::String>().Utf8Value();
   NQ_TRY(env) {
     int tag = 0;
-    if (!dict_.getFieldTag(name, tag)) {
+    if (!dict_->getFieldTag(name, tag)) {
       return env.Undefined();
     }
     return Napi::Number::New(env, tag);
@@ -145,7 +145,7 @@ Napi::Value DataDictionaryWrap::IsField(const Napi::CallbackInfo& info) {
   }
   int tag = fieldmap::CoerceTag(env, info[0]);
   NQ_TRY(env) {
-    return Napi::Boolean::New(env, dict_.isField(tag));
+    return Napi::Boolean::New(env, dict_->isField(tag));
   } NQ_CATCH(env)
 }
 
@@ -156,7 +156,7 @@ Napi::Value DataDictionaryWrap::IsMsgType(const Napi::CallbackInfo& info) {
   }
   std::string msgType = info[0].As<Napi::String>().Utf8Value();
   NQ_TRY(env) {
-    return Napi::Boolean::New(env, dict_.isMsgType(msgType));
+    return Napi::Boolean::New(env, dict_->isMsgType(msgType));
   } NQ_CATCH(env)
 }
 

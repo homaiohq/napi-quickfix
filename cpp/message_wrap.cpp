@@ -60,10 +60,13 @@ Napi::Object MessageWrap::NewInstance(Napi::Env env, const FIX::Message& msg) {
   return obj;
 }
 
-Napi::Object MessageWrap::NewInstance(Napi::Env env, FIX::Message&& msg) {
+Napi::Object MessageWrap::NewInstance(
+    Napi::Env env, FIX::Message&& msg,
+    std::shared_ptr<const FIX::DataDictionary> sessionDictionary) {
   Napi::Object obj = constructor_.New({});
   MessageWrap* wrap = Napi::ObjectWrap<MessageWrap>::Unwrap(obj);
   wrap->message_ = std::move(msg);
+  wrap->sessionDictionary_ = std::move(sessionDictionary);
   return obj;
 }
 
@@ -99,8 +102,10 @@ MessageWrap::MessageWrap(const Napi::CallbackInfo& info)
   const FIX::DataDictionary* sessionDD = nullptr;
   const FIX::DataDictionary* appDD = nullptr;
   if (info.Length() >= 3 && !fieldmap::IsNullish(info[2])) {
-    sessionDD = &DataDictionaryWrap::UnwrapArg(env, info[2], "sessionDictionary")
-                     ->Dictionary();
+    sessionDictionary_ =
+        DataDictionaryWrap::UnwrapArg(env, info[2], "sessionDictionary")
+            ->Shared();
+    sessionDD = sessionDictionary_.get();
   }
   if (info.Length() >= 4 && !fieldmap::IsNullish(info[3])) {
     appDD = &DataDictionaryWrap::UnwrapArg(env, info[3], "applicationDictionary")
@@ -126,19 +131,20 @@ bool Holds(const FIX::FieldMap& map, int tag) {
 }  // namespace
 
 // Auto-route standard header/trailer fields (MsgType, SenderCompID, CheckSum,
-// NoHops, ...) to the right section so callers don't have to know which
-// section a well-known tag belongs to. Any other tag is a body field, unless
-// the header or trailer already holds it: a data dictionary can declare
-// further header/trailer fields, which the engine (and a dictionary-aware
-// parse) stores in that section, and the wrapper has no dictionary of its own
-// to know them. Honouring the section that holds the tag keeps reads finding
-// such a field and setField / removeField editing it in place rather than
-// adding a body duplicate. A tag held nowhere stays a body field.
+// NoHops, ...) and the ones the session dictionary declares to the right
+// section, as the parser does, so callers don't have to know which section a
+// tag belongs to, and a dictionary header field that is removed and set again
+// goes back to the header. Without a dictionary (a message built in JS or
+// parsed without one), any other tag is a body field unless the header or
+// trailer already holds it, so reads find such a field and setField /
+// removeField edit it in place rather than adding a body duplicate. A tag
+// held nowhere stays a body field.
 FIX::FieldMap& MessageWrap::SectionFor(int tag) {
-  if (FIX::Message::isHeaderField(tag)) {
+  const FIX::DataDictionary* dd = sessionDictionary_.get();
+  if (FIX::Message::isHeaderField(tag, dd)) {
     return message_.getHeader();
   }
-  if (FIX::Message::isTrailerField(tag)) {
+  if (FIX::Message::isTrailerField(tag, dd)) {
     return message_.getTrailer();
   }
   if (Holds(message_, tag)) {
@@ -193,8 +199,13 @@ Napi::Value MessageWrap::SetTrailerField(const Napi::CallbackInfo& info) {
   return fieldmap::SetField(info, NQ_TRAILER);
 }
 
+// Header, body and trailer (FIX::Message::isEmpty, not FieldMap's body-only
+// one), like clear().
 Napi::Value MessageWrap::IsEmpty(const Napi::CallbackInfo& info) {
-  return fieldmap::IsEmpty(info.Env(), message_);
+  Napi::Env env = info.Env();
+  NQ_TRY(env) {
+    return Napi::Boolean::New(env, message_.isEmpty());
+  } NQ_CATCH(env)
 }
 
 Napi::Value MessageWrap::TotalFields(const Napi::CallbackInfo& info) {

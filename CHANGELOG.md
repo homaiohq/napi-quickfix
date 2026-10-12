@@ -84,7 +84,10 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   missing entry, index 0 included, and `hasGroup(0, tag)` is `false`: QuickFIX
   has no lower bound on group indices and would silently drop the call.
   `replaceGroup` throws a `TypeError` when the replacement's delimiter differs
-  from the stored entry's.
+  from the stored entry's; an entry QuickFIX copied as a plain field map (a
+  message it queued out of order) has no known delimiter and takes any
+  replacement. `g.replaceGroup(1, g)` replaces the entry with a copy of `g`
+  taken before the entry is touched.
 
 ### Changed
 
@@ -149,10 +152,17 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   truncated (`1.5` → `1`, `NaN` → `0`) or emitted on the wire
   (`setField(0, 'x')` → `0=x`).
 - **Breaking:** `getField` / `isSetField` / `getFieldIfSet` / `setField` /
-  `removeField` find a field that only the data dictionary declares as a header
-  or trailer field (a user-defined tag, say) where the engine parsed it, instead
-  of looking in the body. `setField` edits such a field in place instead of
-  adding a body duplicate; a tag held nowhere is still a body field.
+  `removeField` route a field that only the session dictionary declares as a
+  header or trailer field (a user-defined tag, say) to that section, as the
+  parser does, instead of to the body. The dictionary is the one a message was
+  parsed with (`sessionDictionary` / `dictionary`) or, for a message handed to
+  an engine handler, the session's; such a field removed and set again in
+  `toApp` goes back to the header. On a message without one, a field the header
+  or trailer already holds is edited in place instead of getting a body
+  duplicate; a tag held nowhere is still a body field.
+- **Breaking:** `Message.isEmpty()` covers the header and trailer as well as the
+  body (QuickFIX's `Message::isEmpty`), matching `clear()`; a message with only
+  header fields is no longer empty.
 
 ### Fixed
 

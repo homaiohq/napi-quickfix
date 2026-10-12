@@ -226,6 +226,21 @@ describe('Group', () => {
     assert.equal(g.getGroup(2, NoPartySubIDs).toString(), `523=desk-2${SOH}803=2${SOH}`);
   });
 
+  test('replaceGroup with the group itself replaces the entry with a copy taken beforehand', () => {
+    // g holds a copy of itself; replacing that entry with g copies g first,
+    // so the copy is never read while it is being overwritten.
+    const g = new Group(NoPartySubIDs, PartySubID).setField(PartySubID, 'A');
+    g.addGroup(g);
+    g.replaceGroup(1, g);
+    assert.equal(g.groupCount(NoPartySubIDs), 1);
+    const entry = g.getGroup(1, NoPartySubIDs);
+    assert.equal(entry.getField(PartySubID), 'A');
+    assert.equal(entry.groupCount(NoPartySubIDs), 1, 'the copy holds the entry it replaced');
+    assert.equal(entry.getGroup(1, NoPartySubIDs).getField(PartySubID), 'A');
+    assert.equal(entry.getGroup(1, NoPartySubIDs).hasGroup(NoPartySubIDs), false);
+    assert.equal(g.toString(), `523=A${SOH}802=1${SOH}523=A${SOH}802=1${SOH}523=A${SOH}`);
+  });
+
   test('addGroup / replaceGroup reject anything that is not a Group', () => {
     const g = party('A', 1);
     assert.throws(() => g.addGroup({} as unknown as Group), TypeError);

@@ -259,8 +259,9 @@ directly.
 fields of a repeating group are kept as plain repeated body fields and
 `getGroup` throws. Pass a `dictionary` (or a `sessionDictionary` /
 `applicationDictionary` pair for FIXT/FIX 5) to parse groups structurally.
-Messages delivered to engine handlers are already parsed with the session's
-dictionary, so `getGroup` works on them directly.
+With `UseDataDictionary=Y` (the default), messages delivered to engine handlers
+are already parsed with the session's dictionary, so `getGroup` works on them
+directly; with `UseDataDictionary=N` they arrive flat.
 
 ```ts
 import { DataDictionary, Group, Message, FIELD, MsgType } from '@homaiohq/napi-quickfix';

@@ -7,12 +7,14 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 
 #include "quickfix/Application.h"
+#include "quickfix/DataDictionary.h"
 #include "quickfix/Message.h"
 #include "quickfix/SessionID.h"
 
@@ -85,6 +87,9 @@ class ApplicationBridge : public FIX::Application {
     // dictionary, and only the structured copy keeps its repeating groups for
     // the JS handler, which takes the copy over.
     FIX::Message message;
+    // The session dictionary the JS wrapper routes the message's fields by
+    // (see SessionDictionary); null when the session is gone.
+    std::shared_ptr<const FIX::DataDictionary> sessionDictionary;
     bool hasMessage = false;
     // For synchronous calls only: shared reply channel (null for fire-and-forget).
     std::shared_ptr<SyncChannel> channel;
@@ -148,6 +153,19 @@ class ApplicationBridge : public FIX::Application {
   // handled by the caller-side override, which inspects Result).
   Result CallSync(CallType type, const FIX::SessionID& id,
                   const FIX::Message& message);
+
+  // The session dictionary of `id`, shared so a JS Message can keep it past
+  // the session's lifetime: a copy of the session's DataDictionaryProvider
+  // (which shares its dictionaries' ownership) aliased to the dictionary for
+  // the session's BeginString. Built once per session, on the QuickFIX thread
+  // running the callback (the session is alive there); onCreate drops the
+  // entry so a recreated session gets its own. Null if the session is not
+  // registered.
+  std::shared_ptr<const FIX::DataDictionary> SessionDictionary(
+      const FIX::SessionID& id);
+  std::mutex dictionariesMtx_;
+  std::map<FIX::SessionID, std::shared_ptr<const FIX::DataDictionary>>
+      dictionaries_;
 
   Napi::ObjectReference handlers_;
   TSFN tsfn_;

@@ -134,10 +134,11 @@ export class Message {
 
   /**
    * Read a field by tag. Standard header/trailer tags (`MsgType`,
-   * `SenderCompID`, `CheckSum`, ...) are read from their section. Any other
-   * tag is read from the body, or from the header or trailer if that is where
-   * it is: a field a data dictionary declares in the header is found where the
-   * engine (or a dictionary-aware parse) stored it.
+   * `SenderCompID`, `CheckSum`, ...) are read from their section, and so are
+   * the header/trailer fields of the session dictionary the message was
+   * parsed with (`sessionDictionary` / `dictionary`) or delivered with (a
+   * message handed to an engine handler). Any other tag is read from the body,
+   * or from the header or trailer if that is where it is.
    * @throws A `QuickFixError` (`fixErrorName: 'FieldNotFound'`) if absent.
    */
   getField(tag: number): string {
@@ -145,11 +146,13 @@ export class Message {
   }
 
   /**
-   * Set a field. Standard header/trailer tags auto-route to their section. Any
-   * other tag is updated in place if the header or trailer already holds it
-   * (see {@link Message.getField}); otherwise it goes to the body. To put a new
-   * dictionary-declared header field in the header, use
-   * {@link Message.setHeaderField}. Returns `this` for chaining.
+   * Set a field. Standard header/trailer tags and the session dictionary's
+   * header/trailer fields auto-route to their section (see
+   * {@link Message.getField}). Any other tag is updated in place if the header
+   * or trailer already holds it; otherwise it goes to the body. On a message
+   * without a session dictionary (built with `new Message()`), put a new
+   * custom header field in the header with {@link Message.setHeaderField}.
+   * Returns `this` for chaining.
    */
   setField(tag: number, value: string | number): this {
     this.#native.setField(tag, String(value));
@@ -172,7 +175,7 @@ export class Message {
     return this.#native.getFieldIfSet(tag);
   }
 
-  /** Whether the body has no fields of its own. */
+  /** Whether the header, body and trailer have no fields of their own. */
   isEmpty(): boolean {
     return this.#native.isEmpty();
   }
@@ -229,8 +232,9 @@ export class Message {
    * message; write it back with {@link Message.replaceGroup}.
    *
    * Groups exist only on messages built with {@link Message.addGroup} or
-   * parsed with a dictionary (including every message the engine hands to
-   * your handlers); a flat parse leaves none.
+   * parsed with a dictionary, which includes every message the engine hands
+   * to your handlers when the session has `UseDataDictionary=Y` (the
+   * default); a flat parse, or `UseDataDictionary=N`, leaves none.
    *
    * @throws A `QuickFixError` (`fixErrorName: 'FieldNotFound'`) when the tag
    *   has no entries or `index` is out of range.

@@ -345,8 +345,10 @@ TargetCompID=GRP-SERVER
       acc.on('fromApp', (msg) => eventSeen.push(snapshot(msg)));
 
       // The initiator's toApp sees the OUTBOUND message with groups and may
-      // mutate it: a party added here, a plain field set here and the edit of
-      // the dictionary-declared header field must all reach the acceptor.
+      // mutate it: a party added here, a plain field set here and the
+      // dictionary-declared header field, removed and set again, must all
+      // reach the acceptor (the last one in the header: the message routes by
+      // the session's dictionary, not by where the field happens to be).
       const outbound: Seen[] = [];
       const ini = new Initiator({
         settings: SessionSettings.fromString(initiatorCfg),
@@ -358,6 +360,7 @@ TargetCompID=GRP-SERVER
             msg
               .addGroup(party('ADDED-IN-TOAPP', 3))
               .setField(FIELD.Text, 'edited-in-toApp')
+              .removeField(5001)
               .setField(5001, 'edited-in-toApp');
           },
         },

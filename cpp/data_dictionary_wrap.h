@@ -3,6 +3,8 @@
 
 #include <napi.h>
 
+#include <memory>
+
 #include "quickfix/DataDictionary.h"
 
 namespace napi_quickfix {
@@ -24,8 +26,11 @@ class DataDictionaryWrap : public Napi::ObjectWrap<DataDictionaryWrap> {
 
   explicit DataDictionaryWrap(const Napi::CallbackInfo& info);
 
-  FIX::DataDictionary& Dictionary() { return dict_; }
-  const FIX::DataDictionary& Dictionary() const { return dict_; }
+  FIX::DataDictionary& Dictionary() { return *dict_; }
+  const FIX::DataDictionary& Dictionary() const { return *dict_; }
+  // Shared ownership, for a Message that routes its fields by this dictionary
+  // and may outlive the JS DataDictionary.
+  std::shared_ptr<const FIX::DataDictionary> Shared() const { return dict_; }
 
   // Unwrap a JS value that must be a DataDictionaryWrap; throws
   // Napi::TypeError if not.
@@ -45,7 +50,8 @@ class DataDictionaryWrap : public Napi::ObjectWrap<DataDictionaryWrap> {
   Napi::Value IsField(const Napi::CallbackInfo& info);
   Napi::Value IsMsgType(const Napi::CallbackInfo& info);
 
-  FIX::DataDictionary dict_;
+  std::shared_ptr<FIX::DataDictionary> dict_ =
+      std::make_shared<FIX::DataDictionary>();
 };
 
 }  // namespace napi_quickfix

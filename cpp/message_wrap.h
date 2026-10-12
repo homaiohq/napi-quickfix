@@ -3,6 +3,9 @@
 
 #include <napi.h>
 
+#include <memory>
+
+#include "quickfix/DataDictionary.h"
 #include "quickfix/Message.h"
 
 namespace napi_quickfix {
@@ -20,19 +23,22 @@ namespace napi_quickfix {
 // Field methods (getField / setField / isSetField / removeField /
 // getFieldIfSet) and group methods (addGroup / getGroup / replaceGroup /
 // removeGroup / hasGroup / groupCount) auto-route standard header/trailer
-// tags to the right section, and any other tag to the section that already
-// holds it (body first), so a field a data dictionary declares in the header
-// is found where the engine parsed it. isEmpty / totalFields / fields read
-// the body; clear() empties all three sections.
+// tags to the right section, as well as the header/trailer fields declared by
+// the session dictionary the message was parsed or delivered with. Any other
+// tag goes to the section that already holds it (body first). isEmpty and
+// clear() cover all three sections; totalFields / fields read the body.
 class MessageWrap : public Napi::ObjectWrap<MessageWrap> {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
 
   // Build a JS MessageWrap holding a copy of `msg` (typed down to the last
   // nested group entry, see fieldmap::CloneMessage), or taking `msg` over.
-  // The ApplicationBridge trampoline moves its own copy in.
+  // The ApplicationBridge trampoline moves its own copy in, with the session
+  // dictionary that routes its fields (null: none).
   static Napi::Object NewInstance(Napi::Env env, const FIX::Message& msg);
-  static Napi::Object NewInstance(Napi::Env env, FIX::Message&& msg);
+  static Napi::Object NewInstance(
+      Napi::Env env, FIX::Message&& msg,
+      std::shared_ptr<const FIX::DataDictionary> sessionDictionary = nullptr);
 
   explicit MessageWrap(const Napi::CallbackInfo& info);
 
@@ -78,6 +84,10 @@ class MessageWrap : public Napi::ObjectWrap<MessageWrap> {
   Napi::Value GetMsgType(const Napi::CallbackInfo& info);
 
   FIX::Message message_;
+  // The session dictionary whose header/trailer fields SectionFor routes
+  // (null: none). Shared, since the message may outlive the session or the
+  // JS DataDictionary it came from.
+  std::shared_ptr<const FIX::DataDictionary> sessionDictionary_;
 };
 
 }  // namespace napi_quickfix

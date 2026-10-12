@@ -6,6 +6,8 @@
 
 #include "field_map_ops.h"
 #include "message_wrap.h"
+#include "quickfix/DataDictionaryProvider.h"
+#include "quickfix/Session.h"
 #include "session_id_wrap.h"
 
 namespace napi_quickfix {
@@ -225,6 +227,7 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
   // FIX::Group with the session dictionary, and a plain copy would slice
   // their delimiter away.
   fieldmap::CloneMessage(data->message, message);
+  data->sessionDictionary = SessionDictionary(id);
   data->hasMessage = true;
   data->channel = channel;  // shared: trampoline gets its own owning copy
 
@@ -249,7 +252,30 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
   return channel->result;
 }
 
+std::shared_ptr<const FIX::DataDictionary> ApplicationBridge::SessionDictionary(
+    const FIX::SessionID& id) {
+  std::lock_guard<std::mutex> lock(dictionariesMtx_);
+  auto found = dictionaries_.find(id);
+  if (found != dictionaries_.end()) {
+    return found->second;
+  }
+  FIX::Session* session = FIX::Session::lookupSession(id);
+  if (session == nullptr) {
+    return nullptr;
+  }
+  auto provider = std::make_shared<const FIX::DataDictionaryProvider>(
+      session->getDataDictionaryProvider());
+  std::shared_ptr<const FIX::DataDictionary> dictionary(
+      provider, &provider->getSessionDataDictionary(id.getBeginString()));
+  dictionaries_.emplace(id, dictionary);
+  return dictionary;
+}
+
 void ApplicationBridge::onCreate(const FIX::SessionID& id) {
+  {
+    std::lock_guard<std::mutex> lock(dictionariesMtx_);
+    dictionaries_.erase(id);
+  }
   FireAndForget(CallType::kOnCreate, id);
 }
 
@@ -375,7 +401,8 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
     // Hand the structured copy over to the wrapper (data is deleted by the
     // guard below): no string round-trip and no second copy, so the repeating
     // groups the engine parsed stay intact for the handler.
-    msgObj = MessageWrap::NewInstance(env, std::move(data->message));
+    msgObj = MessageWrap::NewInstance(env, std::move(data->message),
+                                      std::move(data->sessionDictionary));
     haveMsg = true;
   }
 
