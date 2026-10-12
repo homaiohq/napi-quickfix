@@ -151,6 +151,9 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   field inside a group (e.g. `PartyID` under `NoPartyIDs`) is no longer a body
   field: `getField(448)` now throws `FieldNotFound`; read it with
   `getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID)`.
+- **Breaking:** a `NaN` or `±Infinity` field value (`Message.setField` /
+  `setHeaderField` / `setTrailerField`, `Group.setField`) throws a `RangeError`
+  instead of being written as `NaN` / `Infinity`.
 - **Breaking:** field tags and group indices are validated. A tag passed to a
   setter (and a `Group` count tag / delimiter / order entry) must be a positive
   integer; a tag passed to a reader (`Message`, `Group`, and
@@ -170,6 +173,10 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ### Fixed
 
+- `Message.setField` / `setHeaderField` / `setTrailerField` (and `Group.setField`)
+  wrote very small or very large numbers in exponent notation (`44=1e-7`,
+  `44=1e+21`), which FIX numeric fields do not allow. Numbers are now written in
+  plain decimal (`0.0000001`).
 - A `toApp`/`toAdmin`/`fromApp`/`fromAdmin` callback that started on a network thread at
   the same instant the engine was torn down could register its reply channel after the
   teardown had woken the pending callbacks, and then wait on the frozen event loop

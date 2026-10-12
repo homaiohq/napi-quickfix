@@ -93,6 +93,14 @@ describe('Group', () => {
     assert.equal(g.getField(PartyRole), '11');
   });
 
+  test('writes numbers without exponent notation; rejects NaN and Infinity', () => {
+    const g = new Group(NoPartyIDs, PartyID).setField(PartyID, 1e-7).setField(PartyRole, 1e21);
+    assert.equal(g.toString(), `448=0.0000001${SOH}452=1000000000000000000000${SOH}`);
+    assert.throws(() => g.setField(PartyRole, NaN), RangeError);
+    assert.throws(() => g.setField(PartyRole, Infinity), RangeError);
+    assert.equal(g.getField(PartyRole), '1000000000000000000000', 'unchanged');
+  });
+
   test('isSetField / getFieldIfSet / removeField / isEmpty / totalFields / clear', () => {
     const g = new Group(NoPartyIDs, PartyID);
     assert.equal(g.isEmpty(), true);

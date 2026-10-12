@@ -3,6 +3,7 @@
  */
 import { native, type NativeMessage } from './native.js';
 import { Group } from './group.js';
+import { formatFieldValue } from './field-value.js';
 import type { DataDictionary } from './data-dictionary.js';
 
 /** Options controlling how a raw FIX string is parsed into a {@link Message}. */
@@ -48,7 +49,9 @@ export interface MessageJSON {
  * A FIX message.
  *
  * Field values are accepted as `string | number` on input (numbers are
- * stringified, since FIX is string-on-the-wire) and always returned as `string`.
+ * stringified, since FIX is string-on-the-wire, without exponent notation:
+ * `1e-7` is written `0.0000001`) and always returned as `string`. `NaN` and
+ * `±Infinity` throw a `RangeError`.
  *
  * @example
  * ```ts
@@ -155,7 +158,7 @@ export class Message {
    * Returns `this` for chaining.
    */
   setField(tag: number, value: string | number): this {
-    this.#native.setField(tag, String(value));
+    this.#native.setField(tag, formatFieldValue(value));
     return this;
   }
 
@@ -300,7 +303,7 @@ export class Message {
 
   /** Set a header field. Returns `this` for chaining. */
   setHeaderField(tag: number, value: string | number): this {
-    this.#native.setHeaderField(tag, String(value));
+    this.#native.setHeaderField(tag, formatFieldValue(value));
     return this;
   }
 
@@ -314,7 +317,7 @@ export class Message {
 
   /** Set a trailer field. Returns `this` for chaining. */
   setTrailerField(tag: number, value: string | number): this {
-    this.#native.setTrailerField(tag, String(value));
+    this.#native.setTrailerField(tag, formatFieldValue(value));
     return this;
   }
 

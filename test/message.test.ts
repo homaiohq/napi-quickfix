@@ -28,6 +28,35 @@ describe('Message', () => {
     assert.equal(msg.getField(FIELD.OrderQty ?? 38), '100');
   });
 
+  test('writes numbers without exponent notation, in every section', () => {
+    // FIX numeric fields allow no exponent; String(1e-7) is '1e-7'.
+    const cases: [number, string][] = [
+      [123.45, '123.45'],
+      [-7, '-7'],
+      [1e-7, '0.0000001'],
+      [-1.5e-9, '-0.0000000015'],
+      [1.23e-7, '0.000000123'],
+      [1e21, '1000000000000000000000'],
+      [-2.5e22, '-25000000000000000000000'],
+    ];
+    for (const [value, wire] of cases) {
+      const msg = new Message().setField(44, value).setHeaderField(5000, value).setTrailerField(93, value);
+      assert.equal(msg.getField(44), wire, `body ${value}`);
+      assert.equal(msg.getHeaderField(5000), wire, `header ${value}`);
+      assert.equal(msg.getTrailerField(93), wire, `trailer ${value}`);
+    }
+  });
+
+  test('rejects NaN and Infinity field values', () => {
+    const msg = new Message();
+    for (const value of [NaN, Infinity, -Infinity]) {
+      assert.throws(() => msg.setField(44, value), RangeError, `body ${value}`);
+      assert.throws(() => msg.setHeaderField(5000, value), RangeError, `header ${value}`);
+      assert.throws(() => msg.setTrailerField(93, value), RangeError, `trailer ${value}`);
+    }
+    assert.equal(msg.isEmpty(), true, 'nothing was written');
+  });
+
   test('setField is chainable (returns this)', () => {
     const msg = new Message();
     const ret = msg.setField(55, 'AAPL').setField(38, 10);

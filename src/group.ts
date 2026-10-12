@@ -3,6 +3,7 @@
  * group.
  */
 import { native, type NativeGroup } from './native.js';
+import { formatFieldValue } from './field-value.js';
 
 /**
  * One entry of a FIX repeating group.
@@ -12,9 +13,10 @@ import { native, type NativeGroup } from './native.js';
  * `448 PartyID`). Build an entry, fill its fields, then
  * {@link Message.addGroup} it; QuickFIX maintains the count field for you.
  *
- * Field values are accepted as `string | number` on input and always returned
- * as `string`, exactly as on {@link Message}. Groups nest: an entry can carry
- * its own repeating groups through the same `addGroup` / `getGroup` API.
+ * Field values are accepted as `string | number` on input (numbers are written
+ * without exponent notation) and always returned as `string`, exactly as on
+ * {@link Message}. Groups nest: an entry can carry its own repeating groups
+ * through the same `addGroup` / `getGroup` API.
  *
  * Entries read back with `getGroup` are **snapshot copies**: mutating one does
  * not change the message it came from. Write it back with
@@ -94,7 +96,7 @@ export class Group {
 
   /** Set a field. Returns `this` for chaining. */
   setField(tag: number, value: string | number): this {
-    this.#native.setField(tag, String(value));
+    this.#native.setField(tag, formatFieldValue(value));
     return this;
   }
 
