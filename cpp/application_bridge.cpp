@@ -4,6 +4,7 @@
 #include <string>
 #include <utility>
 
+#include "field_map_ops.h"
 #include "message_wrap.h"
 #include "session_id_wrap.h"
 
@@ -220,7 +221,10 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
   auto* data = new CallData();
   data->type = type;
   data->sessionID = id;
-  data->message = message;  // deep copy, groups included
+  // Deep copy, nested entries kept typed: the engine parsed them as
+  // FIX::Group with the session dictionary, and a plain copy would slice
+  // their delimiter away.
+  fieldmap::CloneMessage(data->message, message);
   data->hasMessage = true;
   data->channel = channel;  // shared: trampoline gets its own owning copy
 
@@ -368,9 +372,10 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
   Napi::Object msgObj;
   bool haveMsg = false;
   if (data->hasMessage) {
-    // Wrap a copy of the structured message: no string round-trip, so the
-    // repeating groups the engine parsed stay intact for the handler.
-    msgObj = MessageWrap::NewInstance(env, data->message);
+    // Hand the structured copy over to the wrapper (data is deleted by the
+    // guard below): no string round-trip and no second copy, so the repeating
+    // groups the engine parsed stay intact for the handler.
+    msgObj = MessageWrap::NewInstance(env, std::move(data->message));
     haveMsg = true;
   }
 

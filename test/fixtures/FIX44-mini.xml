@@ -5,7 +5,9 @@
   engine configured with UseDataDictionary=Y can log on and heartbeat), and a
   NewOrderSingle carrying the Parties repeating group (NoPartyIDs/453) with its
   nested NoPartySubIDs/802 group. Field names, tags and group layouts match the
-  upstream FIX44.xml; only the selection is reduced.
+  upstream FIX44.xml; only the selection is reduced. The two user-defined
+  fields CustomHeaderField/5001 and CustomTrailerField/5002 are additions: they
+  exercise header/trailer fields that only a dictionary declares.
 -->
 <fix type="FIX" major="4" minor="4" servicepack="0">
  <header>
@@ -20,8 +22,10 @@
   <field name="SendingTime" required="Y"/>
   <field name="OrigSendingTime" required="N"/>
   <field name="LastMsgSeqNumProcessed" required="N"/>
+  <field name="CustomHeaderField" required="N"/>
  </header>
  <trailer>
+  <field name="CustomTrailerField" required="N"/>
   <field name="CheckSum" required="Y"/>
  </trailer>
  <messages>
@@ -139,5 +143,7 @@
   <field number="789" name="NextExpectedMsgSeqNum" type="SEQNUM"/>
   <field number="802" name="NoPartySubIDs" type="NUMINGROUP"/>
   <field number="803" name="PartySubIDType" type="INT"/>
+  <field number="5001" name="CustomHeaderField" type="STRING"/>
+  <field number="5002" name="CustomTrailerField" type="STRING"/>
  </fields>
 </fix>

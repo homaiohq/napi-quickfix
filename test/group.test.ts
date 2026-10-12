@@ -253,6 +253,33 @@ describe('Group', () => {
     assert.equal(ordered.setField(PartyID, 'B').toString(), `448=B${SOH}452=7${SOH}447=D${SOH}`, 'order survives');
   });
 
+  test('nested entries keep their delimiter through copies, however deep', () => {
+    // addGroup, replaceGroup and getGroup all copy, and a copy of a field map
+    // stores its nested entries without their type. Three levels deep (the
+    // tags need not match a dictionary), the innermost entries, one empty and
+    // one lacking its delimiter, still report it.
+    const subs = party('A', 1)
+      .addGroup(new Group(NoPartySubIDs, PartySubID))
+      .addGroup(new Group(NoPartySubIDs, PartySubID).setField(PartySubIDType, 2));
+    const leg = new Group(FIELD.NoLegs, FIELD.LegSymbol).setField(FIELD.LegSymbol, 'L').addGroup(subs);
+
+    const check = (entry: Group, label: string) => {
+      const p = entry.getGroup(1, NoPartyIDs);
+      assert.equal(p.delim, PartyID, label);
+      assert.equal(p.getGroup(1, NoPartySubIDs).delim, PartySubID, `${label}: empty entry`);
+      assert.equal(p.getGroup(1, NoPartySubIDs).isEmpty(), true, label);
+      assert.equal(p.getGroup(2, NoPartySubIDs).delim, PartySubID, `${label}: entry without its delimiter`);
+      assert.equal(p.getGroup(2, NoPartySubIDs).fields().length, 1, label);
+    };
+    check(leg, 'addGroup');
+
+    const legs = new Group(FIELD.NoLegs, FIELD.LegSymbol).addGroup(leg);
+    check(legs.getGroup(1, FIELD.NoLegs), 'addGroup + getGroup');
+    legs.replaceGroup(1, leg.setField(FIELD.LegSymbol, 'M'));
+    check(legs.getGroup(1, FIELD.NoLegs), 'replaceGroup + getGroup');
+    assert.equal(legs.getGroup(1, FIELD.NoLegs).getField(FIELD.LegSymbol), 'M');
+  });
+
   test('getGroup returns a snapshot; replaceGroup writes it back', () => {
     const g = party('A', 1).addGroup(new Group(NoPartySubIDs, PartySubID).setField(PartySubID, 'desk-1'));
     const sub = g.getGroup(1, NoPartySubIDs);

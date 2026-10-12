@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "errors.h"
+#include "field_map_ops.h"
 #include "message_wrap.h"
 #include "quickfix/Exceptions.h"
 #include "quickfix/Message.h"
@@ -106,7 +107,7 @@ Napi::Value SendToTarget(const Napi::CallbackInfo& info) {
 
   // Copy the message (and session id) by value on the JS thread so the worker
   // never touches JS-owned objects.
-  FIX::Message message = msg->Message();
+  FIX::Message message = fieldmap::CloneMessage(msg->Message());
   const bool byQualifier = info.Length() < 2 || info[1].IsUndefined() ||
                            info[1].IsString();
   FIX::SessionID id;

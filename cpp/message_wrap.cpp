@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <string>
+#include <utility>
 
 #include "data_dictionary_wrap.h"
 #include "errors.h"
@@ -49,11 +50,20 @@ Napi::Object MessageWrap::Init(Napi::Env env, Napi::Object exports) {
   return exports;
 }
 
+// Both construct an empty MessageWrap then fill its (empty) FIX::Message. A
+// move keeps the nested entries typed by itself: FieldMap's move assignment
+// takes the entry pointers over.
 Napi::Object MessageWrap::NewInstance(Napi::Env env, const FIX::Message& msg) {
-  // Construct an empty MessageWrap then overwrite its FIX::Message with a copy.
   Napi::Object obj = constructor_.New({});
   MessageWrap* wrap = Napi::ObjectWrap<MessageWrap>::Unwrap(obj);
-  wrap->message_ = msg;
+  fieldmap::CloneMessage(wrap->message_, msg);
+  return obj;
+}
+
+Napi::Object MessageWrap::NewInstance(Napi::Env env, FIX::Message&& msg) {
+  Napi::Object obj = constructor_.New({});
+  MessageWrap* wrap = Napi::ObjectWrap<MessageWrap>::Unwrap(obj);
+  wrap->message_ = std::move(msg);
   return obj;
 }
 
@@ -107,14 +117,37 @@ MessageWrap::MessageWrap(const Napi::CallbackInfo& info)
   } NQ_CATCH(env)
 }
 
+namespace {
+
+bool Holds(const FIX::FieldMap& map, int tag) {
+  return map.isSetField(tag) || map.hasGroup(tag);
+}
+
+}  // namespace
+
 // Auto-route standard header/trailer fields (MsgType, SenderCompID, CheckSum,
 // NoHops, ...) to the right section so callers don't have to know which
-// section a well-known tag belongs to. Everything else is a body field.
+// section a well-known tag belongs to. Any other tag is a body field, unless
+// the header or trailer already holds it: a data dictionary can declare
+// further header/trailer fields, which the engine (and a dictionary-aware
+// parse) stores in that section, and the wrapper has no dictionary of its own
+// to know them. Honouring the section that holds the tag keeps reads finding
+// such a field and setField / removeField editing it in place rather than
+// adding a body duplicate. A tag held nowhere stays a body field.
 FIX::FieldMap& MessageWrap::SectionFor(int tag) {
   if (FIX::Message::isHeaderField(tag)) {
     return message_.getHeader();
   }
   if (FIX::Message::isTrailerField(tag)) {
+    return message_.getTrailer();
+  }
+  if (Holds(message_, tag)) {
+    return message_;
+  }
+  if (Holds(message_.getHeader(), tag)) {
+    return message_.getHeader();
+  }
+  if (Holds(message_.getTrailer(), tag)) {
     return message_.getTrailer();
   }
   return message_;

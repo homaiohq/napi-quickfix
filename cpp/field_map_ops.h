@@ -19,13 +19,16 @@
 
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "errors.h"
 #include "group_wrap.h"
 #include "quickfix/FieldMap.h"
 #include "quickfix/Group.h"
+#include "quickfix/Message.h"
 
 namespace napi_quickfix {
 namespace fieldmap {
@@ -117,14 +120,14 @@ inline std::string CoerceValue(Napi::Env env, Napi::Value v) {
   throw Napi::TypeError::New(env, "field value must be a string or number");
 }
 
-// --- group snapshots --------------------------------------------------------
+// --- typed copies -----------------------------------------------------------
 
 // The delimiter of a stored group entry. Entries are stored as FIX::Group
-// (both the ones QuickFIX parses with a dictionary and the ones AddGroup below
-// stores), so the dynamic type normally carries it. The fallback covers a
-// plain-FieldMap entry (e.g. one QuickFIX copied with FieldMap::addGroup):
-// its first field, which is the delimiter by definition since every group
-// order sorts it first.
+// (the ones QuickFIX parses with a dictionary, the ones AddGroup stores and
+// the ones Clone rebuilds), so the dynamic type normally carries it. The
+// fallback covers a plain-FieldMap entry QuickFIX itself stored (e.g. with
+// FieldMap::addGroup): its first field, which is the delimiter by definition
+// since every group order sorts it first.
 inline int DelimOf(const FIX::FieldMap& stored) {
   if (const auto* g = dynamic_cast<const FIX::Group*>(&stored)) {
     return g->delim();
@@ -135,11 +138,68 @@ inline int DelimOf(const FIX::FieldMap& stored) {
   return 0;
 }
 
-// A FIX::Group copy of a stored entry (fields, nested groups and field order).
-inline FIX::Group Snapshot(int tag, const FIX::FieldMap& stored) {
-  FIX::Group group(tag, DelimOf(stored));
-  static_cast<FIX::FieldMap&>(group) = stored;
-  return group;
+// FieldMap::operator= (hence every copy of a FIX::Message or FIX::Group,
+// FIX::Group's copy constructor included) stores each nested entry as
+// `new FieldMap(*entry)`: the fields and field order survive, but the entry's
+// FIX::Group type, and with it its delimiter, is sliced away. Clone copies
+// like operator= and then rebuilds every nested entry as a FIX::Group, so the
+// delimiter of an entry that is empty or lacks its delimiter field is not lost
+// on the way from the engine (or a JS Group) to a snapshot.
+
+// Rebuild the nested entries of `dst`, a FieldMap::operator= copy of `src`, as
+// FIX::Group. Walks the two group maps in lockstep (operator= preserves tags,
+// counts and order) and swaps each sliced entry for a typed one that takes
+// over its contents, so nothing is copied twice. The count tag is the map
+// key: a QuickFIX-parsed entry's Group::field() is its first wire tag. The
+// slot keeps its (hollowed) entry until the typed one is complete, so `dst`
+// stays consistent should an allocation throw.
+inline void RebuildGroups(FIX::FieldMap& dst, const FIX::FieldMap& src) {
+  FIX::FieldMap::g_iterator copied = dst.g_begin();
+  for (const auto& tagWithEntries : src.groups()) {
+    const int tag = tagWithEntries.first;
+    std::vector<FIX::FieldMap*>& slots = copied->second;
+    for (size_t i = 0; i < tagWithEntries.second.size(); i++) {
+      const FIX::FieldMap& original = *tagWithEntries.second[i];
+      auto typed = std::make_unique<FIX::Group>(tag, DelimOf(original));
+      static_cast<FIX::FieldMap&>(*typed) = std::move(*slots[i]);
+      RebuildGroups(*typed, original);
+      delete slots[i];
+      slots[i] = typed.release();
+    }
+    ++copied;
+  }
+}
+
+// Assign `src` to `dst` (fields, nested groups and field order), keeping every
+// nested entry a FIX::Group. `dst`'s own dynamic type is untouched: a Group
+// keeps its count tag and delimiter.
+inline void Clone(FIX::FieldMap& dst, const FIX::FieldMap& src) {
+  dst = src;
+  RebuildGroups(dst, src);
+}
+
+// Header, body and trailer of `src` into `dst`, nested entries typed.
+inline void CloneMessage(FIX::Message& dst, const FIX::Message& src) {
+  dst = src;
+  RebuildGroups(dst.getHeader(), src.getHeader());
+  RebuildGroups(dst, src);
+  RebuildGroups(dst.getTrailer(), src.getTrailer());
+}
+
+// The same, by value. FIX::Message has a move constructor (unlike FIX::Group),
+// so the returned copy stays typed whether or not the return is elided.
+inline FIX::Message CloneMessage(const FIX::Message& src) {
+  FIX::Message copy;
+  CloneMessage(copy, src);
+  return copy;
+}
+
+// A heap FIX::Group copy of an entry of the `tag` repeating group, for
+// FieldMap::addGroupPtr (which takes ownership).
+inline FIX::Group* CloneEntry(int tag, const FIX::FieldMap& entry) {
+  auto group = std::make_unique<FIX::Group>(tag, DelimOf(entry));
+  Clone(*group, entry);
+  return group.release();
 }
 
 // `[[tag, value], ...]` for the map's own fields (not its groups' fields).
@@ -213,16 +273,15 @@ Napi::Value GetFieldIfSet(const Napi::CallbackInfo& info, Select select) {
 // --- repeating-group ops (tag-routed) ---------------------------------------
 
 // addGroup(group: Group): appends a COPY of `group` under its own count tag and
-// bumps the count field. FieldMap::addGroup would slice the copy to a plain
-// FieldMap; storing a FIX::Group keeps the delimiter (see DelimOf). The map
-// takes ownership of the pointer.
+// bumps the count field. The copy is typed down to the last nested entry (see
+// Clone); the map takes ownership of the pointer.
 template <class Select>
 Napi::Value AddGroup(const Napi::CallbackInfo& info, Select select) {
   Napi::Env env = info.Env();
   GroupWrap* group = GroupWrap::UnwrapArg(env, info[0], "group");
   NQ_TRY(env) {
     int tag = group->Group().field();
-    select(tag).addGroupPtr(tag, new FIX::Group(group->Group()), true);
+    select(tag).addGroupPtr(tag, CloneEntry(tag, group->Group()), true);
   } NQ_CATCH(env)
   return env.Undefined();
 }
@@ -237,7 +296,7 @@ Napi::Value GetGroup(const Napi::CallbackInfo& info, Select select) {
   int tag = CoerceTag(env, info[1]);
   NQ_TRY(env) {
     const FIX::FieldMap& stored = select(tag).getGroupRef(index, tag);
-    return GroupWrap::NewInstance(env, Snapshot(tag, stored));
+    return GroupWrap::NewInstance(env, tag, DelimOf(stored), stored);
   } NQ_CATCH(env)
 }
 
@@ -249,8 +308,10 @@ inline bool HasGroupAt(const FIX::FieldMap& map, int index, int tag) {
 }
 
 // replaceGroup(index, group): overwrites the index-th entry (1-based) under
-// group.field(). QuickFIX silently ignores a missing slot (including index 0);
-// we throw FieldNotFound instead so a typo cannot silently drop an update.
+// group.field() with a typed copy (FieldMap::replaceGroup would slice the
+// nested entries). The stored entry keeps its own delimiter. QuickFIX silently
+// ignores a missing slot (including index 0); we throw FieldNotFound instead
+// so a typo cannot silently drop an update.
 template <class Select>
 Napi::Value ReplaceGroup(const Napi::CallbackInfo& info, Select select) {
   Napi::Env env = info.Env();
@@ -262,7 +323,7 @@ Napi::Value ReplaceGroup(const Napi::CallbackInfo& info, Select select) {
     if (!HasGroupAt(map, index, tag)) {
       throw FIX::FieldNotFound(tag);
     }
-    map.replaceGroup(index, tag, group->Group());
+    Clone(map.getGroupRef(index, tag), group->Group());
   } NQ_CATCH(env)
   return env.Undefined();
 }

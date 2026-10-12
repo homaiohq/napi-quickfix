@@ -153,6 +153,16 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   to an outbound message in `toApp` / `toAdmin` reach the wire. The bridge used to
   round-trip every message through its wire string without a dictionary, which
   flattened them.
+- `getField` / `isSetField` / `getFieldIfSet` / `setField` / `removeField` find a
+  field that only the data dictionary declares as a header or trailer field (a
+  user-defined tag, say) where the engine parsed it. `setField` edits such a field
+  in place instead of adding a body duplicate; a tag held nowhere is still a body
+  field.
+- A nested group entry keeps its delimiter through every copy (`addGroup`,
+  `replaceGroup`, `getGroup`, the handler and `sendToTarget` paths), so an entry
+  that is empty or lacks its delimiter field reports the right `delim` and
+  `getGroup` no longer throws on it. QuickFIX copies nested entries as plain field
+  maps; the binding now rebuilds them typed.
 
 ## [0.1.0] - 2026-10-08
 

@@ -41,12 +41,16 @@ Napi::Object GroupWrap::Init(Napi::Env env, Napi::Object exports) {
   return exports;
 }
 
-Napi::Object GroupWrap::NewInstance(Napi::Env env, const FIX::Group& group) {
-  Napi::Object obj = constructor_.New({Napi::Number::New(env, group.field()),
-                                       Napi::Number::New(env, group.delim())});
-  GroupWrap* wrap = Napi::ObjectWrap<GroupWrap>::Unwrap(obj);
-  wrap->group_ = group;
-  return obj;
+// The entry travels to the constructor as an External, which JS code cannot
+// forge, so the constructor can tell this internal path from a user call. The
+// pointer is only read, and only during constructor_.New (Napi::External
+// takes a non-const pointer, hence the cast).
+Napi::Object GroupWrap::NewInstance(Napi::Env env, int tag, int delim,
+                                    const FIX::FieldMap& entry) {
+  return constructor_.New(
+      {Napi::External<FIX::FieldMap>::New(env,
+                                          const_cast<FIX::FieldMap*>(&entry)),
+       Napi::Number::New(env, tag), Napi::Number::New(env, delim)});
 }
 
 GroupWrap* GroupWrap::UnwrapArg(Napi::Env env, Napi::Value value,
@@ -59,10 +63,22 @@ GroupWrap* GroupWrap::UnwrapArg(Napi::Env env, Napi::Value value,
   return Napi::ObjectWrap<GroupWrap>::Unwrap(value.As<Napi::Object>());
 }
 
-// FIX::Group has no default constructor, so the member is built from the JS
-// arguments in the initializer list.
+const FIX::FieldMap* GroupWrap::EntryArg(const Napi::CallbackInfo& info) {
+  if (info.Length() == 3 && info[0].IsExternal()) {
+    return info[0].As<Napi::External<FIX::FieldMap>>().Data();
+  }
+  return nullptr;
+}
+
+// FIX::Group has no default constructor, so the member is built from the
+// arguments in the initializer list. Returned as a prvalue: FIX::Group has no
+// move constructor, so a named return would copy (and slice nested entries).
 FIX::Group GroupWrap::MakeGroup(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (EntryArg(info) != nullptr) {
+    return FIX::Group(info[1].As<Napi::Number>().Int32Value(),
+                      info[2].As<Napi::Number>().Int32Value());
+  }
   if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
     throw Napi::TypeError::New(
         env, "new Group(field: number, delim: number, order?: number[])");
@@ -101,7 +117,11 @@ FIX::Group GroupWrap::MakeGroup(const Napi::CallbackInfo& info) {
 }
 
 GroupWrap::GroupWrap(const Napi::CallbackInfo& info)
-    : Napi::ObjectWrap<GroupWrap>(info), group_(MakeGroup(info)) {}
+    : Napi::ObjectWrap<GroupWrap>(info), group_(MakeGroup(info)) {
+  if (const FIX::FieldMap* entry = EntryArg(info)) {
+    fieldmap::Clone(group_, *entry);  // fields, order and typed nested entries
+  }
+}
 
 Napi::Value GroupWrap::Field(const Napi::CallbackInfo& info) {
   return Napi::Number::New(info.Env(), group_.field());

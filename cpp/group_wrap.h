@@ -24,8 +24,12 @@ class GroupWrap : public Napi::ObjectWrap<GroupWrap> {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
 
-  // Build a JS GroupWrap wrapping a COPY of the given FIX::Group.
-  static Napi::Object NewInstance(Napi::Env env, const FIX::Group& group);
+  // Build a JS GroupWrap holding a copy of `entry`, an entry of the `tag`
+  // repeating group delimited by `delim`. The copy keeps every nested entry
+  // typed (fieldmap::Clone), and bypasses the argument validation of the JS
+  // constructor: the entry already exists, there is nothing to validate.
+  static Napi::Object NewInstance(Napi::Env env, int tag, int delim,
+                                  const FIX::FieldMap& entry);
 
   explicit GroupWrap(const Napi::CallbackInfo& info);
 
@@ -39,6 +43,8 @@ class GroupWrap : public Napi::ObjectWrap<GroupWrap> {
  private:
   static Napi::FunctionReference constructor_;
 
+  // The entry NewInstance passes to the constructor, or null for a JS call.
+  static const FIX::FieldMap* EntryArg(const Napi::CallbackInfo& info);
   static FIX::Group MakeGroup(const Napi::CallbackInfo& info);
 
   Napi::Value Field(const Napi::CallbackInfo& info);

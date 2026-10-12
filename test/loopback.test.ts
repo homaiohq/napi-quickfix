@@ -301,8 +301,11 @@ TargetCompID=GRP-SERVER
 
       interface Seen {
         partyCount: number;
-        parties: { id: string; role: string; subIDs: string[] }[];
+        parties: { id: string; role: string; subs: { id: string | undefined; delim: number }[] }[];
         text: string | undefined;
+        // 5001 is a header field per the mini dictionary only; read with the
+        // plain getter, which must find it where the engine put it.
+        customHeader: string | undefined;
         raw: string;
       }
       const snapshot = (msg: Message): Seen => {
@@ -310,13 +313,20 @@ TargetCompID=GRP-SERVER
         const parties: Seen['parties'] = [];
         for (let i = 1; i <= partyCount; i++) {
           const p = msg.getGroup(i, FIELD.NoPartyIDs);
-          const subIDs: string[] = [];
+          const subs: Seen['parties'][number]['subs'] = [];
           for (let j = 1; j <= p.groupCount(FIELD.NoPartySubIDs); j++) {
-            subIDs.push(p.getGroup(j, FIELD.NoPartySubIDs).getField(FIELD.PartySubID));
+            const sub = p.getGroup(j, FIELD.NoPartySubIDs);
+            subs.push({ id: sub.getFieldIfSet(FIELD.PartySubID), delim: sub.delim });
           }
-          parties.push({ id: p.getField(FIELD.PartyID), role: p.getField(FIELD.PartyRole), subIDs });
+          parties.push({ id: p.getField(FIELD.PartyID), role: p.getField(FIELD.PartyRole), subs });
         }
-        return { partyCount, parties, text: msg.getFieldIfSet(FIELD.Text), raw: msg.toString() };
+        return {
+          partyCount,
+          parties,
+          text: msg.getFieldIfSet(FIELD.Text),
+          customHeader: msg.getFieldIfSet(5001),
+          raw: msg.toString(),
+        };
       };
 
       // The acceptor's handler and event see the inbound message with groups.
@@ -335,8 +345,8 @@ TargetCompID=GRP-SERVER
       acc.on('fromApp', (msg) => eventSeen.push(snapshot(msg)));
 
       // The initiator's toApp sees the OUTBOUND message with groups and may
-      // mutate it: a party added here and a plain field set here must both
-      // reach the acceptor.
+      // mutate it: a party added here, a plain field set here and the edit of
+      // the dictionary-declared header field must all reach the acceptor.
       const outbound: Seen[] = [];
       const ini = new Initiator({
         settings: SessionSettings.fromString(initiatorCfg),
@@ -345,7 +355,10 @@ TargetCompID=GRP-SERVER
         handlers: {
           toApp(msg) {
             outbound.push(snapshot(msg));
-            msg.addGroup(party('ADDED-IN-TOAPP', 3)).setField(FIELD.Text, 'edited-in-toApp');
+            msg
+              .addGroup(party('ADDED-IN-TOAPP', 3))
+              .setField(FIELD.Text, 'edited-in-toApp')
+              .setField(5001, 'edited-in-toApp');
           },
         },
       });
@@ -364,7 +377,14 @@ TargetCompID=GRP-SERVER
           .setField(FIELD.Side, Side.Buy)
           .setField(FIELD.TransactTime, '20260101-00:00:00')
           .setField(FIELD.OrdType, '1')
-          .addGroup(party('TRADER-1', 11))
+          .setHeaderField(5001, 'hdr')
+          // A sub-ID entry without its delimiter field: only the dictionary
+          // (and the Group it was built from) knows the delimiter is 523.
+          .addGroup(
+            party('TRADER-1', 11).addGroup(
+              new Group(FIELD.NoPartySubIDs, FIELD.PartySubID).setField(FIELD.PartySubIDType, 7),
+            ),
+          )
           .addGroup(
             party('FIRM-7', 1).addGroup(
               new Group(FIELD.NoPartySubIDs, FIELD.PartySubID)
@@ -382,29 +402,35 @@ TargetCompID=GRP-SERVER
         }
         assert.equal(received.length, 1, 'acceptor fromApp should have received the order');
 
-        // Outbound: toApp saw the two parties we built, structurally, and no
-        // Text yet.
+        // Outbound: toApp saw the two parties we built, structurally (the
+        // delimiter-less sub entry included), the header field, and no Text
+        // yet.
         assert.equal(outbound.length, 1);
         assert.equal(outbound[0].partyCount, 2);
-        assert.deepEqual(
-          outbound[0].parties.map((p) => p.id),
-          ['TRADER-1', 'FIRM-7'],
-        );
+        assert.deepEqual(outbound[0].parties, [
+          { id: 'TRADER-1', role: '11', subs: [{ id: undefined, delim: FIELD.PartySubID }] },
+          { id: 'FIRM-7', role: '1', subs: [{ id: 'desk-7', delim: FIELD.PartySubID }] },
+        ]);
         assert.equal(outbound[0].text, undefined);
+        assert.equal(outbound[0].customHeader, 'hdr');
 
         // Inbound: the acceptor sees all three parties (two built + one added
-        // in toApp), each with its fields and the nested sub-ID group.
+        // in toApp), each with its fields and the nested sub-ID group, and
+        // the header field as edited in toApp (in place: once on the wire).
         const seen = received[0];
         assert.equal(seen.partyCount, 3);
         assert.equal(seen.text, 'edited-in-toApp', 'the plain-field edit in toApp reached the wire too');
+        assert.equal(seen.customHeader, 'edited-in-toApp');
+        assert.equal(seen.raw.split('\x015001=').length, 2, `5001 once, got ${seen.raw.replace(/\x01/g, '|')}`);
+        assert.ok(seen.raw.indexOf('\x015001=') < seen.raw.indexOf('\x0111='), 'in the header');
         assert.deepEqual(seen.parties, [
-          { id: 'TRADER-1', role: '11', subIDs: [] },
-          { id: 'FIRM-7', role: '1', subIDs: ['desk-7'] },
-          { id: 'ADDED-IN-TOAPP', role: '3', subIDs: [] },
+          { id: 'TRADER-1', role: '11', subs: [{ id: undefined, delim: FIELD.PartySubID }] },
+          { id: 'FIRM-7', role: '1', subs: [{ id: 'desk-7', delim: FIELD.PartySubID }] },
+          { id: 'ADDED-IN-TOAPP', role: '3', subs: [] },
         ]);
         assert.ok(
           seen.raw.includes(
-            '\x01453=3\x01448=TRADER-1\x01447=D\x01452=11\x01448=FIRM-7\x01447=D\x01452=1\x01802=1\x01523=desk-7\x01803=2\x01448=ADDED-IN-TOAPP\x01447=D\x01452=3\x01',
+            '\x01453=3\x01448=TRADER-1\x01447=D\x01452=11\x01802=1\x01803=7\x01448=FIRM-7\x01447=D\x01452=1\x01802=1\x01523=desk-7\x01803=2\x01448=ADDED-IN-TOAPP\x01447=D\x01452=3\x01',
           ),
           `expected the group block contiguous on the wire, got ${seen.raw.replace(/\x01/g, '|')}`,
         );

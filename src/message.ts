@@ -133,9 +133,11 @@ export class Message {
   }
 
   /**
-   * Read a field by tag. Well-known header/trailer tags (`MsgType`,
-   * `SenderCompID`, `CheckSum`, ...) are read from their section; everything
-   * else from the body.
+   * Read a field by tag. Standard header/trailer tags (`MsgType`,
+   * `SenderCompID`, `CheckSum`, ...) are read from their section. Any other
+   * tag is read from the body, or from the header or trailer if that is where
+   * it is: a field a data dictionary declares in the header is found where the
+   * engine (or a dictionary-aware parse) stored it.
    * @throws A `QuickFixError` (`fixErrorName: 'FieldNotFound'`) if absent.
    */
   getField(tag: number): string {
@@ -143,8 +145,11 @@ export class Message {
   }
 
   /**
-   * Set a field. Well-known header/trailer tags auto-route to their section;
-   * everything else goes to the body. Returns `this` for chaining.
+   * Set a field. Standard header/trailer tags auto-route to their section. Any
+   * other tag is updated in place if the header or trailer already holds it
+   * (see {@link Message.getField}); otherwise it goes to the body. To put a new
+   * dictionary-declared header field in the header, use
+   * {@link Message.setHeaderField}. Returns `this` for chaining.
    */
   setField(tag: number, value: string | number): this {
     this.#native.setField(tag, String(value));

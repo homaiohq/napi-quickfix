@@ -387,6 +387,82 @@ describe('Message repeating groups', () => {
     assert.equal(parsed.getGroup(1, FIELD.NoPartyIDs).getField(FIELD.PartyID), 'A');
   });
 
+  test('fields a dictionary declares in the header/trailer are found and edited there', () => {
+    // 5001 / 5002 are header / trailer fields only per the mini dictionary:
+    // the engine (and a dictionary-aware parse) stores them in that section,
+    // and the message has no dictionary of its own to know it.
+    const dd = loadFix44Mini();
+    const raw = newOrderSingle().setHeaderField(5001, 'hdr').setTrailerField(5002, 'trl').toString();
+    const parsed = Message.parse(raw, { dictionary: dd });
+    assert.equal(parsed.getHeaderField(5001), 'hdr', 'parsed into the header');
+    assert.equal(parsed.getTrailerField(5002), 'trl', 'parsed into the trailer');
+
+    // Reads look past the body.
+    assert.equal(parsed.getField(5001), 'hdr');
+    assert.equal(parsed.getField(5002), 'trl');
+    assert.equal(parsed.isSetField(5001), true);
+    assert.equal(parsed.getFieldIfSet(5002), 'trl');
+
+    // Writes edit the field where it is, rather than adding a body duplicate.
+    parsed.setField(5001, 'edited').setField(5002, 'edited-too');
+    assert.equal(parsed.getHeaderField(5001), 'edited');
+    assert.equal(parsed.getTrailerField(5002), 'edited-too');
+    assert.deepEqual(
+      parsed.fields().filter(([tag]) => tag === 5001 || tag === 5002),
+      [],
+      'no body copy',
+    );
+    const out = parsed.toString();
+    assert.equal(out.split(`${SOH}5001=`).length, 2, `5001 once on the wire, got ${parsed.toPretty()}`);
+    assert.equal(out.split(`${SOH}5002=`).length, 2, `5002 once on the wire, got ${parsed.toPretty()}`);
+    assert.doesNotThrow(() => dd.validate(parsed));
+
+    parsed.removeField(5001);
+    assert.equal(parsed.isSetField(5001), false);
+    assert.deepEqual(parsed.headerFields().filter(([tag]) => tag === 5001), []);
+
+    // A tag held nowhere is a body field, as always: the message cannot know
+    // the dictionary declares it elsewhere. Use setHeaderField for that.
+    parsed.setField(5001, 'again');
+    assert.deepEqual(parsed.headerFields().filter(([tag]) => tag === 5001), []);
+    assert.equal(parsed.fields().some(([tag, value]) => tag === 5001 && value === 'again'), true);
+  });
+
+  test('nested entries keep their delimiter through copies (addGroup, getGroup, replaceGroup, parse)', () => {
+    // Every copy QuickFIX makes of a field map (addGroup, replaceGroup, a
+    // snapshot) stores nested entries as plain field maps, which know their
+    // fields but not their delimiter. An entry that is empty, or lacks its
+    // delimiter field, must still report it after a copy.
+    const inner = party('A', 1)
+      .addGroup(new Group(FIELD.NoPartySubIDs, FIELD.PartySubID))
+      .addGroup(new Group(FIELD.NoPartySubIDs, FIELD.PartySubID).setField(FIELD.PartySubIDType, 2));
+    const check = (entry: Group, label: string) => {
+      assert.equal(entry.groupCount(FIELD.NoPartySubIDs), 2, label);
+      const empty = entry.getGroup(1, FIELD.NoPartySubIDs);
+      assert.equal(empty.isEmpty(), true, label);
+      assert.equal(empty.delim, FIELD.PartySubID, `${label}: empty entry`);
+      const noDelim = entry.getGroup(2, FIELD.NoPartySubIDs);
+      assert.equal(noDelim.delim, FIELD.PartySubID, `${label}: entry without its delimiter`);
+      assert.equal(noDelim.setField(FIELD.PartySubID, 'late').toString(), `523=late${SOH}803=2${SOH}`, label);
+    };
+
+    const msg = createMessage().addGroup(inner);
+    check(msg.getGroup(1, FIELD.NoPartyIDs), 'addGroup + getGroup');
+    msg.replaceGroup(1, inner.setField(FIELD.PartyID, 'B'));
+    check(msg.getGroup(1, FIELD.NoPartyIDs), 'replaceGroup + getGroup');
+
+    // Through the parser, where the dictionary names the delimiter. An empty
+    // entry cannot travel the wire, so only the delimiter-less one does.
+    const raw = newOrderSingle()
+      .addGroup(party('A', 1).addGroup(new Group(FIELD.NoPartySubIDs, FIELD.PartySubID).setField(FIELD.PartySubIDType, 2)))
+      .toString();
+    assert.ok(raw.includes(`802=1${SOH}803=2${SOH}`));
+    const parsed = Message.parse(raw, { dictionary: loadFix44Mini() });
+    const sub = parsed.getGroup(1, FIELD.NoPartyIDs).getGroup(1, FIELD.NoPartySubIDs);
+    assert.equal(sub.delim, FIELD.PartySubID);
+    assert.equal(sub.getField(FIELD.PartySubIDType), '2');
+  });
+
   test('a flat parse (no dictionary) behaves as before: no groups, fields kept flat', () => {
     const raw = newOrderSingle().addGroup(party('A', 1)).addGroup(party('B', 11)).toString();
     const flat = Message.parse(raw);

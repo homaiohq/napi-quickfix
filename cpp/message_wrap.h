@@ -19,16 +19,20 @@ namespace napi_quickfix {
 //
 // Field methods (getField / setField / isSetField / removeField /
 // getFieldIfSet) and group methods (addGroup / getGroup / replaceGroup /
-// removeGroup / hasGroup / groupCount) auto-route well-known header/trailer
-// tags to the right section. isEmpty / totalFields / fields read the body;
-// clear() empties all three sections.
+// removeGroup / hasGroup / groupCount) auto-route standard header/trailer
+// tags to the right section, and any other tag to the section that already
+// holds it (body first), so a field a data dictionary declares in the header
+// is found where the engine parsed it. isEmpty / totalFields / fields read
+// the body; clear() empties all three sections.
 class MessageWrap : public Napi::ObjectWrap<MessageWrap> {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
 
-  // Build a JS MessageWrap wrapping a COPY of the given FIX::Message. Used by
-  // the ApplicationBridge trampoline to hand messages to JS handlers.
+  // Build a JS MessageWrap holding a copy of `msg` (typed down to the last
+  // nested group entry, see fieldmap::CloneMessage), or taking `msg` over.
+  // The ApplicationBridge trampoline moves its own copy in.
   static Napi::Object NewInstance(Napi::Env env, const FIX::Message& msg);
+  static Napi::Object NewInstance(Napi::Env env, FIX::Message&& msg);
 
   explicit MessageWrap(const Napi::CallbackInfo& info);
 
@@ -43,7 +47,7 @@ class MessageWrap : public Napi::ObjectWrap<MessageWrap> {
  private:
   static Napi::FunctionReference constructor_;
 
-  // The section (header / body / trailer) that owns a well-known tag.
+  // The section (header / body / trailer) that owns `tag`.
   FIX::FieldMap& SectionFor(int tag);
 
   Napi::Value GetField(const Napi::CallbackInfo& info);

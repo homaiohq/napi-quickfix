@@ -219,6 +219,9 @@ Message.parse(raw: string, opts?: MessageParseOptions): Message;
 
 message.setField(tag: number, value: string | number): this; // chainable, auto-routes header/trailer fields
 message.getField(tag: number): string;           // throws QuickFixError (FieldNotFound) if absent
+// Standard header/trailer tags route to their section. Any other tag is a body field, unless the
+// header or trailer already holds it (a field a dictionary declares there): then it is read and
+// edited in place. A new dictionary-declared header field goes in with setHeaderField.
 message.getFieldIfSet(tag: number): string | undefined;
 message.isSetField(tag: number): boolean;
 message.removeField(tag: number): this;
