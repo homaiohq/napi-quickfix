@@ -77,8 +77,10 @@ const FIX::FieldMap* GroupWrap::EntryArg(const Napi::CallbackInfo& info) {
 FIX::Group GroupWrap::MakeGroup(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (EntryArg(info) != nullptr) {
+    // The constructor body clones the entry, field order included, over it.
     return FIX::Group(info[1].As<Napi::Number>().Int32Value(),
-                      info[2].As<Napi::Number>().Int32Value());
+                      info[2].As<Napi::Number>().Int32Value(),
+                      fieldmap::PlaceholderOrder());
   }
   if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
     throw Napi::TypeError::New(

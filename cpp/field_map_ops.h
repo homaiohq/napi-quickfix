@@ -139,6 +139,15 @@ inline int DelimOf(const FIX::FieldMap& stored) {
   return 0;
 }
 
+// The field order a FIX::Group is built with when its contents, field order
+// included, are assigned over it right after (Clone, RebuildGroups' move).
+// Group(field, delim) would build message_order(delim, 0), allocating and
+// zero-filling delim + 1 ints only to discard them, and delim may be DelimOf's
+// first-field guess, which kMaxOrderTag does not bound.
+inline FIX::message_order PlaceholderOrder() {
+  return FIX::message_order(FIX::message_order::normal);
+}
+
 // FieldMap::operator= (hence every copy of a FIX::Message or FIX::Group,
 // FIX::Group's copy constructor included) stores each nested entry as
 // `new FieldMap(*entry)`: the fields and field order survive, but the entry's
@@ -161,7 +170,8 @@ inline void RebuildGroups(FIX::FieldMap& dst, const FIX::FieldMap& src) {
     std::vector<FIX::FieldMap*>& slots = copied->second;
     for (size_t i = 0; i < tagWithEntries.second.size(); i++) {
       const FIX::FieldMap& original = *tagWithEntries.second[i];
-      auto typed = std::make_unique<FIX::Group>(tag, DelimOf(original));
+      auto typed = std::make_unique<FIX::Group>(tag, DelimOf(original),
+                                                PlaceholderOrder());
       static_cast<FIX::FieldMap&>(*typed) = std::move(*slots[i]);
       RebuildGroups(*typed, original);
       delete slots[i];
@@ -198,7 +208,8 @@ inline FIX::Message CloneMessage(const FIX::Message& src) {
 // A heap FIX::Group copy of an entry of the `tag` repeating group, for
 // FieldMap::addGroupPtr (which takes ownership).
 inline FIX::Group* CloneEntry(int tag, const FIX::FieldMap& entry) {
-  auto group = std::make_unique<FIX::Group>(tag, DelimOf(entry));
+  auto group = std::make_unique<FIX::Group>(tag, DelimOf(entry),
+                                              PlaceholderOrder());
   Clone(*group, entry);
   return group.release();
 }
