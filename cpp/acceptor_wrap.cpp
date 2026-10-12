@@ -94,7 +94,7 @@ AcceptorWrap::AcceptorWrap(const Napi::CallbackInfo& info)
 
     RejectDuplicateSessions(settings, "acceptor");
     try {
-      acceptor_ = std::make_unique<FIX::SocketAcceptor>(
+      acceptor_ = std::make_unique<SocketAcceptor>(
           *bridge_, *storeFactory_, settings, *logFactory_);
     } catch (...) {
       // A [SESSION] after the first valid one threw: QuickFIX has leaked the
@@ -137,7 +137,8 @@ void AcceptorWrap::Teardown(bool force) {
   //      destroyed under its FIX::Acceptor::stop() / gate freeze. Hence the
   //      early return is keyed on tornDown_, not on stopped_.
   //   3. stop(force): joins the QuickFIX network threads (a no-op if the
-  //      worker's stop() completed).
+  //      worker's stop() completed). That join lasts until the network thread's
+  //      next poll timeout, up to 1 s (see SocketAcceptor in the header).
   //   4. Abort the TSFN: safe now that no producer thread remains.
   if (tornDown_) return;
   tornDown_ = true;

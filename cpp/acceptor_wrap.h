@@ -18,6 +18,31 @@
 
 namespace napi_quickfix {
 
+// FIX::SocketAcceptor whose stop() leaves the SocketServer to the acceptor's
+// own network thread. QuickFIX's onStop() runs on the STOPPING thread (the stop
+// worker, or the JS thread in Teardown()) right after FIX::Acceptor::stop()
+// sets the stop flag, and calls m_pServer->close(). That close shuts the
+// listening socket down, which wakes the network thread's poll(), and the
+// network thread -- now seeing the stop flag -- leaves its loop, closes the
+// server again and DELETES it. Nothing orders the two: a stopping thread
+// preempted inside close() resumes on the freed SocketServer and walks its
+// freed socket map (SIGSEGV in std::_Rb_tree_increment, issue #24). Even when
+// it wins, the two close() calls close the same descriptor numbers twice, and
+// the second may hit a descriptor the process has reopened in between.
+//
+// With onStop() a no-op -- as FIX::SocketInitiator's already is -- only the
+// network thread touches the server: it sees the stop flag once its poll()
+// times out (SocketServer's 1 s timeout), and stop() waits for that in its
+// thread join. onStop() is private in FIX::SocketAcceptor but virtual (pure in
+// FIX::Acceptor), so it can be overridden here.
+class SocketAcceptor final : public FIX::SocketAcceptor {
+ public:
+  using FIX::SocketAcceptor::SocketAcceptor;
+
+ private:
+  void onStop() override {}
+};
+
 // Napi::ObjectWrap over FIX::SocketAcceptor. Mirrors InitiatorWrap.
 //
 //   new Acceptor({ settings, handlers?, store?, log? })
