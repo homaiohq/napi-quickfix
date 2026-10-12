@@ -91,8 +91,10 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   (`engine.getSession(id)`); `stop(true)` discards the events still queued and destroys
   the engine immediately. If `stop()` fails, the engine is left intact (so it can be
   stopped again) rather than destroyed with its network thread possibly still running.
-  A `sendToTarget()` still in flight when `stop()` is called always completes before
-  the sessions are destroyed, and `engine.getSession()` / `engine.isLoggedOn(id)` keep
+  A `sendToTarget()` that has already reached its session when `stop()` is called
+  completes before the sessions are destroyed; one still queued on the thread pool at
+  that point rejects with `SessionNotFound` rather than being delivered through a later
+  engine reusing the same `SessionID`. `engine.getSession()` / `engine.isLoggedOn(id)` keep
   answering until `stop()` settles (e.g. from a `'logout'` listener fired by a graceful
   stop). A `stop()` called while one is in flight returns that stop's Promise, so it
   never settles before the sessions are gone. `stop()` on a never-started engine is

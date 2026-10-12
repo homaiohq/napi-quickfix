@@ -236,7 +236,10 @@ holds the returned `OpScope` for its whole `Execute()`; no registered gate
 means no engine owns the session, reported as `SessionNotFound`. `Acquire` re-reads the registry *after* the scope
 is held and keeps it only if the same gate is still the owner: constructing the scope may have blocked across the
 owner's destruction, and a new engine may own the id by then — holding the old gate would let the new engine's
-`stop()` destroy the session mid-operation. The engine's stop worker — on its **own** libuv thread, after `stop()`
+`stop()` destroy the session mid-operation. In that case the operation is refused (`SessionNotFound`), not retried
+against the new owner: it was queued for the engine that is gone, and sending it through the new engine's session
+(not logged on, so persisted in its store and sent on its first logon) would be the cross-over `SessionWrap::Resolve()`
+refuses for `Session` handles. The engine's stop worker — on its **own** libuv thread, after `stop()`
 has joined the network threads — calls `Freeze()` on *its* gate, which blocks new operations on *its* sessions and
 waits for the in-flight ones to drain. Waiting on the worker thread rather than on the JS thread matters: an
 in-flight `sendToTarget()` may be blocked in a `toApp` `BlockingCall`, which needs the JS loop free. A never-started

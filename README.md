@@ -281,11 +281,14 @@ settles the engine's sessions are destroyed: `getSession` returns `undefined` an
 any `Session` handle you still hold throws `SessionNotFound`. Until then they are
 still live: a graceful `stop()` settles only after the `'logout'` events it
 triggered have been delivered, so a `'logout'` listener can still read the
-session, and a `sendToTarget()` already in flight always completes before the
-sessions go away. `stop(true)` discards the events still queued and destroys the
-sessions right away. A `stop()` called while another is still in flight (from
-that `'logout'` listener, say) returns the same Promise, so it too settles only
-once the sessions are gone; the first call's `force` applies to both.
+session, and a `sendToTarget()` that has already reached its session completes
+before the sessions go away. One still queued on the thread pool when `stop()`
+freezes them rejects with `SessionNotFound` instead: it is never delivered
+through a later engine that reuses the same `SessionID`. `stop(true)` discards
+the events still queued and destroys the sessions right away. A `stop()` called
+while another is still in flight (from that `'logout'` listener, say) returns
+the same Promise, so it too settles only once the sessions are gone; the first
+call's `force` applies to both.
 
 Two live engines cannot share a `SessionID`: constructing one whose session
 already exists in the process throws a `ConfigError` ("Duplicate Session") until
