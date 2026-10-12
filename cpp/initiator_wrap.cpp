@@ -372,9 +372,15 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
             bridge->RunAfterQueued(env, [self, s, settle](Napi::Env e) {
               if (e == nullptr) {
                 // Discarded: the environment is being torn down. The wrap's
-                // own teardown destroys the engine; nothing JS-side is safe
-                // here, the promise reference included.
-                self->stopPromise_.SuppressDestruct();
+                // own teardown (cleanup hook, then destructor) destroys the
+                // engine; touch nothing but the settlement, which this
+                // closure owns. In particular do not reach through `self`:
+                // what keeps the wrap alive until here is the TSFN's
+                // reference on the napi_env (the env -- and with it every
+                // ObjectWrap finalizer -- is deleted only after the TSFN has
+                // dropped its queue), a Node internal this code must not
+                // lean on. The promise reference needs no special care: the
+                // wrap destructor deletes it, and runs with the env valid.
                 s->Abandon();
                 return;
               }
