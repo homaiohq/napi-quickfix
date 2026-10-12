@@ -118,6 +118,13 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   teardown had woken the pending callbacks, and then wait on the frozen event loop
   (a hang on exit, or in `stop()`). The registration now re-checks the teardown flag
   under the same lock the wake-up takes, so the callback passes through instead.
+- `Acceptor.stop()` could crash the process with `SIGSEGV` (#24). QuickFIX's
+  `SocketAcceptor` closes its socket server from the stopping thread while its own
+  network thread, woken by that close, closes the server again and deletes it; a stopping
+  thread preempted mid-close then read the freed server. The acceptor's network thread
+  now owns that shutdown alone, which also stops listening sockets from being closed
+  twice. In exchange, stopping an acceptor now takes up to one second longer: the network
+  thread notices the stop on its next 1 s poll timeout, as QuickFIX's initiator already does.
 
 ## [0.1.0] - 2026-10-08
 
