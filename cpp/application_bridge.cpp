@@ -101,10 +101,6 @@ bool ApplicationBridge::RunAfterQueued(Napi::Env env,
   if (released_ || inactive_.load(std::memory_order_acquire)) {
     return false;
   }
-  // The loop must not exit before the barrier has run even if the user
-  // unref()'d the engine; after Release() the TSFN closes as soon as its queue
-  // is drained, so this only keeps the loop alive for that drain.
-  tsfn_.Ref(env);
   auto* data = new CallData();
   data->type = CallType::kBarrier;
   data->hasMessage = false;
@@ -114,6 +110,12 @@ bool ApplicationBridge::RunAfterQueued(Napi::Env env,
     delete data;
     return false;
   }
+  // The loop must not exit before the barrier has run even if the user
+  // unref()'d the engine; after Release() the TSFN closes as soon as its queue
+  // is drained, so this only keeps the loop alive for that drain. Ref'd only
+  // once the item is queued: a refused call leaves the TSFN exactly as the
+  // caller had it (JS thread, so nothing runs in between).
+  tsfn_.Ref(env);
   return true;
 }
 
