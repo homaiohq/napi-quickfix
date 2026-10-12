@@ -9,6 +9,10 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-12
+
+Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
+
 ### Added
 
 - Every FIX value constant of the bundled QuickFIX, generated from `FixValues.h`
