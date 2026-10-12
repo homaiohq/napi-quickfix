@@ -77,7 +77,10 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   `Message.isEmpty()` and `clear()` cover the header, body and trailer, as in
   QuickFIX.
 - `DataDictionary.validate(msg, bodyOnly?)`, and the introspection methods
-  `getVersion`, `getFieldName`, `getFieldTag`, `isField`, `isMsgType`.
+  `getVersion`, `getFieldName`, `getFieldTag`, `isField`, `isMsgType`. `bodyOnly`
+  is QuickFIX's `validate(msg, true)`: it skips the BeginString version check and
+  the tag/value checks of header and trailer fields, but still requires every
+  field the dictionary marks required, header and trailer included.
 - Group argument checks. A `Group` delimiter or order entry above 2^20 throws a
   `RangeError`, since QuickFIX allocates `largestTag + 1` ints per group order,
   and an order that lists a tag twice throws a `TypeError` (QuickFIX would rank

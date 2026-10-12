@@ -173,7 +173,9 @@ export interface QuickFixError extends Error {
 export interface NativeDataDictionary {
   /**
    * Throws a {@link QuickFixError} if the message is invalid. With `bodyOnly`
-   * the BeginString version check and header/trailer validation are skipped.
+   * the BeginString version check and the tag/value validation of the
+   * header/trailer fields are skipped; required header/trailer fields are
+   * still checked.
    */
   validate(message: NativeMessage, bodyOnly?: boolean): void;
   /** The BeginString the spec declares (e.g. `'FIX.4.4'`), `''` if none. */

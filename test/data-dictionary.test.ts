@@ -89,7 +89,7 @@ describe('DataDictionary', () => {
     );
   });
 
-  test('validate(msg, bodyOnly) skips the BeginString version check and header validation', () => {
+  test('validate(msg, bodyOnly) skips the BeginString version check and header/trailer tag validation', () => {
     const dd = DataDictionary.fromString(DICT);
     // A FIX.4.2 heartbeat against a FIX.4.4 dictionary: the session-level check
     // rejects the version, the body-only check does not look at it.
@@ -107,6 +107,26 @@ describe('DataDictionary', () => {
     assert.throws(
       () => dd.validate(heartbeat((m) => m.setField(55, 'AAPL')), true),
       (err: any) => err.fixErrorName === 'InvalidTagNumber',
+    );
+    // Header/trailer fields are not checked against the dictionary...
+    const unknownHeaderTag = heartbeat();
+    unknownHeaderTag.setHeaderField(1000, 'x');
+    assert.throws(() => dd.validate(unknownHeaderTag), (err: any) => err.fixErrorName === 'InvalidTagNumber');
+    assert.doesNotThrow(() => dd.validate(unknownHeaderTag, true));
+  });
+
+  test('validate(msg, bodyOnly) still requires the dictionary\'s header and trailer fields', () => {
+    // QuickFIX checks every required field, header and trailer included, even
+    // body-only: a bare draft body is not valid.
+    const dd = DataDictionary.fromString(DICT);
+    const draft = createMessage().setField(FIELD.BeginString, 'FIX.4.4').setField(FIELD.MsgType, MsgType.Heartbeat);
+    assert.throws(
+      () => dd.validate(draft, true),
+      (err: any) => {
+        assert.equal(err.name, 'QuickFixError');
+        assert.equal(err.fixErrorName, 'RequiredTagMissing');
+        return true;
+      },
     );
   });
 

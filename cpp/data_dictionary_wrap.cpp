@@ -85,8 +85,10 @@ Napi::Value DataDictionaryWrap::FromString(const Napi::CallbackInfo& info) {
 }
 
 // validate(message, bodyOnly?: boolean). With bodyOnly the dictionary is used
-// as the application dictionary only: no BeginString version check and no
-// header/trailer field validation (QuickFIX's `validate(msg, true)`).
+// as the application dictionary only (QuickFIX's `validate(msg, true)`): no
+// BeginString version check and no tag/value validation of the header and
+// trailer fields. The header still needs BeginString and MsgType, and every
+// field the dictionary requires, header and trailer included, must be present.
 Napi::Value DataDictionaryWrap::Validate(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   MessageWrap* msg = MessageWrap::UnwrapArg(env, info[0], "message");

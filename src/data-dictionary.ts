@@ -75,9 +75,12 @@ export class DataDictionary {
    * Validate a message against this dictionary.
    *
    * @param msg The message to validate.
-   * @param bodyOnly When `true`, validate only as the *application* dictionary:
-   *   the BeginString version check and header/trailer field validation are
-   *   skipped (QuickFIX's `validate(msg, true)`). Defaults to `false`.
+   * @param bodyOnly When `true`, validate only as the *application* dictionary
+   *   (QuickFIX's `validate(msg, true)`): the BeginString version check and the
+   *   tag/value validation of the header and trailer fields are skipped. It is
+   *   not a check of a draft body: `BeginString` and `MsgType` must be set, and
+   *   every field the dictionary requires, header and trailer included (e.g.
+   *   `BodyLength`, `CheckSum`), must be present. Defaults to `false`.
    * @throws A `QuickFixError` on any validation failure (e.g.
    *   `fixErrorName: 'InvalidMessage'` / `'RequiredTagMissing'` /
    *   `'IncorrectTagValue'` / `'UnsupportedVersion'`).
