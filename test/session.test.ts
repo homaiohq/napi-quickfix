@@ -624,7 +624,11 @@ StartDay=Monday
 
   test('a stopped engine releases its SessionIDs for a new engine', { timeout: 20_000 }, async () => {
     const port = await freePort();
-    const settings = SessionSettings.fromString(acceptorCfg(port));
+    // ResetOnLogon=N: with it set, QuickFIX drops an application message sent
+    // on a not-logged-on session whose seq nums are still 1/1 ("will just be
+    // cleared") before persisting it, which would blind the cross-over guard
+    // below. Without it the send is persisted and bumps the sender seq num.
+    const settings = SessionSettings.fromString(acceptorCfg(port).replace('ResetOnLogon=Y', 'ResetOnLogon=N'));
     const first = new Acceptor({ settings, store: 'memory', log: 'none' });
     assert.ok(doesSessionExist(ACC_ID), 'constructing an engine registers its sessions');
     const stale = first.getSession(ACC_ID)!;
@@ -659,6 +663,10 @@ StartDay=Monday
     assert.equal(fresh.isEnabled(), true, "the stale logout() did not reach second's session");
     assert.equal(fresh.getExpectedSenderNum(), 1, "nor did the stale setter");
     assert.equal(lookupSession(ACC_ID)!.isEnabled(), true, 'a fresh lookup resolves the new owner');
+    // The cross-over guard above is live: a send that does target `second`
+    // is persisted there and bumps its sender seq num.
+    await sendToTarget(newOrder(), ACC_ID);
+    assert.equal(fresh.getExpectedSenderNum(), 2, "a send that reaches `second` is persisted there");
     await second.stop();
     assert.equal(second.getSession(ACC_ID), undefined);
     assert.throws(() => fresh.isEnabled(), isSessionNotFound);

@@ -150,7 +150,7 @@ return a `Promise`, keeping the event loop free to run the bridge trampoline.
 ```mermaid
 flowchart TD
   subgraph MAIN["JS main thread (event loop stays free)"]
-    CALL["await initiator.sendToTarget(msg, id)"]
+    CALL["await sendToTarget(msg, id)<br/>resolve the owning engine's gate"]
     CJS["CallJs trampoline runs toApp handler"]
   end
   subgraph WORKER["libuv worker thread"]

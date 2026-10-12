@@ -41,7 +41,11 @@ export type { Enums, EnumGroup, FieldName, ValueGroups, ValueGroupName } from '.
  * Runs off the main thread and resolves once the engine has accepted (or
  * rejected) the message, so the event loop stays free for callbacks. On a
  * missing session the returned Promise rejects with a
- * {@link QuickFixError} (`fixErrorName: 'SessionNotFound'`).
+ * {@link QuickFixError} (`fixErrorName: 'SessionNotFound'`). The send is
+ * bound to the engine that owns the session when it is called: if that
+ * engine is stopped before the send reaches its session, the Promise rejects
+ * with `SessionNotFound` rather than running through an engine created later
+ * with the same id.
  *
  * @param message The message to send.
  * @param sessionID The destination session.
