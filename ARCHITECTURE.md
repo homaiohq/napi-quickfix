@@ -23,6 +23,7 @@ graph TD
     IDX["index.ts — public barrel"]
     MSG["Message · Group · SessionID<br/>SessionSettings · DataDictionary"]
     ENG["Engine (EventEmitter)<br/>Initiator · Acceptor · Session"]
+    TUN["createTlsTunnel<br/>(loopback ⇄ node:tls)"]
     NAT["native.ts — typed NativeModule"]
     LOAD["load-native.cjs<br/>(node-gyp-build loader)"]
   end
@@ -51,11 +52,19 @@ graph TD
   CORE <--> NET
   NET -->|"callbacks"| BRIDGE
   BRIDGE -->|"ThreadSafeFunction"| ENG
+  APP -.->|"optional"| TUN
+  NET -.->|"TCP to 127.0.0.1"| TUN
 ```
 
 The TypeScript layer is a thin, ergonomic facade. Each TS class holds an opaque handle to its C++ `ObjectWrap`
 counterpart. The C++ layer owns the QuickFIX objects and translates every exception into a JS `QuickFixError`
 (with a stable `.fixErrorName` discriminator).
+
+TLS is not done by QuickFIX: the engine is built without `HAVE_SSL`, because bundling OpenSSL would break the
+one-N-API-prebuild-per-platform model. Instead, `createTlsTunnel` (`src/tls-tunnel.ts`, pure TS) plays the stunnel
+client. The plain `SocketInitiator` connects to its loopback listener, and the tunnel carries each connection to the
+counterparty over `node:tls`. The tunnel and the engine are independent; the user wires the tunnel's port into the
+settings.
 
 ---
 
@@ -347,10 +356,11 @@ musl entries and link musl objects into a glibc addon.
 | Public TS API | `src/index.ts`, `message.ts`, `group.ts`, `session-id.ts`, `session-settings.ts`, `data-dictionary.ts`, `enums.ts` |
 | Generated FIX constants | `scripts/gen-fields.mjs` → `src/generated/fields.ts` (`FIELD`), `scripts/gen-values.mjs` → `src/generated/values.ts` (value groups, `VALUES`) — both from the QuickFIX headers at the pinned tag |
 | Engine + handlers | `src/engine.ts`, `initiator.ts`, `acceptor.ts`, `application.ts` |
+| TLS tunnel (initiators) | `src/tls-tunnel.ts` (`createTlsTunnel`) |
 | Per-session control | `src/session.ts` (`Session`, `lookupSession`, `doesSessionExist`, `getSessions`, `numSessions`), `cpp/session_wrap.{h,cpp}` |
 | Native loader | `src/native.ts`, `src/load-native.cjs` |
 | Addon entry / wraps | `cpp/addon.cpp`, `cpp/*_wrap.{h,cpp}`, `cpp/field_map_ops.h` (field/group ops shared by `MessageWrap` and `GroupWrap`), `cpp/session_static.cpp` (`sendToTarget` + session lookups) |
 | Bridge / async / errors | `cpp/application_bridge.{h,cpp}`, `cpp/engine_workers.h` (`EngineOpWorker`), `cpp/session_static.cpp` (`SendToTargetWorker`), `cpp/errors.h` |
 | Build / dist | `CMakeLists.txt`, `scripts/prebuild.mjs`, `tsconfig.*.json`, `package.json` |
-| Tests | `test/*.test.ts`, `test/helpers.ts` (loopback harness), `test/fixtures/` (reduced FIX 4.4 dictionary + loader) |
+| Tests | `test/*.test.ts`, `test/helpers.ts` (loopback harness), `test/fixtures/` (reduced FIX 4.4 dictionary + loader, TEST-ONLY TLS certificates) |
 | CI | `.github/workflows/ci.yml`, `.github/workflows/release.yml` |
