@@ -2,7 +2,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { connect as netConnect, createServer as createNetServer, Server as NetServer, type Socket } from 'node:net';
+import { connect as netConnect, createServer as createNetServer, Server as NetServer, Socket } from 'node:net';
 import { createServer as createTlsServer, type TlsOptions } from 'node:tls';
 
 import {
@@ -243,6 +243,120 @@ describe('createTlsTunnel', () => {
       await server.close();
     }
   });
+
+  test('rejectUnauthorized: false reports the verification failure as a code', { timeout: 5000 }, async () => {
+    const server = await startTlsServer(await freePort());
+    const tunnel = await createTlsTunnel({
+      host: '127.0.0.1',
+      port: server.port,
+      tls: { ca: OTHER_CA, rejectUnauthorized: false },
+    });
+    try {
+      const secured = new Promise<TlsTunnelSecureConnectInfo>((resolve) => tunnel.once('secureConnect', resolve));
+      netConnect(tunnel.port, '127.0.0.1').on('error', () => {});
+      const info = await secured;
+      assert.equal(info.authorized, false);
+      assert.equal(info.authorizationError, 'UNABLE_TO_VERIFY_LEAF_SIGNATURE');
+    } finally {
+      await tunnel.close();
+      await server.close();
+    }
+  });
+
+  test(
+    'tls options: socket/path are ignored and servername: undefined keeps the SNI default',
+    { timeout: 5000 },
+    async () => {
+      let sni: string | undefined;
+      const server = createTlsServer(
+        {
+          cert: SERVER_CERT,
+          key: SERVER_KEY,
+          // Called during the ClientHello, only when the client sends SNI.
+          SNICallback: (name, cb) => {
+            sni = name;
+            cb(null);
+          },
+        },
+        (secure) => secure.destroy(),
+      );
+      server.on('tlsClientError', () => {});
+      // Listen where 'localhost' resolves first; the tunnel tries every address.
+      await new Promise<void>((resolve) => server.listen(0, 'localhost', resolve));
+      const addr = server.address();
+      const tunnel = await createTlsTunnel({
+        host: 'localhost',
+        port: typeof addr === 'object' && addr ? addr.port : 0,
+        // Excluded by the types, but plain JS callers can still pass them.
+        tls: { ca: CA, servername: undefined, path: '/nonexistent', socket: new Socket() } as never,
+      });
+      try {
+        const secured = new Promise<void>((resolve) => tunnel.once('secureConnect', () => resolve()));
+        netConnect(tunnel.port, '127.0.0.1').on('error', () => {});
+        await secured;
+        assert.equal(sni, 'localhost');
+      } finally {
+        await tunnel.close();
+        await new Promise((resolve) => server.close(resolve));
+      }
+    },
+  );
+
+  test(
+    'a side that closes while the other is still sending is wound down, not reset',
+    { timeout: 15000 },
+    async () => {
+      // Tearing a socket down with unread input sends a TCP RST, which can
+      // discard what its peer has not read yet: here the 'BYE' (a Logout),
+      // sent just before closing while the other side is still streaming.
+      const flood = Buffer.alloc(8 * 1024 * 1024, 0x41);
+      const run = (stream: Socket): Promise<{ text: string; error?: string }> =>
+        new Promise((resolve) => {
+          let text = '';
+          let error: string | undefined;
+          stream.on('data', (chunk: Buffer) => (text += chunk.toString().replaceAll('A', '')));
+          stream.on('error', (err: NodeJS.ErrnoException) => (error ??= err.code));
+          stream.once('close', () => resolve({ text, error }));
+        });
+
+      let onSecure: (secure: Socket) => void = () => {};
+      const server = createTlsServer({ cert: SERVER_CERT, key: SERVER_KEY }, (secure) => onSecure(secure));
+      server.on('tlsClientError', () => {});
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const addr = server.address();
+      const tunnel = await createTlsTunnel({
+        host: '127.0.0.1',
+        port: typeof addr === 'object' && addr ? addr.port : 0,
+        tls: { ca: CA },
+      });
+      const errors = tlsErrors(tunnel);
+      try {
+        // The counterparty says BYE and closes while the engine is still sending.
+        onSecure = (secure) => secure.on('error', () => {}).resume().end('BYE');
+        const engine = netConnect(tunnel.port, '127.0.0.1');
+        const engineSide = run(engine);
+        engine.write(flood);
+        assert.deepEqual(await engineSide, { text: 'BYE', error: undefined }, 'counterparty closes first');
+
+        // The engine says BYE and closes while the counterparty is still sending.
+        const counterpartySide = new Promise<{ text: string; error?: string }>((resolve) => {
+          onSecure = (secure) => {
+            void run(secure).then(resolve);
+            secure.write(flood);
+          };
+        });
+        const engine2 = netConnect(tunnel.port, '127.0.0.1');
+        engine2.on('error', () => {});
+        engine2.resume();
+        engine2.end('BYE');
+        assert.deepEqual(await counterpartySide, { text: 'BYE', error: undefined }, 'engine closes first');
+        assert.deepEqual(errors, []);
+      } finally {
+        await tunnel.close();
+        await new Promise((resolve) => server.close(resolve));
+      }
+    },
+  );
 
   test(
     'failover: one tunnel per SocketConnectHost<n>, the initiator moves on to the live one',

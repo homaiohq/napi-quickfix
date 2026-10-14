@@ -19,6 +19,8 @@ import {
 } from 'node:tls';
 
 const LOOPBACK = '127.0.0.1';
+/** How long a connection may take to wind down once either side has ended. */
+const DRAIN_TIMEOUT_MS = 5000;
 
 /** Options for {@link createTlsTunnel}. */
 export interface TlsTunnelOptions {
@@ -46,10 +48,11 @@ export interface TlsTunnelSecureConnectInfo {
   /** Whether the server certificate was verified against the trusted CAs. */
   authorized: boolean;
   /**
-   * Why verification failed. Only reachable with `rejectUnauthorized: false`;
-   * otherwise a failed verification is a `'tlsError'` instead.
+   * Why verification failed, as the OpenSSL verification code (e.g.
+   * `'UNABLE_TO_VERIFY_LEAF_SIGNATURE'`, the `code` a `'tlsError'` carries
+   * otherwise). Only reachable with `rejectUnauthorized: false`.
    */
-  authorizationError?: Error;
+  authorizationError?: string;
   /** Negotiated protocol, e.g. `'TLSv1.3'`. */
   protocol: string | null;
   /** Negotiated cipher. */
@@ -102,10 +105,13 @@ export class TlsTunnel extends EventEmitter {
     this.#server = server;
     this.port = port;
     this.remote = Object.freeze({ host: options.host, port: options.port });
-    const servername = isIP(options.host) === 0 ? options.host : undefined;
+    // `socket` and `path` are excluded by the types only: drop them for JS
+    // callers too, or every connection would go to them instead of host:port.
+    const { socket: _socket, path: _path, ...tls } = (options.tls ?? {}) as ConnectionOptions;
+    const servername = tls.servername ?? (isIP(options.host) === 0 ? options.host : undefined);
     this.#tls = {
+      ...tls,
       ...(servername === undefined ? {} : { servername }),
-      ...options.tls,
       host: options.host,
       port: options.port,
     };
@@ -143,12 +149,34 @@ export class TlsTunnel extends EventEmitter {
     const pair = { local, remote };
     this.#pairs.add(pair);
 
-    // Any error or close on either side tears the pair down: QuickFIX sees the
-    // loopback connection drop and reconnects on its own schedule.
-    const teardown = () => {
-      this.#pairs.delete(pair);
-      local.destroy();
-      remote.destroy();
+    // Once piped, a side that ends or closes is wound down gracefully on the
+    // other: it is ended, so the data still queued in the tunnel (a Logout, the
+    // TLS close_notify) is delivered rather than reset, and drained of what it
+    // still receives so it sees its peer's EOF. Anything still open
+    // DRAIN_TIMEOUT_MS after the first EOF is destroyed. Before the handshake
+    // completes there is nothing to deliver: a close drops the other side, and
+    // QuickFIX reconnects on its own schedule.
+    let piped = false;
+    let open = 2;
+    let drainTimer: NodeJS.Timeout | undefined;
+    const linger = () => {
+      drainTimer ??= setTimeout(() => {
+        local.destroy();
+        remote.destroy();
+      }, DRAIN_TIMEOUT_MS).unref();
+    };
+    const onClose = (closed: Socket, other: Socket) => () => {
+      if (--open === 0) {
+        clearTimeout(drainTimer);
+        this.#pairs.delete(pair);
+      } else if (!piped) {
+        other.destroy();
+      } else {
+        other.unpipe(closed);
+        other.resume();
+        other.end();
+        linger();
+      }
     };
     local.on('error', () => {
       // ECONNRESET and the like from the engine's side: nothing to report.
@@ -156,19 +184,32 @@ export class TlsTunnel extends EventEmitter {
     remote.on('error', (err) => {
       if (!this.#closing) this.emit('tlsError', err);
     });
-    local.once('close', teardown);
-    remote.once('close', teardown);
+    local.once('close', onClose(local, remote));
+    remote.once('close', onClose(remote, local));
 
     remote.once('secureConnect', () => {
       local.setNoDelay(true);
       remote.setNoDelay(true);
+      // Each side's EOF ends the other. The loopback socket is half-open, so
+      // after QuickFIX's EOF the counterparty's last bytes still reach it; the
+      // TLS socket ends itself on the counterparty's EOF, so what QuickFIX
+      // still sends is discarded (its peer has gone).
       local.pipe(remote);
       remote.pipe(local);
+      local.once('end', linger);
+      remote.once('end', () => {
+        local.unpipe(remote);
+        local.resume();
+        linger();
+      });
+      piped = true;
       local.resume();
+      // Typed as an Error, but a string code at runtime, and null once the
+      // certificate verified.
+      const authorizationError = remote.authorizationError as unknown as string | null;
       this.emit('secureConnect', {
         authorized: remote.authorized,
-        // Typed as Error, but null once the certificate verified.
-        ...(remote.authorizationError ? { authorizationError: remote.authorizationError } : {}),
+        ...(authorizationError ? { authorizationError } : {}),
         protocol: remote.getProtocol(),
         cipher: remote.getCipher(),
         peerCertificate: remote.getPeerCertificate(),
@@ -243,7 +284,9 @@ export async function createTlsTunnel(options: TlsTunnelOptions): Promise<TlsTun
     throw new TypeError('localPort must be an integer from 0 to 65535');
   }
 
-  const server = createServer();
+  // Half-open, so QuickFIX's EOF does not end the loopback socket before the
+  // counterparty's last bytes have crossed it (see #onConnection).
+  const server = createServer({ allowHalfOpen: true });
   await new Promise<void>((resolve, reject) => {
     const onError = (err: Error) => {
       server.off('listening', onListening);

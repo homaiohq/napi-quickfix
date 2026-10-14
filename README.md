@@ -448,8 +448,13 @@ await tunnel.close();
   loopback connection. QuickFIX then reconnects after its `ReconnectInterval`.
   The tunnel never emits `'error'`, so a tunnel with no listeners cannot crash
   the process.
+- **Shutdown of a connection.** When either side closes, the other is ended
+  rather than reset, so data still in the tunnel (a Logout, TLS's
+  `close_notify`) is delivered. A connection that has not fully closed 5 seconds
+  after the first side closed is destroyed.
 - **Lifecycle.** The tunnel's handles are unref'd, so the tunnel alone never
-  keeps the process alive (a started engine does). `close()` is idempotent, and
+  keeps the process alive (a started engine does). `close()` destroys live
+  connections at once. It is idempotent, and
   `await using tunnel = await createTlsTunnel(...)` closes the tunnel at the end
   of the block.
 
