@@ -9,6 +9,10 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-14
+
+Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
+
 ### Added
 
 - `createTlsTunnel`: a built-in, stunnel-style TLS tunnel for initiators. It listens on
