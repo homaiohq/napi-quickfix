@@ -68,8 +68,10 @@ export interface TlsTunnelEvents {
   secureConnect: [info: TlsTunnelSecureConnectInfo];
   /**
    * A connection to the counterparty failed (DNS, TCP, handshake, certificate
-   * verification) or broke. The initiator's loopback connection is closed with
-   * it, so QuickFIX reconnects after its `ReconnectInterval`.
+   * verification, `tls` options `tls.connect` rejects) or broke. The
+   * initiator's loopback connection is closed with it, so QuickFIX reconnects
+   * after its `ReconnectInterval`. Also emitted when the loopback server fails
+   * to accept a connection (e.g. `EMFILE`).
    */
   tlsError: [error: Error];
 }
@@ -108,6 +110,11 @@ export class TlsTunnel extends EventEmitter {
       port: options.port,
     };
     server.on('connection', (local) => this.#onConnection(local));
+    // A failed accept() (EMFILE, ENFILE, ...) is emitted on the server: without
+    // a listener it would be thrown.
+    server.on('error', (err) => {
+      if (!this.#closing) this.emit('tlsError', err);
+    });
   }
 
   #onConnection(local: Socket): void {
@@ -120,7 +127,18 @@ export class TlsTunnel extends EventEmitter {
     // until the handshake is done and the pipe below picks it up.
     local.pause();
 
-    const remote = tlsConnect(this.#tls);
+    // tls.connect throws synchronously on options it cannot build a secure
+    // context from (bad PEM, unknown minVersion, ...): report it like any other
+    // connection failure instead of letting it escape the 'connection' handler.
+    let remote: TLSSocket;
+    try {
+      remote = tlsConnect(this.#tls);
+    } catch (err) {
+      local.on('error', () => {});
+      local.destroy();
+      this.emit('tlsError', err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
     remote.unref();
     const pair = { local, remote };
     this.#pairs.add(pair);

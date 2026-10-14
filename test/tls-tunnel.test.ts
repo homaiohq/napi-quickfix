@@ -2,7 +2,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { connect as netConnect, createServer as createNetServer, type Socket } from 'node:net';
+import { connect as netConnect, createServer as createNetServer, Server as NetServer, type Socket } from 'node:net';
 import { createServer as createTlsServer, type TlsOptions } from 'node:tls';
 
 import {
@@ -307,6 +307,47 @@ describe('createTlsTunnel', () => {
       refused.destroy();
     } finally {
       await server.close();
+    }
+  });
+
+  test('tls options tls.connect throws on are a tlsError, not a crash', { timeout: 5000 }, async () => {
+    // Accepted by createTlsTunnel; tls.connect only throws once a connection
+    // comes in and it builds the secure context.
+    const tunnel = await createTlsTunnel({ host: '127.0.0.1', port: 1, tls: { key: 'not a pem', cert: 'not a pem' } });
+    try {
+      const failed = new Promise<Error>((resolve) => tunnel.once('tlsError', resolve));
+      const client = netConnect(tunnel.port, '127.0.0.1');
+      client.on('error', () => {});
+      const clientClosed = new Promise<void>((resolve) => client.once('close', () => resolve()));
+      assert.ok((await failed) instanceof Error);
+      await clientClosed;
+    } finally {
+      await tunnel.close();
+    }
+  });
+
+  test('an accept error on the loopback server is a tlsError, not a crash', async () => {
+    // The server is private: catch it as createTlsTunnel binds it.
+    let server: NetServer | undefined;
+    const listen = NetServer.prototype.listen;
+    NetServer.prototype.listen = function (this: NetServer, ...args: unknown[]) {
+      server = this;
+      return (listen as (...a: unknown[]) => NetServer).apply(this, args);
+    } as typeof listen;
+    let tunnel: TlsTunnel;
+    try {
+      tunnel = await createTlsTunnel({ host: '127.0.0.1', port: 1 });
+    } finally {
+      NetServer.prototype.listen = listen;
+    }
+    try {
+      const errors = tlsErrors(tunnel);
+      const emfile = Object.assign(new Error('accept EMFILE'), { code: 'EMFILE' });
+      assert.ok(server);
+      server.emit('error', emfile);
+      assert.deepEqual(errors, [emfile]);
+    } finally {
+      await tunnel.close();
     }
   });
 

@@ -443,7 +443,8 @@ await tunnel.close();
 - **Failover.** Open one tunnel per `SocketConnectHost<n>`, and set
   `SocketConnectHost<n>=127.0.0.1` with `SocketConnectPort<n>=${tunnelN.port}`.
 - **Failures.** If the TLS connection fails or breaks (DNS, TCP, handshake,
-  certificate), the tunnel emits `'tlsError'` and drops the initiator's
+  certificate, or `tls` options that `tls.connect` rejects such as an
+  unreadable key), the tunnel emits `'tlsError'` and drops the initiator's
   loopback connection. QuickFIX then reconnects after its `ReconnectInterval`.
   The tunnel never emits `'error'`, so a tunnel with no listeners cannot crash
   the process.
