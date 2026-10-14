@@ -129,9 +129,14 @@ export class TlsTunnel extends EventEmitter {
       return;
     }
     local.unref();
-    // QuickFIX writes its Logon as soon as it connects: keep it in the socket
-    // until the handshake is done and the pipe below picks it up.
-    local.pause();
+    // QuickFIX writes its Logon as soon as it connects: hold it until the
+    // handshake is done and the pipe below takes over. It is read rather than
+    // left in a paused socket, which is not read at all: the engine's EOF or
+    // reset would go unseen, and a handshake completing after the engine gave
+    // up would still deliver its stale Logon.
+    const pending: Buffer[] = [];
+    const hold = (chunk: Buffer) => pending.push(chunk);
+    local.on('data', hold);
 
     // tls.connect throws synchronously on options it cannot build a secure
     // context from (bad PEM, unknown minVersion, ...): report it like any other
@@ -154,8 +159,8 @@ export class TlsTunnel extends EventEmitter {
     // TLS close_notify) is delivered rather than reset, and drained of what it
     // still receives so it sees its peer's EOF. Anything still open
     // DRAIN_TIMEOUT_MS after the first EOF is destroyed. Before the handshake
-    // completes there is nothing to deliver: a close drops the other side, and
-    // QuickFIX reconnects on its own schedule.
+    // completes there is nothing to deliver: an EOF or close drops both sides,
+    // and QuickFIX reconnects on its own schedule.
     let piped = false;
     let open = 2;
     let drainTimer: NodeJS.Timeout | undefined;
@@ -186,6 +191,14 @@ export class TlsTunnel extends EventEmitter {
     });
     local.once('close', onClose(local, remote));
     remote.once('close', onClose(remote, local));
+    local.once('end', () => {
+      if (piped) {
+        linger();
+      } else {
+        local.destroy();
+        remote.destroy();
+      }
+    });
 
     remote.once('secureConnect', () => {
       local.setNoDelay(true);
@@ -194,16 +207,17 @@ export class TlsTunnel extends EventEmitter {
       // after QuickFIX's EOF the counterparty's last bytes still reach it; the
       // TLS socket ends itself on the counterparty's EOF, so what QuickFIX
       // still sends is discarded (its peer has gone).
+      local.off('data', hold);
+      for (const chunk of pending) remote.write(chunk);
+      pending.length = 0;
       local.pipe(remote);
       remote.pipe(local);
-      local.once('end', linger);
       remote.once('end', () => {
         local.unpipe(remote);
         local.resume();
         linger();
       });
       piped = true;
-      local.resume();
       // Typed as an Error, but a string code at runtime, and null once the
       // certificate verified.
       const authorizationError = remote.authorizationError as unknown as string | null;

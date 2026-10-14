@@ -345,14 +345,88 @@ describe('createTlsTunnel', () => {
             secure.write(flood);
           };
         });
+        const secured = new Promise((resolve) => tunnel.once('secureConnect', resolve));
         const engine2 = netConnect(tunnel.port, '127.0.0.1');
         engine2.on('error', () => {});
         engine2.resume();
+        // An EOF before the handshake would give the connection up instead.
+        await secured;
         engine2.end('BYE');
         assert.deepEqual(await counterpartySide, { text: 'BYE', error: undefined }, 'engine closes first');
         assert.deepEqual(errors, []);
       } finally {
         await tunnel.close();
+        await new Promise((resolve) => server.close(resolve));
+      }
+    },
+  );
+
+  test(
+    'an engine that gives up before the handshake completes drops the connection',
+    { timeout: 10000 },
+    async () => {
+      // A counterparty that accepts TCP but never answers the ClientHello: the
+      // engine's EOF (its LogonTimeout) must still close the TLS connection.
+      let stalled: Socket | undefined;
+      const blackhole = createNetServer((s) => (stalled = s.on('error', () => {}).resume()));
+      await new Promise<void>((resolve) => blackhole.listen(0, '127.0.0.1', resolve));
+      const blackholeAddr = blackhole.address();
+      const stalling = await createTlsTunnel({
+        host: '127.0.0.1',
+        port: typeof blackholeAddr === 'object' && blackholeAddr ? blackholeAddr.port : 0,
+      });
+
+      // A counterparty whose handshake completes late, after the engine closed:
+      // its Logon must not be delivered.
+      const received: Buffer[] = [];
+      const server = createTlsServer({ cert: SERVER_CERT, key: SERVER_KEY }, (secure) => {
+        secure.on('error', () => {}).on('data', (chunk: Buffer) => received.push(chunk));
+      });
+      server.on('tlsClientError', () => {});
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const serverAddr = server.address();
+      const delayed = new Set<Socket>();
+      const delay = createNetServer((s) => {
+        delayed.add(s.on('error', () => {}));
+        setTimeout(() => {
+          const upstream = netConnect(typeof serverAddr === 'object' && serverAddr ? serverAddr.port : 0, '127.0.0.1');
+          delayed.add(upstream.on('error', () => {}));
+          s.pipe(upstream);
+          upstream.pipe(s);
+        }, 500);
+      });
+      await new Promise<void>((resolve) => delay.listen(0, '127.0.0.1', resolve));
+      const delayAddr = delay.address();
+      const late = await createTlsTunnel({
+        host: '127.0.0.1',
+        port: typeof delayAddr === 'object' && delayAddr ? delayAddr.port : 0,
+        tls: { ca: CA },
+      });
+
+      const errors = [...tlsErrors(stalling), ...tlsErrors(late)];
+      let secured = false;
+      late.on('secureConnect', () => (secured = true));
+      try {
+        const engine = netConnect(stalling.port, '127.0.0.1').on('error', () => {});
+        engine.write('35=A');
+        assert.ok(await waitUntil(() => stalled !== undefined, 2000), 'the counterparty saw the connection');
+        engine.end();
+        assert.ok(await waitUntil(() => stalled?.destroyed === true, 2000), 'the TLS connection is closed');
+
+        const engine2 = netConnect(late.port, '127.0.0.1').on('error', () => {});
+        engine2.write('35=A');
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        engine2.destroy();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        assert.equal(secured, false, 'the handshake does not complete');
+        assert.deepEqual(received, [], 'the stale Logon is not delivered');
+        assert.deepEqual(errors, []);
+      } finally {
+        await stalling.close();
+        await late.close();
+        for (const s of delayed) s.destroy();
+        await new Promise((resolve) => blackhole.close(resolve));
+        await new Promise((resolve) => delay.close(resolve));
         await new Promise((resolve) => server.close(resolve));
       }
     },
