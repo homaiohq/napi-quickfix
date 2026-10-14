@@ -9,6 +9,16 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
+### Added
+
+- `createTlsTunnel`: a built-in, stunnel-style TLS tunnel for initiators. It listens on
+  a loopback port that `SocketConnectHost`/`SocketConnectPort` point at, and carries each
+  connection to the counterparty over Node's `tls.connect` (mTLS, SNI, certificate and
+  hostname verification). It emits `'secureConnect'`/`'tlsError'`, closes idempotently,
+  and supports `await using`. QuickFIX's OpenSSL-based SSL engines are still not built,
+  so prebuilds are unchanged. Acceptor-side TLS is not provided; see the README for why
+  and for the alternatives.
+
 ## [0.2.0] - 2026-10-12
 
 Bundles **QuickFIX v1.16.0** (statically linked, unchanged).

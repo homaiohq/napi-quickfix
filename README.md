@@ -34,6 +34,9 @@ included.
   field (`MsgType`, `Side`, `ExecType`, `OrdStatus`, ...) are
   generated from the bundled QuickFIX headers with literal types, frozen, and
   importable without loading the native addon.
+- **TLS for initiators** — `createTlsTunnel` is a built-in, stunnel-style TLS
+  tunnel (mTLS, SNI, certificate verification via Node's `tls`), so you don't need
+  a separate stunnel process.
 
 ## Install
 
@@ -385,6 +388,110 @@ the engine owning it has been stopped. A constructor that fails on a later
 (so the ids are not locked out by the failed attempt) and the engine-level log
 QuickFIX had already opened for it.
 
+### TLS (stunnel-style) for initiators
+
+QuickFIX's own `SSLSocketInitiator` needs OpenSSL compiled into the engine, and
+this package's prebuilds are built without it. Instead, `createTlsTunnel` does
+what a stunnel client does, inside your process. It listens on a loopback port,
+you point the initiator's `SocketConnectHost`/`SocketConnectPort` at it, and it
+carries each connection to the counterparty over Node's
+[`tls.connect`](https://nodejs.org/api/tls.html#tlsconnectoptions-callback):
+
+```text
+Initiator --plain TCP--> 127.0.0.1:<tunnel.port> --TLS--> fix.broker.com:9443
+```
+
+```ts
+import { readFileSync } from 'node:fs';
+import { createTlsTunnel, Initiator, SessionSettings } from '@homaiohq/napi-quickfix';
+
+const tunnel = await createTlsTunnel({
+  host: 'fix.broker.com',
+  port: 9443,
+  tls: {
+    ca: readFileSync('broker-ca.pem'),   // omit to trust Node's default CAs
+    cert: readFileSync('client.pem'),    // mTLS, if the venue requires it
+    key: readFileSync('client.key'),
+    minVersion: 'TLSv1.2',
+  },
+});
+tunnel.on('secureConnect', (info) => console.log('TLS up', info.protocol, info.peerCertificate.subject));
+tunnel.on('tlsError', (err) => console.error('TLS failed:', err.message));
+
+const settings = SessionSettings.fromString(`
+[DEFAULT]
+ConnectionType=initiator
+SocketConnectHost=${tunnel.host}
+SocketConnectPort=${tunnel.port}
+...
+`);
+const initiator = new Initiator({ settings, handlers });
+await initiator.start();
+
+// Shutdown: the engine first, so its Logout still crosses the tunnel.
+await initiator.stop();
+await tunnel.close();
+```
+
+- **Options.** `tls` accepts any `tls.ConnectionOptions` except
+  `host`/`port`/`socket`/`path`. `servername` (SNI, and the name the server
+  certificate is checked against) defaults to `host`, unless `host` is an IP
+  address.
+- **Fixed port.** Pass `localPort` to listen on a fixed port, for example to
+  keep `SocketConnectPort=9001` in a static `.cfg` file. A port that is already
+  in use makes `createTlsTunnel` reject with `EADDRINUSE`.
+- **Failover.** Open one tunnel per `SocketConnectHost<n>`, and set
+  `SocketConnectHost<n>=127.0.0.1` with `SocketConnectPort<n>=${tunnelN.port}`.
+- **Failures.** If the TLS connection fails or breaks (DNS, TCP, handshake,
+  certificate, or `tls` options that `tls.connect` rejects such as an
+  unreadable key), the tunnel emits `'tlsError'` and drops the initiator's
+  loopback connection. QuickFIX then reconnects after its `ReconnectInterval`.
+  The tunnel never emits `'error'`, so a tunnel with no listeners cannot crash
+  the process.
+- **Shutdown of a connection.** When either side closes, the other is ended
+  rather than reset, so data still in the tunnel (a Logout, TLS's
+  `close_notify`) is delivered. A connection that has not fully closed 5 seconds
+  after the first side closed is destroyed.
+- **Lifecycle.** The tunnel's handles are unref'd, so the tunnel alone never
+  keeps the process alive (a started engine does). `close()` destroys live
+  connections at once. It is idempotent, and
+  `await using tunnel = await createTlsTunnel(...)` closes the tunnel at the end
+  of the block.
+
+**Security notes**
+
+- The plain-text hop listens on `127.0.0.1` only. As with stunnel, other
+  processes on the same host can still connect to that port, so treat the host
+  as trusted.
+- QuickFIX's own logs show the loopback address (`Connecting to 127.0.0.1 on
+  port ...`). Use the `'secureConnect'` event to see the real peer and its
+  certificate.
+- Tunnel traffic runs on the JS event loop, which the application handlers
+  already depend on. A blocked loop stalls both in the same way.
+
+**Acceptor side.** There is no in-process equivalent for acceptors. QuickFIX
+1.16's acceptor always listens on every interface, and it checks
+`AllowedRemoteAddresses` only after processing the Logon. A tunnel in front of
+it could therefore be bypassed by connecting to the plain port directly. To
+accept TLS, terminate it outside the process (stunnel in server mode, a load
+balancer, a service mesh) and firewall the acceptor's port.
+
+If you'd rather run stunnel as a sidecar on the initiator side, this config is
+equivalent to the example above:
+
+```ini
+[fix-broker]
+client = yes
+accept = 127.0.0.1:9001
+connect = fix.broker.com:9443
+CAfile = broker-ca.pem
+cert = client.pem
+key = client.key
+verifyChain = yes
+checkHost = fix.broker.com
+sslVersionMin = TLSv1.2
+```
+
 ### Session
 
 A handle on one **live** session, obtained from `engine.getSession(id)` or the
@@ -502,6 +609,8 @@ getSessions(): SessionID[];      // every session in this process, across all en
 numSessions(): number;
 
 version(): string;               // engine / addon version string
+
+createTlsTunnel(options: TlsTunnelOptions): Promise<TlsTunnel>; // see "TLS (stunnel-style) for initiators"
 
 FIELD        // field-name -> tag number, e.g. FIELD.MsgType === 35, FIELD.Password === 554
 MsgType      // MsgType values, e.g. MsgType.Logon === 'A'

@@ -25,6 +25,13 @@ export { Session, lookupSession, doesSessionExist, getSessions, numSessions } fr
 export { FixReject, fixReject } from './application.js';
 export type { ApplicationHandlers, FixRejectKind } from './application.js';
 export type { QuickFixError } from './native.js';
+export { createTlsTunnel } from './tls-tunnel.js';
+export type {
+  TlsTunnel,
+  TlsTunnelOptions,
+  TlsTunnelEvents,
+  TlsTunnelSecureConnectInfo,
+} from './tls-tunnel.js';
 
 // --- Enums / constants ----------------------------------------------------
 // Every other value group (ExecType, OrdStatus, SecurityType, ...) is reachable
