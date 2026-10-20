@@ -125,6 +125,13 @@ class ApplicationBridge : public FIX::Application {
   void Ref(Napi::Env env);
   void Unref(Napi::Env env);
 
+  // Drop what the bridge roots on the engine's behalf: the handlers object
+  // and the per-session dictionaries (see handlers_ below). JS thread only;
+  // call it once the engine is gone, or once no queued callback can reach JS
+  // any more (after Abort()). A callback dispatched afterwards passes
+  // through as if no handler were installed.
+  void DropHandlers();
+
   // Queue `fn` to run on the JS thread AFTER every callback already queued
   // (the TSFN queue is FIFO), and keep the event loop alive until it has run.
   // JS thread only; call it before Release()/Abort(). Returns false, without
@@ -167,6 +174,14 @@ class ApplicationBridge : public FIX::Application {
   std::map<FIX::SessionID, std::shared_ptr<const FIX::DataDictionary>>
       dictionaries_;
 
+  // The user's handlers object, held strongly for the engine's whole life so
+  // a started engine stays reachable through them (the wrapper's handlers
+  // close over the Engine), like a net.Server does through its listeners.
+  // That makes a reference cycle through native memory the GC cannot see:
+  // wrap -> bridge -> handlers -> Engine -> wrap. The wraps break it with
+  // DropHandlers() as soon as the engine is destroyed (stop() settled, or
+  // the force/failed-stop paths that abort the TSFN); the destructor's Reset
+  // is only the fallback for a wrap collected without stop().
   Napi::ObjectReference handlers_;
   TSFN tsfn_;
   bool released_ = false;

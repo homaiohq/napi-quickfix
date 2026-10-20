@@ -1,7 +1,17 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { setImmediate as nextMacrotask } from 'node:timers/promises';
+import v8 from 'node:v8';
+import vm from 'node:vm';
 
-import { Acceptor, Initiator, SessionSettings, SessionID } from '../dist/esm/index.js';
+import {
+  Acceptor,
+  Initiator,
+  SessionSettings,
+  SessionID,
+  type ApplicationHandlers,
+  type Engine,
+} from '../dist/esm/index.js';
 
 // Lifecycle smoke tests use engines with NO counterparty, so nothing logs on and
 // stop() tears down cleanly. A live logged-on session (with a real send -> fromApp
@@ -110,4 +120,99 @@ describe('Engine lifecycle (no counterparty)', () => {
     await ini.stop();
     await assert.doesNotReject(() => ini.stop());
   });
+});
+
+// A full GC on demand, without `--expose-gc` on the command line: the flag only
+// installs `gc` in contexts created after it is set, so take it from a fresh one.
+v8.setFlagsFromString('--expose-gc');
+const gc = vm.runInNewContext('gc') as () => void;
+
+/**
+ * Build an engine whose handlers and listeners close over it, as an application's
+ * typically do (the Engine's own native handlers close over it in any case). It is
+ * the bridge's reference to those handlers that used to make every engine immortal.
+ */
+function buildEngine(make: (handlers: ApplicationHandlers) => Engine): Engine {
+  let engine: Engine | undefined;
+  const handlers: ApplicationHandlers = {
+    onLogon() {
+      engine!.isLoggedOn();
+    },
+  };
+  engine = make(handlers);
+  engine.on('logout', () => engine!.getSessions());
+  return engine;
+}
+
+/**
+ * Create, (optionally start,) stop and drop `n` engines one after the other, in a
+ * frame of their own so no slot of the test body keeps the last one reachable.
+ * Sequential so each stop() has destroyed its sessions before the next engine
+ * claims the same SessionID.
+ */
+async function churnEngines(
+  n: number,
+  registry: FinalizationRegistry<number>,
+  make: (handlers: ApplicationHandlers) => Engine,
+  { start, force }: { start: boolean; force: boolean },
+): Promise<void> {
+  for (let i = 0; i < n; i++) {
+    const engine = buildEngine(make);
+    registry.register(engine, i);
+    if (start) {
+      engine.unref();
+      await engine.start();
+      await wait(50);
+    }
+    await engine.stop(force);
+  }
+}
+
+/** GC repeatedly until `count()` reaches `want` or the attempts run out. */
+async function collectUntil(count: () => number, want: number): Promise<number> {
+  for (let i = 0; i < 100 && count() < want; i++) {
+    gc();
+    // FinalizationRegistry callbacks run as tasks after the GC that cleared the target.
+    await nextMacrotask();
+  }
+  return count();
+}
+
+describe('Engine garbage collection', () => {
+  // Stopping a started engine joins its network thread, up to its 1 s poll
+  // timeout: keep the started cases short.
+  const N_IDLE = 5;
+  const N_STARTED = 2;
+  const initiator = (handlers: ApplicationHandlers) =>
+    new Initiator({
+      settings: SessionSettings.fromString(INITIATOR_CFG),
+      store: 'memory',
+      log: 'none',
+      handlers,
+    });
+  const acceptor = (handlers: ApplicationHandlers) =>
+    new Acceptor({
+      settings: SessionSettings.fromString(ACCEPTOR_CFG),
+      store: 'memory',
+      log: 'none',
+      handlers,
+    });
+
+  const cases: Array<[string, (h: ApplicationHandlers) => Engine, boolean, boolean]> = [
+    ['Initiator, never started, stop()', initiator, false, false],
+    ['Acceptor, never started, stop()', acceptor, false, false],
+    ['Initiator, started, stop()', initiator, true, false],
+    ['Initiator, started, stop(true)', initiator, true, true],
+    ['Acceptor, started, stop()', acceptor, true, false],
+  ];
+
+  for (const [label, make, start, force] of cases) {
+    test(`${label}: dropped engines are collected`, async () => {
+      const n = start ? N_STARTED : N_IDLE;
+      let finalized = 0;
+      const registry = new FinalizationRegistry<number>(() => finalized++);
+      await churnEngines(n, registry, make, { start, force });
+      assert.equal(await collectUntil(() => finalized, n), n);
+    });
+  }
 });

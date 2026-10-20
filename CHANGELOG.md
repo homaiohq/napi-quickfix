@@ -9,6 +9,19 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
+### Fixed
+
+- `Initiator`/`Acceptor` instances were never garbage-collected, started or not. The
+  native bridge held the handlers object (which closes over the `Engine`) for the
+  wrap's whole life, a cycle through native memory the GC cannot see, so every engine
+  kept its `Engine` object, listeners, both factories and, once a message had passed
+  through it, the parsed data dictionary of each session (about 3 MB per
+  acceptor+initiator pair with `FIX44.xml`). The bridge now drops the handlers and
+  the dictionaries as soon as the engine is destroyed: when `stop()` settles (after
+  the `'logout'` events a graceful stop fired have been dispatched), or right after a
+  force stop or a failed force stop aborted the callback queue. A started engine is
+  still kept alive by its handlers until it is stopped, like a `net.Server`.
+
 ## [0.3.0] - 2026-10-14
 
 Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
