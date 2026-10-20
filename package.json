@@ -1,6 +1,6 @@
 {
   "name": "@homaiohq/napi-quickfix",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Modern Node-API (N-API) C++ binding for the QuickFIX FIX-protocol engine.",
   "license": "MIT",
   "repository": {

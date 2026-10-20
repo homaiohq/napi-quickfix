@@ -9,6 +9,10 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-20
+
+Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
+
 ### Fixed
 
 - `Initiator`/`Acceptor` instances were never garbage-collected, started or not. The

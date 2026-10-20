@@ -30,7 +30,7 @@ void RegisterSessionStatic(Napi::Env env, Napi::Object exports);
 namespace {
 
 // Keep in sync with package.json "version".
-constexpr const char* kAddonVersion = "0.3.0";
+constexpr const char* kAddonVersion = "0.3.1";
 
 Napi::Value Version(const Napi::CallbackInfo& info) {
   return Napi::String::New(info.Env(), kAddonVersion);
