@@ -185,6 +185,14 @@ void AcceptorWrap::DestroyStoppedEngine() {
   SessionOpGate::Unregister(sessionIDs_, gate_.get());
   acceptor_.reset();
   gate_->Unfreeze();
+  // The engine is gone, so nothing will call the handlers again: drop the
+  // bridge's reference to them. It is what kept this wrap reachable from the
+  // user's Engine object (the handlers close over it) and so made the wrap
+  // -- and the Engine, its listeners and the parsed dictionaries -- immortal.
+  // On the graceful path this runs from the barrier queued behind every
+  // callback stop() fired, so none of them is lost; on the force path the
+  // TSFN was aborted first, discarding the queue.
+  if (bridge_) bridge_->DropHandlers();
 }
 
 Napi::Value AcceptorWrap::Start(const Napi::CallbackInfo& info) {
@@ -248,9 +256,13 @@ Napi::Value AcceptorWrap::Stop(const Napi::CallbackInfo& info) {
     return deferred.Promise();
   }
   if (!acceptor_) {
-    // Already torn down: just release the TSFN and resolve.
+    // Already torn down: just release the TSFN, drop the handlers (nothing
+    // can call them without an engine) and resolve.
     stopped_ = true;
-    if (bridge_) bridge_->Release();
+    if (bridge_) {
+      bridge_->Release();
+      bridge_->DropHandlers();
+    }
     deferred.Resolve(env.Undefined());
     return deferred.Promise();
   }
@@ -323,8 +335,15 @@ Napi::Value AcceptorWrap::Stop(const Napi::CallbackInfo& info) {
           self->gate_->Unfreeze();
           if (bridge) {
             if (force) {
+              // The abort discarded the queue: no callback can reach JS
+              // any more, so the handlers can go now.
               bridge->Abort();
+              bridge->DropHandlers();
             } else {
+              // Callbacks already queued (a trailing 'logout') are still
+              // dispatched after the release, and read the handlers: keep
+              // them. The retried stop() drops them in
+              // DestroyStoppedEngine().
               bridge->Release();
             }
           }

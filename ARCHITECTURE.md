@@ -227,7 +227,14 @@ throws. QuickFIX only deletes sessions — and removes them from the registry
 `lookupSession` reads — in the engine destructor, so `InitiatorWrap`/`AcceptorWrap` destroy their engine as soon
 as `stop()` settles (all network threads are joined by then) rather than waiting for GC. That is what makes a stale
 `Session` handle fail deterministically after `stop()`, and lets a new engine reuse the same `SessionID`s right
-after the old one has been stopped. A `SessionID` that is still live is refused: both wrap constructors throw
+after the old one has been stopped. The same point is where the wrap breaks the only cycle that could keep it
+alive: the bridge holds the handlers object strongly (so a started engine stays reachable through them, like a
+`net.Server` through its listeners), the handlers close over the `Engine`, and the `Engine` holds the wrap — a
+cycle through native memory the GC cannot see. `DestroyStoppedEngine()` calls `ApplicationBridge::DropHandlers()`,
+which also frees the per-session dictionaries the bridge cached for its `Message`s; neither `Release()` nor
+`Abort()` does, because callbacks queued before a graceful `Release()` (the `'logout'` events `stop()` fired) are
+still dispatched afterwards and read the handlers. A wrap dropped without `stop()` keeps everything, and its TSFN
+keeps the event loop alive, until the process exits. A `SessionID` that is still live is refused: both wrap constructors throw
 `ConfigError` "Duplicate Session" (`RejectDuplicateSessions`, `engine_common.h`). QuickFIX itself does **not**
 enforce that — its `Session` constructor ignores `addSession()`'s result and the only upstream "Duplicate Session"
 check is within one `SessionSettings` — so without it a second engine silently shadowed the first in the registry.

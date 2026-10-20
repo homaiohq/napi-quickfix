@@ -167,6 +167,18 @@ void ApplicationBridge::WakeAllPending() {
   }
 }
 
+void ApplicationBridge::DropHandlers() {
+  if (!handlers_.IsEmpty()) {
+    handlers_.Reset();
+  }
+  // The dictionaries pin a parsed FIX spec per session (a copy of the
+  // session's DataDictionaryProvider, which shares the dictionary's
+  // ownership); the sessions that could still want them are gone. Locked
+  // for form: the network threads that fill the map are joined by now.
+  std::lock_guard<std::mutex> lock(dictionariesMtx_);
+  dictionaries_.clear();
+}
+
 void ApplicationBridge::Ref(Napi::Env env) {
   if (!released_) {
     tsfn_.Ref(env);
