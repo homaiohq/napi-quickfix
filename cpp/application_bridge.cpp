@@ -364,7 +364,32 @@ void ApplicationBridge::fromApp(const FIX::Message& message,
 
 // ---------------------------------------------------------------------------
 // JS-thread trampoline. Runs on the Node event-loop thread.
+//
+// worker.terminate() can mark the environment unable to call into JS at any
+// time while the TSFN still dispatches what it holds: every Node-API call that
+// may run JS then fails and node-addon-api throws, so CallJs catches what a
+// stopping environment throws and lets the callback pass through, as after
+// Deactivate().
+// A handler interrupted mid-call leaves V8's termination marker (null) as the
+// pending exception, which node-addon-api cannot wrap in a stopping
+// environment without aborting: NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS
+// (CMakeLists.txt) covers that, and CanCallIntoJs tells the interruption from
+// a throw.
 // ---------------------------------------------------------------------------
+
+namespace {
+
+// A property lookup on a fresh object fails only in a stopping environment.
+bool CanCallIntoJs(napi_env env) {
+  napi_value object = nullptr;
+  napi_value key = nullptr;
+  bool has = false;
+  if (napi_create_object(env, &object) != napi_ok) return false;
+  if (napi_create_string_utf8(env, "p", 1, &key) != napi_ok) return false;
+  return napi_has_own_property(env, object, key, &has) == napi_ok;
+}
+
+}  // namespace
 
 void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
                                ApplicationBridge* context, CallData* data) {
@@ -391,6 +416,21 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
     }
   } guard{data, {}};
 
+  // A Napi::Error from a stopping environment is the interruption: pass
+  // through. Any other one is a real failure (a throwing handlers getter, a
+  // failed wrapper): rethrow it so the TSFN wrapper raises it as an uncaught JS
+  // exception. Other C++ exceptions would std::terminate there.
+  try {
+    CallJsBody(env, context, data, guard.result);
+  } catch (const Napi::Error&) {
+    if (env != nullptr && CanCallIntoJs(env)) throw;
+  } catch (...) {
+  }
+  // guard destructor signals the channel (for sync) and deletes data.
+}
+
+void ApplicationBridge::CallJsBody(Napi::Env env, ApplicationBridge* context,
+                                   CallData* data, Result& result) {
   if (data->type == CallType::kBarrier) {
     // Dropped (null env) or reached in FIFO order: either way, hand over.
     if (data->barrier) data->barrier(env);
@@ -423,7 +463,7 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
   bool haveMsg = false;
   if (data->hasMessage) {
     // Hand the structured copy over to the wrapper (data is deleted by the
-    // guard below): no string round-trip and no second copy, so the repeating
+    // guard above): no string round-trip and no second copy, so the repeating
     // groups the engine parsed stay intact for the handler.
     msgObj = MessageWrap::NewInstance(env, std::move(data->message),
                                       std::move(data->sessionDictionary));
@@ -442,37 +482,39 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
       handler.Call({sessionIdObj});
     }
   } catch (const Napi::Error& e) {
+    // Interrupted by terminate(), not a throw: pass-through.
+    if (!CanCallIntoJs(env)) {
+      return;
+    }
     if (isSync) {
-      guard.result.threw = true;
-      // Read a `.fixError` / name off the JS error to pick the FIX exception.
-      Napi::Value nameVal;
-      try {
-        nameVal = e.Value().As<Napi::Object>().Get("fixError");
-      } catch (...) {
-      }
-      if (nameVal.IsString()) {
-        guard.result.errorName = nameVal.As<Napi::String>().Utf8Value();
-      }
-      try {
-        guard.result.errorMessage = e.Message();
-      } catch (...) {
+      result.threw = true;
+      // `.fixError` picks the FIX exception; a non-object throw has none.
+      Napi::Value value = e.Value();
+      if (value.IsObject()) {
+        Napi::Object error = value.As<Napi::Object>();
+        Napi::Value name = error.Get("fixError");
+        if (name.IsString()) {
+          result.errorName = name.As<Napi::String>().Utf8Value();
+        }
+        Napi::Value message = error.Get("message");
+        if (message.IsString()) {
+          result.errorMessage = message.As<Napi::String>().Utf8Value();
+        }
       }
     }
     // For fire-and-forget, the JS error is swallowed here (there's no FIX-thread
     // waiting). Reported best-effort by leaving it; QuickFIX doesn't care.
+    return;
   }
 
   // For mutating sync callbacks, read back the (possibly edited) message.
-  if (isSync && IsMutating(data->type) && haveMsg && !guard.result.threw) {
-    try {
-      MessageWrap* w = Napi::ObjectWrap<MessageWrap>::Unwrap(msgObj);
-      guard.result.editedMessage = w->Message();
-      guard.result.mutated = true;
-    } catch (...) {
-      guard.result.mutated = false;
+  if (isSync && IsMutating(data->type) && haveMsg) {
+    MessageWrap* w = Napi::ObjectWrap<MessageWrap>::Unwrap(msgObj);
+    if (w != nullptr) {
+      result.editedMessage = w->Message();
+      result.mutated = true;
     }
   }
-  // guard destructor signals the channel (for sync) and deletes data.
 }
 
 }  // namespace napi_quickfix

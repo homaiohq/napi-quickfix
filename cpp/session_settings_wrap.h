@@ -25,7 +25,6 @@ class SessionSettingsWrap : public Napi::ObjectWrap<SessionSettingsWrap> {
                                      const char* argName);
 
  private:
-  static Napi::FunctionReference constructor_;
 
   static Napi::Value FromString(const Napi::CallbackInfo& info);
   static Napi::Value FromFile(const Napi::CallbackInfo& info);

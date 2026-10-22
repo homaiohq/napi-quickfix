@@ -1,5 +1,7 @@
 #include "group_wrap.h"
 
+#include "addon_data.h"
+
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -8,8 +10,6 @@
 #include "field_map_ops.h"
 
 namespace napi_quickfix {
-
-Napi::FunctionReference GroupWrap::constructor_;
 
 Napi::Object GroupWrap::Init(Napi::Env env, Napi::Object exports) {
   Napi::Function func = DefineClass(
@@ -35,8 +35,7 @@ Napi::Object GroupWrap::Init(Napi::Env env, Napi::Object exports) {
           InstanceMethod("groupCount", &GroupWrap::GroupCount),
       });
 
-  constructor_ = Napi::Persistent(func);
-  constructor_.SuppressDestruct();
+  AddonData::Get(env).group = Napi::Persistent(func);
 
   exports.Set("GroupWrap", func);
   return exports;
@@ -44,11 +43,11 @@ Napi::Object GroupWrap::Init(Napi::Env env, Napi::Object exports) {
 
 // The entry travels to the constructor as an External, which JS code cannot
 // forge, so the constructor can tell this internal path from a user call. The
-// pointer is only read, and only during constructor_.New (Napi::External
+// pointer is only read, and only during AddonData::Get(env).group.New (Napi::External
 // takes a non-const pointer, hence the cast).
 Napi::Object GroupWrap::NewInstance(Napi::Env env, int tag, int delim,
                                     const FIX::FieldMap& entry) {
-  return constructor_.New(
+  return AddonData::Get(env).group.New(
       {Napi::External<FIX::FieldMap>::New(env,
                                           const_cast<FIX::FieldMap*>(&entry)),
        Napi::Number::New(env, tag), Napi::Number::New(env, delim)});
@@ -57,7 +56,7 @@ Napi::Object GroupWrap::NewInstance(Napi::Env env, int tag, int delim,
 GroupWrap* GroupWrap::UnwrapArg(Napi::Env env, Napi::Value value,
                                 const char* argName) {
   if (!value.IsObject() ||
-      !value.As<Napi::Object>().InstanceOf(constructor_.Value())) {
+      !value.As<Napi::Object>().InstanceOf(AddonData::Get(env).group.Value())) {
     throw Napi::TypeError::New(
         env, std::string(argName) + " must be a Group instance");
   }

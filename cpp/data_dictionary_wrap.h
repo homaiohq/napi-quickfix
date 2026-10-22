@@ -38,7 +38,6 @@ class DataDictionaryWrap : public Napi::ObjectWrap<DataDictionaryWrap> {
                                        const char* argName);
 
  private:
-  static Napi::FunctionReference constructor_;
 
   static Napi::Value FromFile(const Napi::CallbackInfo& info);
   static Napi::Value FromString(const Napi::CallbackInfo& info);

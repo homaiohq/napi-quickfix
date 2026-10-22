@@ -33,7 +33,6 @@ class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap> {
   ~InitiatorWrap() override;
 
  private:
-  static Napi::FunctionReference constructor_;
 
   Napi::Value Start(const Napi::CallbackInfo& info);
   Napi::Value Stop(const Napi::CallbackInfo& info);

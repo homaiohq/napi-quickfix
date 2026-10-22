@@ -51,7 +51,6 @@ class MessageWrap : public Napi::ObjectWrap<MessageWrap> {
                              const char* argName);
 
  private:
-  static Napi::FunctionReference constructor_;
 
   // The section (header / body / trailer) that owns `tag`.
   FIX::FieldMap& SectionFor(int tag);

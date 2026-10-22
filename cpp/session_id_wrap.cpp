@@ -1,12 +1,12 @@
 #include "session_id_wrap.h"
 
+#include "addon_data.h"
+
 #include <string>
 
 #include "errors.h"
 
 namespace napi_quickfix {
-
-Napi::FunctionReference SessionIDWrap::constructor_;
 
 Napi::Object SessionIDWrap::Init(Napi::Env env, Napi::Object exports) {
   Napi::Function func = DefineClass(
@@ -20,8 +20,7 @@ Napi::Object SessionIDWrap::Init(Napi::Env env, Napi::Object exports) {
           InstanceMethod("toString", &SessionIDWrap::ToString),
       });
 
-  constructor_ = Napi::Persistent(func);
-  constructor_.SuppressDestruct();
+  AddonData::Get(env).sessionID = Napi::Persistent(func);
 
   exports.Set("SessionIDWrap", func);
   return exports;
@@ -29,18 +28,18 @@ Napi::Object SessionIDWrap::Init(Napi::Env env, Napi::Object exports) {
 
 Napi::Object SessionIDWrap::NewInstance(Napi::Env env,
                                         const FIX::SessionID& id) {
-  Napi::Object obj = constructor_.New(
-      {Napi::String::New(env, id.getBeginString().getValue()),
-       Napi::String::New(env, id.getSenderCompID().getValue()),
-       Napi::String::New(env, id.getTargetCompID().getValue()),
-       Napi::String::New(env, id.getSessionQualifier())});
-  return obj;
+  return AddonData::Get(env).sessionID.New({
+      Napi::String::New(env, id.getBeginString().getValue()),
+      Napi::String::New(env, id.getSenderCompID().getValue()),
+      Napi::String::New(env, id.getTargetCompID().getValue()),
+      Napi::String::New(env, id.getSessionQualifier()),
+  });
 }
 
 SessionIDWrap* SessionIDWrap::UnwrapArg(Napi::Env env, Napi::Value value,
                                      const char* argName) {
   if (!value.IsObject() ||
-      !value.As<Napi::Object>().InstanceOf(constructor_.Value())) {
+      !value.As<Napi::Object>().InstanceOf(AddonData::Get(env).sessionID.Value())) {
     throw Napi::TypeError::New(
         env, std::string(argName) + " must be a SessionID instance");
   }

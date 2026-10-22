@@ -1,5 +1,7 @@
 #include "initiator_wrap.h"
 
+#include "addon_data.h"
+
 #include <memory>
 #include <string>
 
@@ -15,8 +17,6 @@
 #include "session_wrap.h"
 
 namespace napi_quickfix {
-
-Napi::FunctionReference InitiatorWrap::constructor_;
 
 namespace {
 
@@ -43,8 +43,7 @@ Napi::Object InitiatorWrap::Init(Napi::Env env, Napi::Object exports) {
           InstanceMethod("ref", &InitiatorWrap::Ref),
           InstanceMethod("unref", &InitiatorWrap::Unref),
       });
-  constructor_ = Napi::Persistent(func);
-  constructor_.SuppressDestruct();
+  AddonData::Get(env).initiator = Napi::Persistent(func);
   exports.Set("InitiatorWrap", func);
   return exports;
 }
@@ -219,20 +218,14 @@ void InitiatorWrap::DestroyStoppedEngine() {
 
 Napi::Value InitiatorWrap::Start(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  auto deferred = Napi::Promise::Deferred::New(env);
   if (stopped_) {
-    deferred.Reject(Napi::Error::New(env, "Initiator has been stopped").Value());
-    return deferred.Promise();
+    return RejectedPromise(env, "Initiator has been stopped");
   }
   if (started_) {
-    deferred.Resolve(env.Undefined());
-    return deferred.Promise();
+    return ResolvedPromise(env);
   }
   if (busy_) {
-    deferred.Reject(
-        Napi::Error::New(env, "Initiator start/stop already in progress")
-            .Value());
-    return deferred.Promise();
+    return RejectedPromise(env, "Initiator start/stop already in progress");
   }
   busy_ = true;
   started_ = true;  // set optimistically; reset in onSettled on failure
@@ -260,7 +253,6 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
   if (info.Length() >= 1 && !info[0].IsUndefined()) {
     force = info[0].ToBoolean().Value();
   }
-  auto deferred = Napi::Promise::Deferred::New(env);
   // A stop() is in flight (its worker is running, or a graceful stop is
   // waiting for its queued 'logout' events to be dispatched before destroying
   // the engine): join it. Resolving right away here -- `stopped_` is already
@@ -270,14 +262,10 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
     return stopPromise_.Value();
   }
   if (stopped_) {
-    deferred.Resolve(env.Undefined());
-    return deferred.Promise();
+    return ResolvedPromise(env);
   }
   if (busy_) {
-    deferred.Reject(
-        Napi::Error::New(env, "Initiator start/stop already in progress")
-            .Value());
-    return deferred.Promise();
+    return RejectedPromise(env, "Initiator start/stop already in progress");
   }
   if (!initiator_) {
     // Already torn down: just release the TSFN, drop the handlers (nothing
@@ -287,8 +275,7 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
       bridge_->Release();
       bridge_->DropHandlers();
     }
-    deferred.Resolve(env.Undefined());
-    return deferred.Promise();
+    return ResolvedPromise(env);
   }
   busy_ = true;
   stopped_ = true;

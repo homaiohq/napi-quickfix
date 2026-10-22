@@ -3,12 +3,16 @@ import assert from 'node:assert/strict';
 import { setImmediate as nextMacrotask } from 'node:timers/promises';
 import v8 from 'node:v8';
 import vm from 'node:vm';
+import { Worker } from 'node:worker_threads';
 
 import {
   Acceptor,
   Initiator,
   SessionSettings,
   SessionID,
+  createMessage,
+  FIELD,
+  MsgType,
   type ApplicationHandlers,
   type Engine,
 } from '../dist/esm/index.js';
@@ -215,4 +219,99 @@ describe('Engine garbage collection', () => {
       assert.equal(await collectUntil(() => finalized, n), n);
     });
   }
+});
+
+// --- regression: resources that must not accumulate per engine ---------------
+
+// Promise objects in the heap after a full GC, from a heap snapshot: it sees a
+// Promise rooted only from native memory (an unsettled napi_deferred).
+async function countPromises(): Promise<number> {
+  // Two full GCs with a macrotask between: the first clears, the second
+  // collects what the first's finalizers released.
+  for (let i = 0; i < 2; i++) {
+    gc();
+    await nextMacrotask();
+  }
+  const chunks: Buffer[] = [];
+  for await (const chunk of v8.getHeapSnapshot()) chunks.push(chunk as Buffer);
+  const snapshot = JSON.parse(Buffer.concat(chunks).toString()) as {
+    snapshot: { meta: { node_fields: string[]; node_types: string[][] } };
+    nodes: number[];
+    strings: string[];
+  };
+  const fields = snapshot.snapshot.meta.node_fields;
+  const stride = fields.length;
+  const typeIndex = fields.indexOf('type');
+  const nameIndex = fields.indexOf('name');
+  const types = snapshot.snapshot.meta.node_types[typeIndex];
+  let count = 0;
+  for (let i = 0; i < snapshot.nodes.length; i += stride) {
+    if (
+      types[snapshot.nodes[i + typeIndex]] === 'object' &&
+      snapshot.strings[snapshot.nodes[i + nameIndex]] === 'Promise'
+    ) {
+      count++;
+    }
+  }
+  return count;
+}
+
+describe('Engine resource regressions', () => {
+  test('start()/stop() do not root a Promise per call', { timeout: 60000 }, async () => {
+    // Each cycle takes all four worker paths, so one leaking path roots at
+    // least N Promises. Stopping a started engine takes up to 1 s, bounding N.
+    const churn = async (n: number) => {
+      for (let i = 0; i < n; i++) {
+        const ini = new Initiator({ settings: SessionSettings.fromString(INITIATOR_CFG), store: 'memory', log: 'none' });
+        ini.unref();
+        await ini.start();
+        await ini.stop();
+        const acc = new Acceptor({ settings: SessionSettings.fromString(ACCEPTOR_CFG), store: 'memory', log: 'none' });
+        acc.unref();
+        await acc.start();
+        await acc.stop();
+      }
+    };
+    // First calls populate lazily created state: measure from a warm process.
+    await churn(1);
+    const before = await countPromises();
+    const N = 8;
+    await churn(N);
+    const retained = (await countPromises()) - before;
+    assert.ok(retained < N, `${retained} Promises retained after ${N} engines were started and stopped`);
+  });
+
+  describe('worker_threads', () => {
+    const WORKER = new URL('./fixtures/worker-load.mjs', import.meta.url);
+    const runWorker = (mode: string, until: 'exit' | 'message'): Promise<Worker> =>
+      new Promise((resolve, reject) => {
+        const worker = new Worker(WORKER, { workerData: { mode } });
+        worker.on('error', reject);
+        if (until === 'exit') {
+          worker.on('exit', (code) =>
+            code === 0 ? resolve(worker) : reject(new Error(`worker exited with ${code}`)),
+          );
+        } else {
+          worker.once('message', () => resolve(worker));
+        }
+      });
+
+    test('Workers that load the addon leave the main thread and each other intact', { timeout: 60000 }, async () => {
+      for (let i = 0; i < 3; i++) {
+        await runWorker('churn', 'exit');
+        // The main thread's constructors must still be the main thread's.
+        const ini = new Initiator({ settings: SessionSettings.fromString(INITIATOR_CFG), store: 'memory', log: 'none' });
+        assert.equal(ini.getSessions().length, 1);
+        await ini.stop();
+        assert.equal(createMessage({ [FIELD.MsgType]: MsgType.NewOrderSingle }).getMsgType(), MsgType.NewOrderSingle);
+      }
+    });
+
+    test('terminate() while a callback is being dispatched does not abort the process', { timeout: 60000 }, async () => {
+      for (let i = 0; i < 3; i++) {
+        const worker = await runWorker('terminate', 'message');
+        await worker.terminate();
+      }
+    });
+  });
 });

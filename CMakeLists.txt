@@ -105,6 +105,7 @@ target_compile_definitions(napi_quickfix PRIVATE
   NAPI_VERSION=9
   NAPI_CPP_EXCEPTIONS
   NODE_ADDON_API_DISABLE_DEPRECATED
+  NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS  # see the trampoline in cpp/application_bridge.cpp
 )
 
 target_link_libraries(napi_quickfix PRIVATE ${CMAKE_JS_LIB} quickfix)

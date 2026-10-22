@@ -30,7 +30,6 @@ class SessionIDWrap : public Napi::ObjectWrap<SessionIDWrap> {
                                const char* argName);
 
  private:
-  static Napi::FunctionReference constructor_;
 
   Napi::Value GetBeginString(const Napi::CallbackInfo& info);
   Napi::Value GetSenderCompID(const Napi::CallbackInfo& info);

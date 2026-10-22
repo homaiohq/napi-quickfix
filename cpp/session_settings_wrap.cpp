@@ -1,5 +1,7 @@
 #include "session_settings_wrap.h"
 
+#include "addon_data.h"
+
 #include <set>
 #include <sstream>
 #include <string>
@@ -10,8 +12,6 @@
 
 namespace napi_quickfix {
 
-Napi::FunctionReference SessionSettingsWrap::constructor_;
-
 Napi::Object SessionSettingsWrap::Init(Napi::Env env, Napi::Object exports) {
   Napi::Function func = DefineClass(
       env, "SessionSettings",
@@ -21,8 +21,7 @@ Napi::Object SessionSettingsWrap::Init(Napi::Env env, Napi::Object exports) {
           InstanceMethod("getSessions", &SessionSettingsWrap::GetSessions),
       });
 
-  constructor_ = Napi::Persistent(func);
-  constructor_.SuppressDestruct();
+  AddonData::Get(env).sessionSettings = Napi::Persistent(func);
 
   exports.Set("SessionSettingsWrap", func);
   return exports;
@@ -32,7 +31,7 @@ SessionSettingsWrap* SessionSettingsWrap::UnwrapArg(Napi::Env env,
                                                  Napi::Value value,
                                                  const char* argName) {
   if (!value.IsObject() ||
-      !value.As<Napi::Object>().InstanceOf(constructor_.Value())) {
+      !value.As<Napi::Object>().InstanceOf(AddonData::Get(env).sessionSettings.Value())) {
     throw Napi::TypeError::New(
         env, std::string(argName) + " must be a SessionSettings instance");
   }
@@ -69,7 +68,7 @@ Napi::Value SessionSettingsWrap::FromString(const Napi::CallbackInfo& info) {
   if (info.Length() < 1 || !info[0].IsString()) {
     throw Napi::TypeError::New(env, "fromString(text: string)");
   }
-  return constructor_.New(
+  return AddonData::Get(env).sessionSettings.New(
       {Napi::String::New(env, "string"), info[0].As<Napi::String>()});
 }
 
@@ -78,7 +77,7 @@ Napi::Value SessionSettingsWrap::FromFile(const Napi::CallbackInfo& info) {
   if (info.Length() < 1 || !info[0].IsString()) {
     throw Napi::TypeError::New(env, "fromFile(path: string)");
   }
-  return constructor_.New(
+  return AddonData::Get(env).sessionSettings.New(
       {Napi::String::New(env, "file"), info[0].As<Napi::String>()});
 }
 

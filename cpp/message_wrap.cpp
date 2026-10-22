@@ -1,5 +1,7 @@
 #include "message_wrap.h"
 
+#include "addon_data.h"
+
 #include <algorithm>
 #include <string>
 #include <utility>
@@ -10,8 +12,6 @@
 #include "quickfix/FieldNumbers.h"
 
 namespace napi_quickfix {
-
-Napi::FunctionReference MessageWrap::constructor_;
 
 Napi::Object MessageWrap::Init(Napi::Env env, Napi::Object exports) {
   Napi::Function func = DefineClass(
@@ -43,8 +43,7 @@ Napi::Object MessageWrap::Init(Napi::Env env, Napi::Object exports) {
           InstanceMethod("getMsgType", &MessageWrap::GetMsgType),
       });
 
-  constructor_ = Napi::Persistent(func);
-  constructor_.SuppressDestruct();
+  AddonData::Get(env).message = Napi::Persistent(func);
 
   exports.Set("MessageWrap", func);
   return exports;
@@ -54,7 +53,7 @@ Napi::Object MessageWrap::Init(Napi::Env env, Napi::Object exports) {
 // move keeps the nested entries typed by itself: FieldMap's move assignment
 // takes the entry pointers over.
 Napi::Object MessageWrap::NewInstance(Napi::Env env, const FIX::Message& msg) {
-  Napi::Object obj = constructor_.New({});
+  Napi::Object obj = AddonData::Get(env).message.New({});
   MessageWrap* wrap = Napi::ObjectWrap<MessageWrap>::Unwrap(obj);
   fieldmap::CloneMessage(wrap->message_, msg);
   return obj;
@@ -63,7 +62,7 @@ Napi::Object MessageWrap::NewInstance(Napi::Env env, const FIX::Message& msg) {
 Napi::Object MessageWrap::NewInstance(
     Napi::Env env, FIX::Message&& msg,
     std::shared_ptr<const FIX::DataDictionary> sessionDictionary) {
-  Napi::Object obj = constructor_.New({});
+  Napi::Object obj = AddonData::Get(env).message.New({});
   MessageWrap* wrap = Napi::ObjectWrap<MessageWrap>::Unwrap(obj);
   wrap->message_ = std::move(msg);
   wrap->sessionDictionary_ = std::move(sessionDictionary);
@@ -73,7 +72,7 @@ Napi::Object MessageWrap::NewInstance(
 MessageWrap* MessageWrap::UnwrapArg(Napi::Env env, Napi::Value value,
                                  const char* argName) {
   if (!value.IsObject() ||
-      !value.As<Napi::Object>().InstanceOf(constructor_.Value())) {
+      !value.As<Napi::Object>().InstanceOf(AddonData::Get(env).message.Value())) {
     throw Napi::TypeError::New(
         env, std::string(argName) + " must be a Message instance");
   }
