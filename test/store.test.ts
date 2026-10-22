@@ -266,6 +266,30 @@ HeartBtInt=30
     assert.equal(doesSessionExist(ACC_ID), false);
   });
 
+  test('create() rejects with TypeError when load() returns a seqnum at or above 2^53', async () => {
+    // Refused by validState() in the TS preload, like the `0` case above
+    // (ReadSeq() in native guards the same bound on the reload paths).
+    const port = await freePort();
+    for (const state of [
+      { creationTime: new Date(), nextSenderMsgSeqNum: 2 ** 53, nextTargetMsgSeqNum: 1 },
+      { creationTime: new Date(), nextSenderMsgSeqNum: 1, nextTargetMsgSeqNum: 2 ** 53 },
+    ]) {
+      const bad: MessageStoreAdapter = {
+        load: () => state,
+        create: () => {},
+        setSeqNums: () => {},
+        setMessage: () => {},
+        getMessages: () => [],
+        reset: () => {},
+      };
+      await assert.rejects(
+        () => Initiator.create({ settings: SessionSettings.fromString(initiatorCfg(port)), store: bad, log: 'none' }),
+        { name: 'TypeError', message: /must be a positive safe integer/ },
+      );
+      assert.equal(doesSessionExist(INI_ID), false);
+    }
+  });
+
   test('a session constructed outside its session time resets through the adapter on the JS thread; create() awaits it', async () => {
     const port = await freePort();
     // A one-hour window starting two hours from now: "now" is outside it.
@@ -750,6 +774,67 @@ describe('MessageStoreAdapter: failure policy', () => {
       assert.ok(Date.now() - t0 < 10_000);
     } finally {
       await stopBoth(acc, ini, true);
+    }
+  });
+
+  test('a SequenceReset with NewSeqNo above 2^53 is refused before the adapter: row and cache unchanged, storeError (not poisoned), disconnect', { timeout: 30_000 }, async () => {
+    const port = await freePort();
+    // Record every seqnum pair the adapter is asked to write: a value above
+    // 2^53-1 would arrive rounded (9007199254740993 -> ...992), and either
+    // fails Number.isSafeInteger.
+    const base = new ControlledStore(undefined, 1);
+    const written: Array<[number, number]> = [];
+    const iniStore: MessageStoreAdapter = {
+      load: (id) => base.load(id),
+      create: (id, s) => base.create(id, s),
+      setSeqNums: (id, s, t) => {
+        written.push([s, t]);
+        return base.setSeqNums(id, s, t);
+      },
+      setMessage: (id, n, m) => base.setMessage(id, n, m),
+      getMessages: (id, b, e) => base.getMessages(id, b, e),
+      reset: (id, s) => base.reset(id, s),
+      close: (id) => base.close(id),
+    };
+    // No heartbeat and no reconnect inside the test window, so the only
+    // write the initiator could make is the one the SequenceReset asks for;
+    // ResetOnLogon=N so a reconnect could not rewrite the row either.
+    const quiet = { HeartBtInt: '60', ReconnectInterval: '60', ResetOnLogon: 'N' };
+    const { acc, ini, storeErrors } = await makePair(port, { iniStore, acc: { ResetOnLogon: 'N' }, ini: quiet });
+    try {
+      await logonBoth(acc, ini);
+      const session = ini.getSession(INI_ID)!;
+      const before = base.row(INI_ID).state.nextTargetMsgSeqNum;
+      assert.equal(session.getExpectedTargetNum(), before);
+      // GapFillFlag=N: QuickFIX skips the seqnum checks and calls
+      // setNextTargetMsgSeqNum(NewSeqNo) with the exact 64-bit value. The
+      // value is a string: 9007199254740993 has no JS number representation.
+      const sequenceReset = createMessage()
+        .setField(FIELD.MsgType, MsgType.SequenceReset)
+        .setField(FIELD.GapFillFlag, 'N')
+        .setField(FIELD.NewSeqNo, '9007199254740993');
+      const logout = waitForEvent(ini, 'logout', 'initiator disconnect', T);
+      assert.equal(await sendToTarget(sequenceReset, ACC_ID), true);
+      // The refusal is an IOException inside Session::next(Message), whose
+      // handler disconnects; the report crosses the bridge on its own.
+      await logout;
+      assert.ok(await waitUntil(() => storeErrors.some((e) => e.method === 'setSeqNums'), T));
+      assert.equal(session.isLoggedOn(), false);
+      const refusals = storeErrors.filter((e) => e.method === 'setSeqNums');
+      assert.equal(refusals.length, 1);
+      assert.equal(refusals[0].poisoned, false, 'nothing reached the adapter: cache and row are equal, no poison');
+      assert.match(refusals[0].message, /setNextTargetMsgSeqNum\(9007199254740993\)/, 'the exact value reached the guard');
+      assert.match(refusals[0].message, /9007199254740991 \(2\^53-1/);
+      assert.equal(base.row(INI_ID).state.nextTargetMsgSeqNum, before, 'the row is unchanged');
+      assert.equal(session.getExpectedTargetNum(), before, 'so is the cache');
+      assert.ok(written.length > 0);
+      assert.ok(
+        written.every(([s, t]) => Number.isSafeInteger(s) && Number.isSafeInteger(t) && t <= before),
+        `no rounded value was ever written: ${JSON.stringify(written)}`,
+      );
+      assert.doesNotThrow(() => session.getExpectedSenderNum(), 'not poisoned: the getters still answer');
+    } finally {
+      await stopBoth(acc, ini);
     }
   });
 

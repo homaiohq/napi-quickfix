@@ -34,8 +34,10 @@ export interface MessageStoreState {
  * threads block that thread, not the event loop, until the Promise settles,
  * bounded by `storeTimeoutMs`.
  *
- * Sequence numbers cross as `number`; values at or above 2^53 are not
- * supported.
+ * Sequence numbers cross as `number` and are refused in both directions
+ * above `Number.MAX_SAFE_INTEGER` (2^53-1): a {@link load} result above it
+ * fails, and the engine never asks the adapter to write one (the write is
+ * refused and reported as a `'storeError'` instead of being rounded).
  */
 export interface MessageStoreAdapter {
   /**

@@ -46,6 +46,15 @@
 //     a late write has landed) and the next call of any kind has reloaded
 //     the cache through load(); at most one reload is in flight, and a
 //     failed reload keeps the store poisoned for the next attempt.
+//   * A sequence number above 2^53-1 (Number.MAX_SAFE_INTEGER) is refused
+//     BEFORE it reaches the bridge: the dispatcher hands seqnums to JS as
+//     doubles, so a larger value would arrive rounded and the adapter would
+//     persist a number the engine never had (ReadSeq() already refuses such
+//     values coming back). The counterparty can reach it (a SequenceReset
+//     with GapFillFlag=N carries a 64-bit NewSeqNo into
+//     setNextTargetMsgSeqNum()). Refused like a non-fatal adapter failure:
+//     IOException + 'storeError', no poison (nothing was sent, cache and DB
+//     are still equal), and QuickFIX's handler disconnects the session.
 //   * reset(), refresh(), getCreationTime() and getNextTargetMsgSeqNum()
 //     NEVER throw into QuickFIX, because each has a call site with no
 //     handler: Session::disconnect() (ResetOnDisconnect=Y) runs reset()
@@ -300,6 +309,10 @@ class JsMessageStore : public FIX::MessageStore {
   void LogEvent(const std::string& text) const;
   // Throw IOException (helper so the message shape is uniform).
   [[noreturn]] void Throw(Factory::Method method, const std::string& why) const;
+  // Refuse a sequence number a JS number cannot carry exactly (> 2^53-1)
+  // before it is forwarded: reports a non-poisoning 'storeError' for
+  // `method` and throws IOException. `what` names the member for the text.
+  void CheckSafeSeq(FIX::SEQNUM n, Factory::Method method, const char* what) const;
 
   Factory& factory_;
   FIX::SessionID id_;

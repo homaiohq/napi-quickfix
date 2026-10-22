@@ -700,6 +700,15 @@ the session log.
 - `reset()` and `refresh()` never raise into QuickFIX, which runs them on
   paths without a handler (`ResetOnDisconnect=Y` inside its own error handler,
   `RefreshOnLogon=Y` on the connect path); they poison and report instead.
+- Sequence numbers cross as JS `number`s, exact only up to **2^53-1**
+  (`Number.MAX_SAFE_INTEGER`). A `load()` result above that is refused
+  (`create()` rejects with `TypeError`, a reload fails with `IOException`),
+  and the engine never hands the adapter a larger value either: a sequence
+  number above the limit — a counterparty's `SequenceReset` with such a
+  `NewSeqNo`, or an increment past it — is refused before the write, reported
+  as a `'storeError'` with `poisoned: false` (nothing reached the adapter, cache
+  and row are still equal), and the session disconnects, instead of a rounded
+  number being persisted.
 
 **`stop()`.** `stop(true)` fails every pending store call first, so a stalled
 adapter cannot hold it up. A graceful `stop()` lets in-flight writes complete

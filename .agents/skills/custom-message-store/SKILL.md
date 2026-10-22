@@ -83,7 +83,7 @@ export interface MessageStoreState {
  * (or a synchronous throw) surfaces to the engine as an IOException. Calls
  * made from the engine's threads block that thread, not the event loop, until
  * the Promise settles, bounded by `storeTimeoutMs`.
- * Sequence numbers cross as `number`; values at or above 2^53 are not supported.
+ * Sequence numbers cross as `number`; values above 2^53-1 are refused in both directions.
  */
 export interface MessageStoreAdapter {
   /** The persisted state of `sessionID`, or `null` if the session has never been seen. */

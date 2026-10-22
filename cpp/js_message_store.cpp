@@ -605,6 +605,25 @@ void JsMessageStore::Throw(Factory::Method method, const std::string& why) const
                          Factory::MethodName(method) + ": " + why);
 }
 
+// Sequence numbers cross the bridge as JS numbers (doubles), exact only up to
+// 2^53-1; ReadSeq() refuses larger values coming back from JS, this refuses
+// them going out. Reached by a counterparty's SequenceReset (GapFillFlag=N,
+// a 64-bit NewSeqNo) or by an increment past the limit. Nothing has been
+// forwarded, so cache and adapter are still equal: report without poison
+// (the non-fatal path of Forward()) and throw; QuickFIX's IOException
+// handler disconnects the session.
+void JsMessageStore::CheckSafeSeq(FIX::SEQNUM n, Factory::Method method,
+                                  const char* what) const {
+  constexpr FIX::SEQNUM kMaxSafeSeq = 9007199254740991ULL;  // 2^53-1
+  if (n <= kMaxSafeSeq) return;
+  const std::string why =
+      std::string(what) + "(" + std::to_string(n) +
+      "): sequence numbers above 9007199254740991 (2^53-1, Number.MAX_SAFE_INTEGER)"
+      " cannot reach the adapter exactly; refused before the write";
+  factory_.ReportError(id_, method, why, /*poisoned=*/false, /*late=*/false);
+  Throw(method, why);
+}
+
 void JsMessageStore::LogEvent(const std::string& text) const {
   if (factory_.OnJsThread()) return;
   FIX::Session* session = FIX::Session::lookupSession(id_);
@@ -699,6 +718,7 @@ JsMessageStore::Factory::Outcome JsMessageStore::Forward(Factory::Request req,
 
 bool JsMessageStore::set(FIX::SEQNUM seq, const std::string& msg)
     EXCEPT(FIX::IOException) {
+  CheckSafeSeq(seq, Factory::Method::kSetMessage, "set");
   Gate("setMessage");
   Factory::Request r;
   r.method = Factory::Method::kSetMessage;
@@ -756,6 +776,7 @@ FIX::UtcTimeStamp JsMessageStore::getCreationTime() const EXCEPT(FIX::IOExceptio
 }
 
 void JsMessageStore::setNextSenderMsgSeqNum(FIX::SEQNUM n) EXCEPT(FIX::IOException) {
+  CheckSafeSeq(n, Factory::Method::kSetSeqNums, "setNextSenderMsgSeqNum");
   Gate("setNextSenderMsgSeqNum");
   Factory::Request r;
   r.method = Factory::Method::kSetSeqNums;
@@ -770,6 +791,7 @@ void JsMessageStore::setNextSenderMsgSeqNum(FIX::SEQNUM n) EXCEPT(FIX::IOExcepti
 }
 
 void JsMessageStore::setNextTargetMsgSeqNum(FIX::SEQNUM n) EXCEPT(FIX::IOException) {
+  CheckSafeSeq(n, Factory::Method::kSetSeqNums, "setNextTargetMsgSeqNum");
   Gate("setNextTargetMsgSeqNum");
   Factory::Request r;
   r.method = Factory::Method::kSetSeqNums;

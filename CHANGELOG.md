@@ -28,7 +28,11 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   the next logon. `reset()`/`refresh()` never throw into QuickFIX (its
   `ResetOnDisconnect`/`RefreshOnLogon` paths have no handler; observed `std::terminate`).
   `stop(true)` fails pending store calls first; a graceful `stop()` lets them complete
-  and calls `close()` per session before settling. `MapMessageStore` (in-memory
+  and calls `close()` per session before settling. Sequence numbers above 2^53-1
+  (`Number.MAX_SAFE_INTEGER`) are refused in both directions: a `load()` result above it
+  fails, and a write of one (a counterparty's `SequenceReset` can ask for it) is reported
+  as a non-poisoning `'storeError'` and disconnects the session instead of persisting a
+  rounded value. `MapMessageStore` (in-memory
   reference implementation) is exported; README "Message store" has the threading and
   latency contract (bound in-flight sends; an adapter must not depend on the libuv
   threadpool).

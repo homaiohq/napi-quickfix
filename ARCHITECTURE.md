@@ -228,7 +228,11 @@ sequenceDiagram
 - **Failure policy** (README "Message store"): `setMessage`/`getMessages` failures are `IOException`s QuickFIX
   already handles; `setSeqNums`/`reset` rejections, timeouts and late settlements, and `load` failures, **poison**
   the store (every write and the sender-seqnum getter throw until a reload through `load()` succeeds, after every
-  timed-out write has settled). Four members never throw into QuickFIX, because each has a call site with no
+  timed-out write has settled). Sequence numbers cross the bridge as doubles: `ReadSeq()` refuses a value above
+  2^53-1 coming back from JS, and `CheckSafeSeq()` refuses one going out (`set()`, `setNext*()`, hence `incr*()`;
+  reachable by a counterparty's `SequenceReset` with a 64-bit `NewSeqNo`) before `Forward()`, as a non-poisoning
+  `IOException` + `storeError` (nothing reached the adapter), which QuickFIX's handler turns into a disconnect.
+  Four members never throw into QuickFIX, because each has a call site with no
   handler: `reset()` (`Session::disconnect()` with `ResetOnDisconnect=Y` runs inside `Session::next()`'s own
   `catch (IOException&)`), `refresh()` and `getCreationTime()` (`Session::setResponder()` on the connect path: the
   acceptor has no handler there, `std::terminate`; the initiator swallows the exception with the session stuck

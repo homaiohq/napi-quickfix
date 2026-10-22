@@ -47,7 +47,13 @@ as a KV key when CompIDs are plain identifiers.
 number`. Sequence numbers are positive safe integers (`1 <= n <= 2^53-1`);
 values at or above `2^53` are not supported by the binding. Sources:
 `[store.ts]` `MessageStoreState`, `validState()`; `[js_message_store.cpp]`
-`ReadSeq()` (`d < 1 || floor(d) != d || d > 2^53-1` → error). Upstream's
+`ReadSeq()` (`d < 1 || floor(d) != d || d > 2^53-1` → error). The bridge
+refuses outbound values above the limit too, so your adapter is never asked to
+write one: `[js_message_store.cpp]` `CheckSafeSeq()` (`n > 9007199254740991` →
+non-poisoning `storeError` + `IOException` before `Forward()`, from `set()`,
+`setNextSenderMsgSeqNum()`, `setNextTargetMsgSeqNum()` and hence `incrNext*()`;
+a counterparty's `SequenceReset` with such a `NewSeqNo` disconnects the session
+instead of persisting a rounded number). Upstream's
 `SEQNUM` is a 64-bit unsigned and its test case exercises `uint64 max`
 (`[QF test/MessageStoreTestCase.h]` `CHECK_MESSAGE_STORE_SET_GET_UINT64`), so
 use a 64-bit-capable column/field even though the binding stops at `2^53-1`.
