@@ -13,12 +13,11 @@ QuickFIX C++ deployment already uses (its `PostgreSQLStore`, `MySQLStore` or
   Upstream paths are relative to the QuickFIX repository root. Line numbers are
   those of v1.16.0.
 - No DDL is reproduced in this skill, neither upstream's (section 5 links to
-  it) nor the binding's own: that one is `sqlSchema()` in `src/store/sql.ts`
-  and `sql/*.sql` on the branch that ships the SQL adapter
-  (`@homaiohq/napi-quickfix` branch `feat/js-message-store` @ `f802818`,
-  identical at `6b8caa0`, the commit that added it), elided from the
-  reproduction in `sql-adapter-reference.md`; it was tested against
-  `node:sqlite` and PostgreSQL by that revision's SQL adapter test.
+  it) nor the binding's own: that one is `sql/postgres.sql`, `sql/mysql.sql`
+  and `sql/sqlite.sql` in this repository (the same statements
+  `sqlSchema(dialect)` in `src/store/sql.ts` returns; the adapter is
+  reproduced in `sql-adapter-reference.md` with that function's body elided);
+  `test/store-sql.test.ts` tests them against `node:sqlite` and PostgreSQL.
 
 ## License
 
@@ -98,15 +97,15 @@ parameters and a real upsert (`INSERT ... ON CONFLICT (...) DO UPDATE`,
   is UTC" is the whole contract.
 - **Driver trap**: `pg` parses `timestamp without time zone` as LOCAL time when
   it builds a `Date`; `mysql2` applies its `timezone` option. The binding's
-  removed SQL adapter sidestepped both by selecting the column as text
+  shipped SQL adapter (`src/store/sql.ts`) sidesteps both by selecting the column as text
   (`creation_time::text` / `CAST(creation_time AS CHAR)`) and parsing it as UTC
   (`fromSqlTime()` in `sql-adapter-reference.md`), and by writing
   `toISOString().replace('T', ' ').replace('Z', '')`. Do the same, or configure
   the driver's type parser; verify with test 1.11 of `test-checklist.md`.
 - **Precision**: upstream writes seconds. The binding writes milliseconds
   (`.mmm`), which a `TIMESTAMP`/`DATETIME` column truncates or rounds
-  harmlessly; the binding's own MySQL DDL (`sqlSchema('mysql')` / `sql/mysql.sql`,
-  section 5) uses `DATETIME(3)` to keep them. Reading a
+  harmlessly; the binding's own `sql/mysql.sql` (section 5) uses `DATETIME(3)` to
+  keep them. Reading a
   second-precision value is fine: the only consumer is `checkSessionTime()`.
 - **What it is for**: QuickFIX compares `creation_time` with "now" against the
   configured `StartTime`/`EndTime` window (`Session.h:248-254`) and resets the
@@ -117,10 +116,10 @@ parameters and a real upsert (`INSERT ... ON CONFLICT (...) DO UPDATE`,
 ## 4. Table prefix
 
 Upstream hard-codes the names `sessions` and `messages` in database `quickfix`
-(and the log tables, section 5). The binding's removed SQL adapter added an optional
+(and the log tables, section 5). The binding's shipped SQL adapter adds an optional
 `tablePrefix` that is prepended to BOTH names (`${prefix}sessions`,
-`${prefix}messages`) so several deployments can share one schema; its test
-used `t<pid>_` to isolate CI runs. Interop with an
+`${prefix}messages`) so several deployments can share one schema;
+`test/store-sql.test.ts` uses `t<pid>_` to isolate CI runs. Interop with an
 upstream deployment means an empty prefix.
 
 ## 5. The DDL: read it upstream, do not copy it from here
@@ -156,12 +155,12 @@ an adapter are discussed where they bite: section 3 (`creation_time`) and
 section 6, gotchas 5-7 (`message`, the seqnum columns, `CHAR(8)`).
 
 **The binding's own dialect DDL.** The binding's SQL adapter does not use the
-upstream files; it carries its own idempotent (`IF NOT EXISTS`) table statements of the same
-layout (`DATETIME(3)` for MySQL so the binding's millisecond `creation_time`
-survives, a plain-typed SQLite variant) in `sqlSchema(dialect)` of
-`src/store/sql.ts` and as `sql/*.sql`, on the branch that ships the adapter;
-the reproduction in `sql-adapter-reference.md` elides them (the same rule as
-for upstream: link, do not copy); those statements were tested against
+upstream files; it ships its own idempotent (`IF NOT EXISTS`) table statements of
+the same layout (`DATETIME(3)` for MySQL so the binding's millisecond
+`creation_time` survives, a plain-typed SQLite variant) as `sql/postgres.sql`,
+`sql/mysql.sql` and `sql/sqlite.sql` in this repository, also returned by
+`sqlSchema(dialect)` in `src/store/sql.ts` (whose body the reproduction in
+`sql-adapter-reference.md` elides: link, do not copy); `test/store-sql.test.ts` runs them against
 `node:sqlite` and PostgreSQL. Interop with an upstream deployment means using
 the upstream files, not these.
 

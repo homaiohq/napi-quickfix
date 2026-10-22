@@ -3,10 +3,10 @@
 Run the candidate adapter through every scenario below. `MapMessageStore`
 (exported by `@homaiohq/napi-quickfix`) is the oracle: for the adapter-level
 scenarios, run the same script against a `MapMessageStore` and against the
-candidate and compare the outputs. The examples these scenarios are lifted
-from: the SQL adapter test of the source revision (`contract()`, reproduced
-below as section 1, and `loopback()`; see the sources table in `contract.md`),
-and, in the repository, `test/store.test.ts` and the test doubles in `test/store-adapters.ts`
+candidate and compare the outputs. The in-repo examples these scenarios are
+lifted from: `test/store-sql.test.ts` (`contract()`, reproduced below as
+section 1, and `loopback()`), `test/store.test.ts`, and the test doubles in
+`test/store-adapters.ts`
 (`ControlledStore`: per-method `'ok' | 'reject' | 'hang' | 'defer'`).
 
 All scenarios use `SessionID` values; build them with
@@ -121,8 +121,8 @@ with mirrored session ids (`FIX.4.4:CLIENT->SERVER` on the initiator,
 `StartTime=00:00:00`, `EndTime=00:00:00`, `HeartBtInt=30`, `log: 'none'`. In the
 repository, `test/helpers.ts` (`acceptorCfg(port)`, `initiatorCfg(port)`,
 `freePort()`, `waitForEvent()`, `waitUntil()`) and `test/store-adapters.ts`
-(`withSettings()`) build exactly that; the SQL adapter test's `loopback()` (source
-revision, see the sources table in `contract.md`) is the minimal version of 2.1-2.2.
+(`withSettings()`) build exactly that; `test/store-sql.test.ts` `loopback()` is
+the minimal version of 2.1-2.2.
 
 - **2.1 Numbering continues across a restart (`ResetOnLogon=N`).** Start both
   with the candidate adapter, log on, send two application messages, stop both
@@ -132,7 +132,7 @@ revision, see the sources table in `contract.md`) is the minimal version of 2.1-
   Logout took 4) and messages 1..4. Start a second pair over the SAME adapter:
   `getExpectedSenderNum()` is 5 before logon; send one more message; it arrives
   with `MsgSeqNum = 6` (test "ResetOnLogon=N: a restart continues seqnums from
-  the adapter ..." and the SQL adapter test's `loopback()`: `sender2 == 7` after
+  the adapter ..." and `test/store-sql.test.ts` `loopback()`: `sender2 == 7` after
   the second logon + order).
 - **2.2 A gap is served from `getMessages()` with the message intact.** Before
   the second start of 2.1, lower the ACCEPTOR row's `nextTargetMsgSeqNum` to 3
