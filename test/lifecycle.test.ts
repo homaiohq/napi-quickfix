@@ -264,28 +264,29 @@ describe('Engine resource regressions', () => {
   // unsettled on the path that hands the work to an AsyncWorker: one Promise
   // rooted from native memory for the rest of the process, per call.
   test('start()/stop() do not root a Promise per call', { timeout: 60000 }, async () => {
+    // Every cycle takes all four worker paths (Initiator and Acceptor, start()
+    // and stop()), so a leak on any one of them roots at least N Promises.
     // Stopping a started engine joins its network thread (up to its 1 s poll
-    // timeout), so only the first cycles start one; the rest stop never-started
-    // engines, which take the same worker path.
-    const churn = async (n: number, started: number) => {
+    // timeout), which bounds N.
+    const churn = async (n: number) => {
       for (let i = 0; i < n; i++) {
         const ini = new Initiator({ settings: SessionSettings.fromString(INITIATOR_CFG), store: 'memory', log: 'none' });
-        if (i < started) {
-          ini.unref();
-          await ini.start();
-        }
+        ini.unref();
+        await ini.start();
         await ini.stop();
         const acc = new Acceptor({ settings: SessionSettings.fromString(ACCEPTOR_CFG), store: 'memory', log: 'none' });
+        acc.unref();
+        await acc.start();
         await acc.stop();
       }
     };
     // First calls populate lazily created state: measure from a warm process.
-    await churn(2, 1);
+    await churn(1);
     const before = await countPromises();
-    const N = 20; // at least 2 stop() calls per cycle
-    await churn(N, 2);
+    const N = 8;
+    await churn(N);
     const retained = (await countPromises()) - before;
-    assert.ok(retained < N, `${retained} Promises retained after ${N} engines were stopped`);
+    assert.ok(retained < N, `${retained} Promises retained after ${N} engines were started and stopped`);
   });
 
   // The constructors of the exported classes were module statics shared by

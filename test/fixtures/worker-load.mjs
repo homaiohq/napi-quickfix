@@ -6,9 +6,10 @@
 //   mode 'terminate': construct an engine with two sessions, so two 'create'
 //                     callbacks are queued back to back, and block inside the
 //                     first one's handler after telling the parent, which
-//                     terminates the Worker meanwhile. The second callback is
-//                     then dispatched into an environment that can no longer
-//                     call into JS.
+//                     terminates the Worker meanwhile. The first handler is
+//                     interrupted mid-call, and the second callback is then
+//                     dispatched into an environment that can no longer call
+//                     into JS.
 import { parentPort, workerData } from 'node:worker_threads';
 
 const { Initiator, SessionSettings, createMessage, Group, FIELD, MsgType } = await import('../../dist/esm/index.js');
@@ -53,8 +54,11 @@ if (workerData.mode === 'churn') {
         if (!first) return;
         first = false;
         parentPort.postMessage('in-handler');
-        // Hold the dispatch until the parent has called terminate().
-        Atomics.wait(sab, 0, 0, 1000);
+        // Hold the dispatch until the parent's terminate() interrupts it: V8
+        // wakes the wait for a termination request. No timeout, or a slow
+        // parent would let the handler return first and the second callback
+        // be dispatched into a live environment.
+        Atomics.wait(sab, 0, 0);
       },
     },
   });
