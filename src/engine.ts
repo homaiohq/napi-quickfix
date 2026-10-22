@@ -59,7 +59,8 @@ export interface CreateEngineOptions extends Omit<EngineOptions, 'store'> {
    * before failing it with `IOException`, in milliseconds. Default `30_000`;
    * `0` disables the timeout, accepting that a stalled adapter then stalls
    * every session of the engine, a graceful `stop()` and process exit with
-   * it. See the README for the trade-off.
+   * it. See the README for the trade-off. Passing it with `'file'`/`'memory'`
+   * is a `TypeError` (it would silently do nothing).
    */
   storeTimeoutMs?: number;
 }

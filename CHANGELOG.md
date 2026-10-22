@@ -43,7 +43,7 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   `Session.setNextSenderMsgSeqNum()` and `Session.setNextTargetMsgSeqNum()` now return
   a `Promise<void>` and run on a libuv worker under the engine's gate, like
   `sendToTarget()`. They take the session-state mutex that the engine holds while it
-  writes to the message store; with the message store adapter below, that write waits
+  writes to the message store; with the message store adapter above, that write waits
   on the event loop, so taking the mutex on the main thread deadlocked the whole
   process (observed in the issue #29 spike, with a synchronous adapter too). Calls on
   one session are serialised in program order whether awaited or not, so
