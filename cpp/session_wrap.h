@@ -3,6 +3,7 @@
 
 #include <napi.h>
 
+#include <functional>
 #include <memory>
 
 #include "quickfix/Session.h"
@@ -31,13 +32,20 @@ namespace napi_quickfix {
 //   gate via NewInstance(). A handle built any other way has no gate and
 //   always throws SessionNotFound.
 //
-// Every member is synchronous and safe on the JS thread: none takes
-// FIX::Session::m_mutex, which QuickFIX holds across application callbacks.
-//   getSessionID, isLoggedOn, isEnabled, sentLogon, sentLogout, receivedLogon,
-//   isInitiator, isAcceptor, isSessionTime(nowMs?), isLogonTime(nowMs?),
-//   getExpectedSenderNum, getExpectedTargetNum, setNextSenderMsgSeqNum,
-//   setNextTargetMsgSeqNum, logon, logout(reason?), refresh, and the runtime
-//   option getters/setters.
+// Two kinds of member:
+//   * Synchronous, on the JS thread: getSessionID, isLoggedOn, isEnabled,
+//     sentLogon, sentLogout, receivedLogon, isInitiator, isAcceptor,
+//     isSessionTime(nowMs?), isLogonTime(nowMs?), getExpectedSenderNum,
+//     getExpectedTargetNum and the runtime option getters/setters. None of
+//     them takes a QuickFIX mutex that another thread may hold while it waits
+//     on the JS event loop.
+//   * Promise-returning, on a libuv worker under the engine's SessionOpGate
+//     (SessionOpWorker, like SendToTargetWorker): logon, logout(reason?),
+//     refresh, setNextSenderMsgSeqNum, setNextTargetMsgSeqNum. They take
+//     SessionState::m_mutex, which a QuickFIX or libuv thread holds while it
+//     waits on a JS message-store call (js_message_store.h); taken on the JS
+//     thread that is a LOOP -> SessionState -> LOOP deadlock, observed in the
+//     issue #29 spike. See the control section of session_wrap.cpp.
 // FIX::Session::disconnect()/reset() are not exposed: they are only safe on
 // the engine's own network thread (see session_wrap.cpp).
 class SessionWrap : public Napi::ObjectWrap<SessionWrap> {
@@ -113,11 +121,18 @@ class SessionWrap : public Napi::ObjectWrap<SessionWrap> {
   Napi::Value GetTimestampPrecision(const Napi::CallbackInfo& info);
   Napi::Value SetTimestampPrecision(const Napi::CallbackInfo& info);
 
-  // Control. All sync: they only touch SessionState under its own mutex,
-  // which QuickFIX never holds across a callback.
+  // Control and sequence-number setters: Promise-returning, run on a libuv
+  // worker under the SessionOpGate (see RunOnWorker).
   Napi::Value Logon(const Napi::CallbackInfo& info);
   Napi::Value Logout(const Napi::CallbackInfo& info);
   Napi::Value Refresh(const Napi::CallbackInfo& info);
+
+  // Queue `op` against this handle's session on a libuv worker and return
+  // the Promise of its outcome: resolved with undefined, or rejected with the
+  // QuickFixError `op` threw (SessionNotFound if the engine that owned the
+  // session when the handle was created no longer does).
+  Napi::Value RunOnWorker(const Napi::CallbackInfo& info,
+                          std::function<void(FIX::Session&)> op);
 
   // Shared helpers for the one-liner getters/setters above.
   template <typename Fn>
