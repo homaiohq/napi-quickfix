@@ -34,8 +34,9 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   `Napi::Error`, which escaped the bridge's trampoline and terminated the process; and
   a handler interrupted mid-call leaves V8's termination marker (`null`) as the pending
   exception, which the wrappers cannot wrap without aborting. The trampoline now
-  catches everything and lets such a callback pass through, as it does after the
-  engine's own teardown, and the build defines node-addon-api's
+  catches what a stopping environment throws and lets such a callback pass through,
+  as it does after the engine's own teardown (any other `Napi::Error` still surfaces
+  as an uncaught exception), and the build defines node-addon-api's
   `NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS` for the interrupted-handler case, which is
   told apart from a handler that threw so the interruption is not reported to QuickFIX
   as a throw.

@@ -164,7 +164,9 @@ sequenceDiagram
 - The message also carries the **session dictionary**, so `setField` & co. route its header/trailer fields as the
   parser does. The bridge caches, per session, a copy of the session's `DataDictionaryProvider` (which shares its
   dictionaries' ownership) taken on the QuickFIX thread, so a message kept by JS can outlive its session safely.
-- The trampoline (`CallJs`) **catches everything** its body throws and lets the callback pass through. A Worker's
+- The trampoline (`CallJs`) **catches what a stopping environment throws** and lets the callback pass through; any
+  other `Napi::Error` (a throwing handlers getter, a failed wrapper) is rethrown and surfaces as an uncaught
+  exception, and any other C++ exception is swallowed, since it would `std::terminate` the process. A Worker's
   `terminate()` marks its environment unable to call into JS from the parent thread, at any moment, while the
   Worker's loop still dispatches what the TSFN holds (and the callback whose handler is running): from then on every
   Node-API call that may run JS fails, and the node-addon-api wrappers throw a `Napi::Error` for it, which the
