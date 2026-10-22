@@ -25,9 +25,9 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   in: each Worker that imported the module overwrote them, deleting the previous
   environment's references from the wrong thread (a use-after-free once that Worker had
   exited, a cross-isolate handle release when it was the main thread), and the main
-  thread was left building its instances from a dead environment. The symptoms were
-  heap corruption, a V8 fatal check at Worker teardown, or a `TypeError` on the main
-  thread. The constructors now live in per-environment instance data.
+  thread was left building its instances from a dead environment. Observed as glibc
+  heap corruption, a V8 fatal check at Worker teardown and a segmentation fault. The
+  constructors now live in per-environment instance data.
 - `worker.terminate()` aborted the whole process when an engine callback was being
   dispatched in the Worker at that moment: once a Worker's environment is stopping,
   every Node-API call that may run JS fails, and node-addon-api's wrappers abort while

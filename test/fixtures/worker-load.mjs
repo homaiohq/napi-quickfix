@@ -58,7 +58,10 @@ if (workerData.mode === 'churn') {
       },
     },
   });
-  ini.unref();
-  // Never exits on its own: the parent terminates it.
+  if (ini.getSessions().length !== 2) throw new Error('expected two sessions');
+  // The engine's callback channel keeps the Worker's loop alive (it is not
+  // unref'd here): with nothing referenced, Node 26 ends the Worker before the
+  // queued 'create' callbacks are dispatched, and the parent never hears from
+  // the handler. The parent terminates the Worker.
   await new Promise(() => {});
 }

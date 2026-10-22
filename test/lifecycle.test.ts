@@ -229,7 +229,12 @@ describe('Engine garbage collection', () => {
  * that is never settled) is seen even though nothing in JS can reach it.
  */
 async function countPromises(): Promise<number> {
-  await collectUntil(() => 0, 1); // one GC + a macrotask
+  // Two full GCs with a macrotask between: the first clears, the second
+  // collects what the first's finalizers released.
+  for (let i = 0; i < 2; i++) {
+    gc();
+    await nextMacrotask();
+  }
   const chunks: Buffer[] = [];
   for await (const chunk of v8.getHeapSnapshot()) chunks.push(chunk as Buffer);
   const snapshot = JSON.parse(Buffer.concat(chunks).toString()) as {
