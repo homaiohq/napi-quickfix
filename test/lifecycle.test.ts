@@ -223,11 +223,8 @@ describe('Engine garbage collection', () => {
 
 // --- regression: resources that must not accumulate per engine ---------------
 
-/**
- * The number of `Promise` objects in the heap, after a full GC. Counted from a
- * heap snapshot, so a Promise kept alive from native memory (a `napi_deferred`
- * that is never settled) is seen even though nothing in JS can reach it.
- */
+// Promise objects in the heap after a full GC, from a heap snapshot: it sees a
+// Promise rooted only from native memory (an unsettled napi_deferred).
 async function countPromises(): Promise<number> {
   // Two full GCs with a macrotask between: the first clears, the second
   // collects what the first's finalizers released.
@@ -260,14 +257,9 @@ async function countPromises(): Promise<number> {
 }
 
 describe('Engine resource regressions', () => {
-  // start() and stop() used to create a Promise deferred up front and leave it
-  // unsettled on the path that hands the work to an AsyncWorker: one Promise
-  // rooted from native memory for the rest of the process, per call.
   test('start()/stop() do not root a Promise per call', { timeout: 60000 }, async () => {
-    // Every cycle takes all four worker paths (Initiator and Acceptor, start()
-    // and stop()), so a leak on any one of them roots at least N Promises.
-    // Stopping a started engine joins its network thread (up to its 1 s poll
-    // timeout), which bounds N.
+    // Each cycle takes all four worker paths, so one leaking path roots at
+    // least N Promises. Stopping a started engine takes up to 1 s, bounding N.
     const churn = async (n: number) => {
       for (let i = 0; i < n; i++) {
         const ini = new Initiator({ settings: SessionSettings.fromString(INITIATOR_CFG), store: 'memory', log: 'none' });
@@ -289,10 +281,6 @@ describe('Engine resource regressions', () => {
     assert.ok(retained < N, `${retained} Promises retained after ${N} engines were started and stopped`);
   });
 
-  // The constructors of the exported classes were module statics shared by
-  // every environment the addon was loaded in. Each Worker overwrote them,
-  // deleting the previous environment's references from the wrong thread, and
-  // the main thread was left building its instances from a dead one.
   describe('worker_threads', () => {
     const WORKER = new URL('./fixtures/worker-load.mjs', import.meta.url);
     const runWorker = (mode: string, until: 'exit' | 'message'): Promise<Worker> =>

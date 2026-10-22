@@ -3,13 +3,10 @@
 //
 //   mode 'churn':     load the addon, build a message with a group, construct
 //                     and stop an engine, exit.
-//   mode 'terminate': construct an engine with two sessions, so two 'create'
-//                     callbacks are queued back to back, and block inside the
-//                     first one's handler after telling the parent, which
-//                     terminates the Worker meanwhile. The first handler is
-//                     interrupted mid-call, and the second callback is then
-//                     dispatched into an environment that can no longer call
-//                     into JS.
+//   mode 'terminate': two sessions, so two 'create' callbacks are queued;
+//                     block in the first handler until the parent terminates
+//                     the Worker. The second callback is then dispatched into
+//                     a stopping environment.
 import { parentPort, workerData } from 'node:worker_threads';
 
 const { Initiator, SessionSettings, createMessage, Group, FIELD, MsgType } = await import('../../dist/esm/index.js');
@@ -54,18 +51,14 @@ if (workerData.mode === 'churn') {
         if (!first) return;
         first = false;
         parentPort.postMessage('in-handler');
-        // Hold the dispatch until the parent's terminate() interrupts it: V8
-        // wakes the wait for a termination request. No timeout, or a slow
-        // parent would let the handler return first and the second callback
-        // be dispatched into a live environment.
+        // No timeout: terminate() interrupts the wait, and a slow parent must
+        // not let the handler return first.
         Atomics.wait(sab, 0, 0);
       },
     },
   });
   if (ini.getSessions().length !== 2) throw new Error('expected two sessions');
-  // The engine's callback channel keeps the Worker's loop alive (it is not
-  // unref'd here): with nothing referenced, Node 26 ends the Worker before the
-  // queued 'create' callbacks are dispatched, and the parent never hears from
-  // the handler. The parent terminates the Worker.
+  // Keep the loop alive (the engine is not unref'd): Node 26 otherwise ends
+  // the Worker before the queued 'create' callbacks are dispatched.
   await new Promise(() => {});
 }
