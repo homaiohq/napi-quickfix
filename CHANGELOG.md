@@ -11,6 +11,22 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
 
+### Changed
+
+- **Breaking:** `Session.logon()`, `Session.logout()`, `Session.refresh()`,
+  `Session.setNextSenderMsgSeqNum()` and `Session.setNextTargetMsgSeqNum()` now return
+  a `Promise<void>` and run on a libuv worker under the engine's gate, like
+  `sendToTarget()`. They take the session-state mutex that the engine holds while it
+  writes to the message store; with the message store adapter below, that write waits
+  on the event loop, so taking the mutex on the main thread deadlocked the whole
+  process (observed in the issue #29 spike, with a synchronous adapter too). Calls on
+  one session are serialised in program order whether awaited or not, so
+  `logout(); logon();` still ends enabled. Argument validation still throws
+  synchronously (`TypeError`/`RangeError`); `SessionNotFound` is now a rejection, which
+  a `'logout'` listener fired by `stop()` can see if the write lands after the engine
+  was destroyed. The getters, state queries and option getters/setters stay
+  synchronous.
+
 ### Fixed
 
 - Every `start()` and `stop()` call rooted one `Promise` for the rest of the process. Both
