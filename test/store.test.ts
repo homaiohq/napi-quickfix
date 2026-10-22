@@ -482,6 +482,55 @@ describe('MessageStoreAdapter: write-through over a loopback', () => {
     }
   });
 
+  test('incr* writes the other seqnum back unchanged on every setSeqNums call (upstream CHECK_MESSAGE_STORE_OTHER)', { timeout: 30_000 }, async () => {
+    // The adapter has no incr: JsMessageStore::incrNext*() compute the new
+    // value from the cache and write BOTH numbers through setSeqNums, so the
+    // number not being incremented must come back unchanged on every call.
+    // Checked per call on the recorded argument pairs, not on the final row
+    // (a wrong intermediate write overwritten later would pass that).
+    const port = await freePort();
+    const iniStore = new RecordingMapStore();
+    const noReset = { ResetOnLogon: 'N' };
+    // HeartBtInt=60: no heartbeat write can interleave with the steps below.
+    const { acc, ini, received } = await makePair(port, { iniStore, acc: noReset, ini: { ...noReset, HeartBtInt: '60' } });
+    try {
+      const session = ini.getSession(INI_ID)!;
+      // Step 1: the setters, before any traffic (the row starts at 1/1).
+      await session.setNextSenderMsgSeqNum(10);
+      await session.setNextTargetMsgSeqNum(20);
+      assert.deepEqual(iniStore.seqNumWrites, [
+        [10, 1],
+        [10, 20],
+      ]);
+      // Line the acceptor up (memory store) so neither side sees a gap.
+      const accSession = acc.getSession(ACC_ID)!;
+      await accSession.setNextTargetMsgSeqNum(10);
+      await accSession.setNextSenderMsgSeqNum(20);
+      // Step 2 / step 3 through the logon itself: the initiator's Logon is an
+      // outbound message (sender 10 -> 11, target still 20), the acceptor's
+      // Logon reply an inbound one (target 20 -> 21, sender still 11).
+      await logonBoth(acc, ini);
+      assert.ok(await waitUntil(() => iniStore.seqNumWrites.length >= 4, T));
+      assert.deepEqual(iniStore.seqNumWrites.slice(2), [
+        [11, 20],
+        [11, 21],
+      ]);
+      // Step 2 again with an application message out...
+      assert.equal(await sendToTarget(newOrder('out'), INI_ID), true);
+      assert.ok(await waitUntil(() => received.length === 1, T));
+      assert.deepEqual(iniStore.seqNumWrites.slice(4), [[12, 21]]);
+      // ...and step 3 with one in.
+      assert.equal(await sendToTarget(newOrder('in'), ACC_ID), true);
+      assert.ok(await waitUntil(() => iniStore.seqNumWrites.length >= 6, T));
+      assert.deepEqual(iniStore.seqNumWrites.slice(5), [[12, 22]]);
+      assert.equal(session.getExpectedSenderNum(), 12);
+      assert.equal(session.getExpectedTargetNum(), 22);
+      assert.deepEqual(iniStore.rows.get(INI_ID.toString())!.state.nextTargetMsgSeqNum, 22);
+    } finally {
+      await stopBoth(acc, ini);
+    }
+  });
+
   test('stress: bounded sends through a slow adapter while the JS thread hammers the session ops, with a latency bound', { timeout: 60_000 }, async () => {
     const port = await freePort();
     const iniStore = new ControlledStore(undefined, 2);

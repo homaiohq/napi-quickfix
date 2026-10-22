@@ -37,6 +37,8 @@ export interface Parked {
 export class ControlledStore implements MessageStoreAdapter {
   readonly inner: MapMessageStore;
   readonly calls: string[] = [];
+  /** The `[nextSender, nextTarget]` pair of every setSeqNums call, in order. */
+  readonly seqNumWrites: Array<[number, number]> = [];
   readonly parked: Parked[] = [];
   readonly closed: string[] = [];
   inflight = 0;
@@ -113,6 +115,7 @@ export class ControlledStore implements MessageStoreAdapter {
     return this.#run('create', [id, state], () => this.inner.create(id, state));
   }
   setSeqNums(id: SessionID, s: number, t: number): Promise<void> {
+    this.seqNumWrites.push([s, t]);
     return this.#run('setSeqNums', [id, s, t], () => this.inner.setSeqNums(id, s, t));
   }
   setMessage(id: SessionID, seq: number, msg: string): Promise<void> {
@@ -141,6 +144,8 @@ export class ControlledStore implements MessageStoreAdapter {
 /** A synchronous MapMessageStore that also records its calls and implements close(). */
 export class RecordingMapStore extends MapMessageStore {
   readonly calls: string[] = [];
+  /** The `[nextSender, nextTarget]` pair of every setSeqNums call, in order. */
+  readonly seqNumWrites: Array<[number, number]> = [];
   override load(id: SessionID): MessageStoreState | null {
     this.calls.push('load');
     return super.load(id);
@@ -151,6 +156,7 @@ export class RecordingMapStore extends MapMessageStore {
   }
   override setSeqNums(id: SessionID, s: number, t: number): void {
     this.calls.push('setSeqNums');
+    this.seqNumWrites.push([s, t]);
     super.setSeqNums(id, s, t);
   }
   override setMessage(id: SessionID, seq: number, msg: string): void {
