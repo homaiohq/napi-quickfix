@@ -30,6 +30,13 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
   reference implementation) is exported; README "Message store" has the threading and
   latency contract (bound in-flight sends; an adapter must not depend on the libuv
   threadpool).
+- `@homaiohq/napi-quickfix/store/sql`: a generic SQL adapter (`createSqlMessageStore`)
+  over an `execute(sql, params)` function and a dialect (`postgres` | `mysql` |
+  `sqlite`), with QuickFIX's own `sessions`/`messages` table layout (configurable
+  prefix) so an existing QuickFIX C++ deployment interoperates; `sqlSchema()` and the
+  `sql/` files hold the `CREATE TABLE` statements. No driver dependency: the README
+  shows `pg`, `mysql2`, `node:sqlite` and Prisma wiring. Tested against `node:sqlite`
+  in the suite and against PostgreSQL in CI.
 - `SessionSettings.getSessions(connectionType?)`: only the sessions an engine of that
   type would create.
 - `scripts/tsan.sh` and a ThreadSanitizer CI job over the suite, gating on reports in

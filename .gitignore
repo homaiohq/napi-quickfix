@@ -29,3 +29,6 @@ Makefile
 # misc
 *.log
 .DS_Store
+
+# ThreadSanitizer build (scripts/tsan.sh)
+build-tsan/
