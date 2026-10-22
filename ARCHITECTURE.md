@@ -31,7 +31,7 @@ graph TD
   subgraph ADDON["C++ Node-API addon  (cpp/ → napi_quickfix.node)"]
     REG["addon.cpp — module init"]
     WRAPS["ObjectWrap classes<br/>MessageWrap · GroupWrap · SessionIDWrap<br/>SessionSettingsWrap · DataDictionaryWrap<br/>InitiatorWrap · AcceptorWrap · SessionWrap"]
-    BRIDGE["ApplicationBridge<br/>(FIX::Application + TSFN)"]
+    BRIDGE["ApplicationBridge<br/>(FIX::Application + TSFN)<br/>JsMessageStoreFactory<br/>(FIX::MessageStore + TSFN)"]
     WORKERS["engine_workers.h<br/>AsyncWorkers (start/stop/send/session ops)"]
     ERR["errors.h — FIX::Exception → QuickFixError"]
   end
@@ -156,6 +156,74 @@ sequenceDiagram
 
 ---
 
+## 4b. The message-store bridge (JS store → C++ threads)
+
+`JsMessageStoreFactory` / `JsMessageStore` (`cpp/js_message_store.{h,cpp}`) implement QuickFIX's `MessageStore`
+over a JS `MessageStoreAdapter`, so session state can be persisted write-through in any database Node can reach
+without a client library in the prebuild. The direction is the reverse of the Application bridge: QuickFIX calls the
+store synchronously, under `SessionState::m_mutex`, from whichever thread touched the session, and that thread has to
+wait for a JS result.
+
+```mermaid
+sequenceDiagram
+  participant QF as QuickFIX / libuv thread (holds SessionState mutex)
+  participant ST as JsMessageStore
+  participant TSFN as store TSFN
+  participant JS as JS main thread
+  participant AD as TS bridge → user adapter
+
+  QF->>ST: set(seq, msg) / incrNextSenderMsgSeqNum() ...
+  ST->>TSFN: BlockingCall + Channel(id), wait with deadline
+  TSFN-->>JS: CallJs trampoline
+  JS->>AD: bridge.setMessage(sid, seq, msg)  (always a Promise)
+  AD-->>JS: promise.then(onFulfilled.bind(id), onRejected.bind(id))
+  JS-->>ST: continuation looks the channel up by id, fulfils it
+  ST->>QF: return / throw IOException; cache updated after the ack
+```
+
+- **Dispatch rule.** On the JS thread (the engine constructor's `reset()` for a session built outside its session
+  time) the bridge is called directly and the Promise is not awaited: the TS `StoreBinding` collects it and
+  `Initiator.create()` awaits it, tearing the engine down on rejection. On every other thread the call goes through a
+  **dedicated** `TypedThreadSafeFunction` with `BlockingCall` and a promise-aware channel (`cpp/sync_channel.h`, the
+  same `SyncChannel` + `PendingChannels` the Application bridge uses), released by the promise continuation, by the
+  per-call deadline (`storeTimeoutMs`), or by `Deactivate()`/`Abort()` during teardown (→ "aborted" → `IOException`,
+  never a fake success). The TS layer never calls native directly for the adapter's `load()`/`create()` of
+  `create()`'s preload, nor for `close()`: both happen in TS, before the engine exists and after `stop()` settled.
+- **Cache.** Sequence numbers and the creation time live in a `MemoryStore` cache (upstream's `PostgreSQLStore`
+  layout), updated **after** the adapter acknowledged (upstream's `incr*` bump the cache first), so a rejected write
+  leaves cache and database equal. The engine's getters read it; `SessionWrap::getExpected*` on the JS thread read
+  it through a process-wide `SessionID → JsMessageStore` registry, written only on the JS thread, without entering
+  `FIX::Session` (whose getters take `SessionState::m_mutex`, see §5).
+- **Continuation lifetime.** The two continuations are created once per factory and bound per call to a channel id
+  (`Function.prototype.bind`); they capture a `shared_ptr` to the pending-channel registry, never a channel, so no
+  per-call native closure — and no finalizer running at GC time — ever races the waiting thread for the channel's
+  ownership (the spike's TSan finding). The waiting thread registers the channel, waits, and erases it; a
+  continuation finds it by id under the registry lock and fulfils it there. A channel whose waiter timed out stays
+  registered as *expired*, so the continuation that settles it later can tell it was **late** and let the store
+  record that (poison bookkeeping) before erasing it.
+- **Failure policy** (README "Message store"): `setMessage`/`getMessages` failures are `IOException`s QuickFIX
+  already handles; `setSeqNums`/`reset` rejections, timeouts and late settlements, and `load` failures, **poison**
+  the store (every write and the sender-seqnum getter throw until a reload through `load()` succeeds, after every
+  timed-out write has settled). Four members never throw into QuickFIX, because each has a call site with no
+  handler: `reset()` (`Session::disconnect()` with `ResetOnDisconnect=Y` runs inside `Session::next()`'s own
+  `catch (IOException&)`), `refresh()` and `getCreationTime()` (`Session::setResponder()` on the connect path: the
+  acceptor has no handler there, `std::terminate`; the initiator swallows the exception with the session stuck
+  "pending" for good), and `getNextTargetMsgSeqNum()` (`Session::next(Message)` reads it in `nextQueued()` after its
+  handlers, on every inbound message). The writes poison and report; the getters attempt the reload, then return the
+  cache. `storeError` events originate in native (only it knows about timeouts, late settlements and poison), through
+  a callback on the TS bridge object: called directly on the JS thread, or queued through the store TSFN from a
+  waiting thread. The session-log event is written only from the waiting thread, which already holds
+  `SessionState::m_mutex` (re-entrant for its owner); the JS thread must never take it.
+- **Teardown** mirrors the Application bridge on every path: `Teardown()` deactivates the store bridge *before* the
+  Application bridge and before the force-stop (a network thread parked in a store call holds the mutex
+  `Initiator::stop()` takes); `stop(true)` deactivates it on the JS thread before queuing the stop worker; a graceful
+  `stop()` keeps it serving (its writes are legitimate, each bounded by the timeout) and releases it in
+  `DestroyStoppedEngine()`, where the rooted bridge object is dropped too (#28 shape); `ref()`/`unref()` apply to both
+  TSFNs. The trampoline refuses to run the adapter once deactivated, so a call nobody waits on cannot land after
+  `close()`.
+
+---
+
 ## 5. Why `start` / `stop` / `sendToTarget` are async
 
 These calls make QuickFIX invoke synchronous callbacks that must round-trip to the JS main thread. If they ran **on**
@@ -189,19 +257,24 @@ and the entire pure layer (`Message`, `SessionID`, `SessionSettings`, `DataDicti
 cleanup hook deactivates the bridge and force-stops the engine **before** the TSFN is torn down, so a live session
 never crashes on shutdown.
 
-### `Session`: why every member is synchronous
+### `Session`: which members are synchronous
 
 `SessionWrap` is a handle on an engine-owned `FIX::Session`. The rule for what may run on the main thread is the
-lock, not the I/O: **QuickFIX holds `Session::m_mutex` while it runs application callbacks** (`sendRaw` holds it
-across `toAdmin`/`toApp`; `disconnect` holds it across `onLogout`). A QuickFIX thread blocked in one of those
-callbacks is waiting on the JS event loop via a `BlockingCall`, so any main-thread call that takes `m_mutex` would
-wait on a thread that is waiting on the main thread — deadlock. Every exposed member stays clear of it:
+lock, not the I/O: a main-thread call must never take a mutex that another thread may hold **while it waits on the
+JS event loop**. Two QuickFIX mutexes are held that way. `Session::m_mutex` (`S`) is held across application
+callbacks (`sendRaw` holds it across `toAdmin`/`toApp`; `disconnect` across `onLogout`), each a `BlockingCall` that
+needs the loop. `SessionState::m_mutex` (`SS`) is held across every message-store call (`SessionState::set`,
+`incr*`, `get`, `reset`, `refresh`, and the getters `getNext*`/`getCreationTime`), and with a JS message store
+(§4b) each of those is a wait on the loop too, from whichever thread runs it: the engine's network thread, or a
+`sendToTarget` libuv worker running `Session::sendRaw`. A main-thread call taking `S` or `SS` would then wait on a
+thread that is waiting on the main thread: a deadlock of the whole process, reproduced for `SS` in the issue #29
+spike. The members split accordingly:
 
 | Members | Thread | Why |
 | --- | --- | --- |
 | `isLoggedOn` · `isEnabled` · `sentLogon` · `sentLogout` · `receivedLogon` · `isInitiator` · `isAcceptor` · `isSessionTime` · `isLogonTime` · option getters/setters | sync, main | Read/write plain members of `FIX::Session`; no lock, no callback. |
-| `getExpectedSenderNum` · `getExpectedTargetNum` · `setNextSenderMsgSeqNum` · `setNextTargetMsgSeqNum` | sync, main | Touch the `MessageStore` under `SessionState`'s own mutex, which QuickFIX never holds across a callback. May throw `IOException` (mapped to `QuickFixError`). Not serialised against the engine, though: `Session::sendRaw` holds `m_mutex` across `fill()` (reads the next sender num into the header), `toApp`/`toAdmin` and `persist()` (`incrNextSenderMsgSeqNum`), and `Session::next()` across the target-num check, `fromApp`/`fromAdmin` and `incrNextTargetMsgSeqNum`; a setter landing inside that window is overwritten by the increment and the session ends up one off from the peer. The setters are for a quiescent session (before `start()`, from a `'logout'` event, never from a handler); `m_mutex` is private and could not be taken from the JS thread anyway. |
-| `logon` · `logout` · `refresh` | sync, main | Only touch `SessionState` (`enabled`/`logoutReason`, and the store for `refresh`); no `m_mutex`, no callback, so no deadlock. `logoutReason` and the store are under `SessionState`'s own mutex; `enabled` is a plain `bool` written with **no lock** while the network thread reads it in `Session::next()` — formally a data race (TSan reports it), the same one `Initiator::stop()` makes from the stopping thread, benign in practice (the flag is picked up on the next pass). Running them inline also keeps them **ordered**: as AsyncWorkers, `logout(); logon();` could land on two pool threads in either order. |
+| `getExpectedSenderNum` · `getExpectedTargetNum` | sync, main | For a `file`/`memory` store: `FIX::Session::getExpected*` → `SessionState::getNext*` under `SS`, which no thread holds across a wait on the loop in that configuration (the store is in-process). For a JS store the handle bypasses `FIX::Session` and reads the `JsMessageStore` cache under the store's own leaf mutex (§4b); `SS` is never taken on the main thread. |
+| `setNextSenderMsgSeqNum` · `setNextTargetMsgSeqNum` · `logon` · `logout` · `refresh` | `SessionOpWorker` (libuv), Promise | Each takes `SS` (`setNext*`/`refresh` through the store; `logout`/`logon` through `logoutReason`), so they run on a worker under the engine's `SessionOpGate`, exactly like `SendToTargetWorker`: the loop stays free to serve the store call the holder is waiting on. The TS `Session` serialises the five per session (a module-level chain keyed by `sessionID.toString()`, since every `getSession()` hands out a fresh handle), so `logout(); logon();` still lands in program order. Their latency is that of the pool: they queue behind in-flight `sendToTarget` workers, each of which may be parked in a store write. The setters are not serialised against the engine, though: `Session::sendRaw` holds `S` across `fill()` (reads the next sender num into the header), `toApp`/`toAdmin` and `persist()` (`incrNextSenderMsgSeqNum`), and `Session::next()` across the target-num check, `fromApp`/`fromAdmin` and `incrNextTargetMsgSeqNum`; a setter landing inside that window is overwritten by the increment and the session ends up one off from the peer. The setters are for a quiescent session (before `start()`, from a `'logout'` event, never from a handler). `enabled` is a plain `bool` that `logon`/`logout` write with no lock while the network thread reads it in `Session::next()`: formally a data race, the same one `Initiator::stop()` makes from the stopping thread, benign in practice (the flag is picked up on the next pass; the TSan baseline over the suite reports nothing in `FIX::` frames). A `'logout'` listener fired by a graceful `stop()` that calls `setNext*` either runs before the stop worker's `Freeze()` and succeeds, or parks on the gate until the engine is destroyed and rejects `SessionNotFound`. |
 
 `FIX::Session::disconnect()` and `reset()` (which calls it) are **not exposed**, and not only because they take
 `m_mutex` and fire callbacks (that alone would just make them AsyncWorkers, like `sendToTarget`). Through the
@@ -302,6 +375,36 @@ JS thread can service — a deadlock.
 Until `stop()` settles the engine is alive on the JS thread, so `engine.getSession()` / `engine.isLoggedOn(id)`
 keep answering during a graceful stop (a `'logout'` listener can still read the final sequence numbers).
 
+### Lock order
+
+The locks and the two scheduling resources that behave like locks, with the order in which a thread may hold them
+(`X → Y`: holds `X` while acquiring or waiting for `Y`):
+
+| Symbol | What |
+| --- | --- |
+| `E` | `Initiator`/`Acceptor::m_mutex` (engine) |
+| `R` | `Session::s_mutex` (the process-wide session registry; a leaf) |
+| `G` | `SessionOpGate` (an `OpScope` in flight / `Freeze()` waiting) |
+| `S` | `Session::m_mutex`, held across application callbacks |
+| `SS` | `SessionState::m_mutex`, held across every message-store call |
+| `LOOP` | the JS event loop as a resource: every `BlockingCall` waits for it to be free |
+| `POOL` | a libuv threadpool slot (`UV_THREADPOOL_SIZE`, default 4) |
+| `C` | `JsMessageStore`'s cache mutex (a leaf, never held across a JS call) |
+
+```
+E → R ;  POOL → G → S → SS → {LOOP, C} ;  SS → LOOP ;  SS → R (session-log event) ;
+never LOOP → SS outside engine construction/destruction ;  never C → anything ;
+an adapter's hot path → never POOL
+```
+
+`SS` is held by "a QuickFIX or libuv thread": the engine's network thread, a `sendToTarget` worker running
+`Session::sendRaw`, a `SessionOpWorker`, or the stop worker (`Initiator::stop()` → `logout()`). With a JS store each
+of them may wait on `LOOP` under `SS`, which is why nothing on the JS thread may take `SS` (the `Session` members
+that do run on workers, §5 table) and why `getExpected*` read the store cache `C` instead. A JS-thread `SS` is only
+taken by the engine constructor and destructor, when no other thread owns the session. The one remaining cycle is
+through the pool: four parked session operations plus an adapter that itself needs a pool slot to finish
+(`POOL → G → S → SS → LOOP → adapter → POOL`), hence the last rule.
+
 ---
 
 ## 6. Handlers vs. events
@@ -363,11 +466,12 @@ musl entries and link musl objects into a glibc addon.
 | Public TS API | `src/index.ts`, `message.ts`, `group.ts`, `session-id.ts`, `session-settings.ts`, `data-dictionary.ts`, `enums.ts` |
 | Generated FIX constants | `scripts/gen-fields.mjs` → `src/generated/fields.ts` (`FIELD`), `scripts/gen-values.mjs` → `src/generated/values.ts` (value groups, `VALUES`) — both from the QuickFIX headers at the pinned tag |
 | Engine + handlers | `src/engine.ts`, `initiator.ts`, `acceptor.ts`, `application.ts` |
+| Message store | `src/store.ts` (`MessageStoreAdapter`, `MapMessageStore`, the `StoreBinding` bridge), `src/store/sql.ts` (generic SQL adapter, `sql/` schemas), `cpp/js_message_store.{h,cpp}`, `cpp/sync_channel.h` |
 | TLS tunnel (initiators) | `src/tls-tunnel.ts` (`createTlsTunnel`) |
 | Per-session control | `src/session.ts` (`Session`, `lookupSession`, `doesSessionExist`, `getSessions`, `numSessions`), `cpp/session_wrap.{h,cpp}` |
 | Native loader | `src/native.ts`, `src/load-native.cjs` |
 | Addon entry / wraps | `cpp/addon.cpp`, `cpp/*_wrap.{h,cpp}`, `cpp/field_map_ops.h` (field/group ops shared by `MessageWrap` and `GroupWrap`), `cpp/session_static.cpp` (`sendToTarget` + session lookups) |
-| Bridge / async / errors | `cpp/application_bridge.{h,cpp}`, `cpp/engine_workers.h` (`EngineOpWorker`), `cpp/session_static.cpp` (`SendToTargetWorker`), `cpp/errors.h` |
+| Bridge / async / errors | `cpp/application_bridge.{h,cpp}`, `cpp/sync_channel.h` (the reply channel + pending registry both bridges use), `cpp/engine_workers.h` (`EngineOpWorker`), `cpp/session_static.cpp` (`SendToTargetWorker`), `cpp/session_wrap.cpp` (`SessionOpWorker`), `cpp/errors.h` |
 | Build / dist | `CMakeLists.txt`, `scripts/prebuild.mjs`, `tsconfig.*.json`, `package.json` |
-| Tests | `test/*.test.ts`, `test/helpers.ts` (loopback harness), `test/fixtures/` (reduced FIX 4.4 dictionary + loader, TEST-ONLY TLS certificates) |
-| CI | `.github/workflows/ci.yml`, `.github/workflows/release.yml` |
+| Tests | `test/*.test.ts`, `test/helpers.ts` (loopback harness), `test/store-adapters.ts` (store test doubles), `test/fixtures/` (reduced FIX 4.4 dictionary + loader, TEST-ONLY TLS certificates, child-process store scenarios) |
+| CI | `.github/workflows/ci.yml` (build-test matrix, musl, ThreadSanitizer via `scripts/tsan.sh`, Postgres adapter), `.github/workflows/release.yml` |

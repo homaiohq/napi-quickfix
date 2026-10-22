@@ -9,6 +9,55 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
+### Added
+
+- `MessageStoreAdapter`: a pluggable message store. Pass an adapter object (one per
+  engine, keyed by `SessionID`: `load`/`create`/`setSeqNums`/`setMessage`/`getMessages`/
+  `reset`/`close?`, each sync or async) to the new `Initiator.create()` /
+  `Acceptor.create()` factories to persist session state write-through in any database
+  Node can reach, through your own driver and pool. The factories preload the state
+  (`load()`, `create()` for a session never seen) before constructing the engine, and
+  also accept `'file'`/`'memory'`. `storeTimeoutMs` (default 30 s, `0` disables) bounds
+  how long an engine thread waits on one adapter call. Failures reach the engine as
+  `IOException` and are reported through the new `'storeError'` event: `setMessage`/
+  `getMessages` failures are never fatal; `setSeqNums`/`reset` rejections, timeouts and
+  late settlements (and `load` failures) poison the session's store until it has been
+  reloaded, which takes the session down and lets QuickFIX reconcile with the peer at
+  the next logon. `reset()`/`refresh()` never throw into QuickFIX (its
+  `ResetOnDisconnect`/`RefreshOnLogon` paths have no handler; observed `std::terminate`).
+  `stop(true)` fails pending store calls first; a graceful `stop()` lets them complete
+  and calls `close()` per session before settling. `MapMessageStore` (in-memory
+  reference implementation) is exported; README "Message store" has the threading and
+  latency contract (bound in-flight sends; an adapter must not depend on the libuv
+  threadpool).
+- `@homaiohq/napi-quickfix/store/sql`: a generic SQL adapter (`createSqlMessageStore`)
+  over an `execute(sql, params)` function and a dialect (`postgres` | `mysql` |
+  `sqlite`), with QuickFIX's own `sessions`/`messages` table layout (configurable
+  prefix) so an existing QuickFIX C++ deployment interoperates; `sqlSchema()` and the
+  `sql/` files hold the `CREATE TABLE` statements. No driver dependency: the README
+  shows `pg`, `mysql2`, `node:sqlite` and Prisma wiring. Tested against `node:sqlite`
+  in the suite and against PostgreSQL in CI.
+- `SessionSettings.getSessions(connectionType?)`: only the sessions an engine of that
+  type would create.
+- `scripts/tsan.sh` and a ThreadSanitizer CI job over the suite, gating on reports in
+  this addon's frames.
+
+### Changed
+
+- **Breaking:** `Session.logon()`, `Session.logout()`, `Session.refresh()`,
+  `Session.setNextSenderMsgSeqNum()` and `Session.setNextTargetMsgSeqNum()` now return
+  a `Promise<void>` and run on a libuv worker under the engine's gate, like
+  `sendToTarget()`. They take the session-state mutex that the engine holds while it
+  writes to the message store; with the message store adapter above, that write waits
+  on the event loop, so taking the mutex on the main thread deadlocked the whole
+  process (observed in the issue #29 spike, with a synchronous adapter too). Calls on
+  one session are serialised in program order whether awaited or not, so
+  `logout(); logon();` still ends enabled. Argument validation still throws
+  synchronously (`TypeError`/`RangeError`); `SessionNotFound` is now a rejection, which
+  a `'logout'` listener fired by `stop()` can see if the write lands after the engine
+  was destroyed. The getters, state queries and option getters/setters stay
+  synchronous.
+
 ## [0.3.1] - 2026-10-20
 
 Bundles **QuickFIX v1.16.0** (statically linked, unchanged).

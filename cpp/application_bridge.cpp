@@ -67,7 +67,6 @@ ApplicationBridge::ApplicationBridge(Napi::Env env, Napi::Object handlers) {
 
 ApplicationBridge::~ApplicationBridge() {
   // Wake any straggling waiter so it can't block on a destroyed channel.
-  inactive_.store(true, std::memory_order_release);
   WakeAllPending();
   // Ensure the TSFN is released so it doesn't dangle. If already released this
   // is a no-op-ish (Abort on an aborted tsfn returns an error we ignore).
@@ -84,7 +83,6 @@ void ApplicationBridge::Release() {
   if (!released_) {
     // Mark inactive BEFORE releasing so any QuickFIX thread that is about to
     // dispatch sees it and bails out (pass-through) instead of racing the TSFN.
-    inactive_.store(true, std::memory_order_release);
     WakeAllPending();
     released_ = true;
     tsfn_.Release();
@@ -93,7 +91,6 @@ void ApplicationBridge::Release() {
 
 void ApplicationBridge::Abort() {
   if (!released_) {
-    inactive_.store(true, std::memory_order_release);
     WakeAllPending();
     released_ = true;
     tsfn_.Abort();
@@ -102,7 +99,7 @@ void ApplicationBridge::Abort() {
 
 bool ApplicationBridge::RunAfterQueued(Napi::Env env,
                                        std::function<void(Napi::Env)> fn) {
-  if (released_ || inactive_.load(std::memory_order_acquire)) {
+  if (released_ || pending_.Inactive()) {
     return false;
   }
   auto* data = new CallData();
@@ -124,47 +121,16 @@ bool ApplicationBridge::RunAfterQueued(Napi::Env env,
 }
 
 void ApplicationBridge::Deactivate() {
-  inactive_.store(true, std::memory_order_release);
   // Release any network thread already blocked in CallSync so the subsequent
   // engine stop() (which joins those threads) can complete without deadlocking
   // on the frozen main loop.
   WakeAllPending();
 }
 
-bool ApplicationBridge::RegisterChannel(const std::shared_ptr<SyncChannel>& ch,
-                                        std::uint64_t& id) {
-  std::lock_guard<std::mutex> lock(pendingMtx_);
-  // Checked under the lock: Deactivate()/Abort()/Release() store inactive_
-  // before they take pendingMtx_ for WakeAllPending(), so either this
-  // registration lands in pending_ before the wake loop iterates it, or it
-  // observes inactive_ here and is refused. Without this re-check a caller
-  // could pass CallSync's unlocked fast-path check, register after the wake
-  // loop ran, and wait until Abort() while the JS thread is blocked on it.
-  if (inactive_.load(std::memory_order_acquire)) {
-    return false;
-  }
-  id = nextChannelId_++;
-  pending_[id] = ch;
-  return true;
-}
-
-void ApplicationBridge::UnregisterChannel(std::uint64_t id) {
-  std::lock_guard<std::mutex> lock(pendingMtx_);
-  pending_.erase(id);
-}
-
 void ApplicationBridge::WakeAllPending() {
-  std::lock_guard<std::mutex> lock(pendingMtx_);
-  for (auto& kv : pending_) {
-    auto& ch = kv.second;
-    {
-      std::lock_guard<std::mutex> chLock(ch->mtx);
-      if (!ch->done) {
-        ch->done = true;  // pass-through (default Result: no mutate, no throw)
-      }
-    }
-    ch->cv.notify_all();
-  }
+  // Pass-through (default Result: no mutate, no throw).
+  pending_.Deactivate(
+      [](const std::shared_ptr<SyncChannel>& ch) { ch->ForceFulfil(Result{}); });
 }
 
 void ApplicationBridge::DropHandlers() {
@@ -198,7 +164,7 @@ void ApplicationBridge::Unref(Napi::Env env) {
 void ApplicationBridge::FireAndForget(CallType type, const FIX::SessionID& id) {
   // Bridge is releasing/aborting (possibly during finalize where the TSFN is
   // being destroyed): don't touch the TSFN. Fire-and-forget just drops.
-  if (inactive_.load(std::memory_order_acquire)) {
+  if (pending_.Inactive()) {
     return;
   }
   auto* data = new CallData();
@@ -218,8 +184,8 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
   // torn down during finalize -> calling would abort the process). Return an
   // empty pass-through result so the QuickFIX thread proceeds without mutation
   // or thrown exception. This is only a cheap fast path; the authoritative
-  // check is the one RegisterChannel() makes under pendingMtx_.
-  if (inactive_.load(std::memory_order_acquire)) {
+  // check is the one PendingChannels::Register() makes under its lock.
+  if (pending_.Inactive()) {
     Result r;
     return r;
   }
@@ -246,7 +212,7 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
 
   auto channel = std::make_shared<SyncChannel>();
   std::uint64_t channelId = 0;
-  if (!RegisterChannel(channel, channelId)) {
+  if (!pending_.Register(channel, channelId)) {
     // Lost the race with Deactivate()/Abort(): the wake loop has already run
     // (or is running) over pending_, so waiting now could block until Abort().
     Result r;
@@ -259,7 +225,7 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
     // TSFN is closing/aborted: it won't take ownership and won't fulfill the
     // channel. Clean up (`data` frees itself) and return a pass-through
     // result.
-    UnregisterChannel(channelId);
+    pending_.Erase(channelId);
     Result r;
     return r;
   }
@@ -267,13 +233,10 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
 
   // Wait for the trampoline (normal completion) or Abort/Deactivate (teardown)
   // to signal the channel. Never blocks forever: WakeAllPending() sets done.
-  {
-    std::unique_lock<std::mutex> lock(channel->mtx);
-    channel->cv.wait(lock, [&channel] { return channel->done; });
-  }
-  UnregisterChannel(channelId);
+  channel->Wait(std::chrono::milliseconds(0));
+  pending_.Erase(channelId);
   std::lock_guard<std::mutex> lock(channel->mtx);
-  return channel->result;
+  return channel->outcome;
 }
 
 std::shared_ptr<const FIX::DataDictionary> ApplicationBridge::SessionDictionary(
@@ -377,15 +340,7 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
     Result result;
     ~Guard() {
       if (data->channel) {
-        auto& ch = *data->channel;
-        {
-          std::lock_guard<std::mutex> lock(ch.mtx);
-          if (!ch.done) {
-            ch.result = std::move(result);
-            ch.done = true;
-          }
-        }
-        ch.cv.notify_all();
+        data->channel->TryFulfil(std::move(result));
       }
       delete data;
     }
