@@ -628,6 +628,13 @@ the engine, which needs that state synchronously; they also accept `'file'` and
 `MapMessageStore` (an in-memory `Map` per session) is exported as the reference
 implementation and a test double.
 
+Writing your own adapter? The repository ships an agent skill,
+[`.agents/skills/custom-message-store/SKILL.md`](./.agents/skills/custom-message-store/SKILL.md),
+that an LLM can follow: the store contract as numbered rules with their sources,
+the verified column mapping onto QuickFIX's own `sessions`/`messages` tables
+(v1.16.0; the upstream DDL is linked, not copied) for interoperating with a C++
+deployment, and a test checklist.
+
 **Threads and latency.** The store is write-through: the engine persists a
 message and bumps the sequence number *before* the message hits the wire, and
 the thread doing that — the engine's network thread, or the worker running a

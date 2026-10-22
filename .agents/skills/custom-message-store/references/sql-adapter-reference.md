@@ -1,0 +1,298 @@
+# Worked example: the generic SQL adapter (abridged: DDL elided)
+
+This is `src/store/sql.ts` as it existed on `@homaiohq/napi-quickfix` branch
+`feat/js-message-store` @ `f802818` (introduced by commit `6b8caa0` "feat:
+generic SQL message-store adapter"). It was removed from that pull request to
+be shipped separately; it is reproduced here, abridged (the body of
+`sqlSchema()` is elided: this skill links to schemas, it does not copy them,
+see `upstream-schemas.md` section 5), as the executable form of the
+contract in `contract.md`, because it passed `test/store-sql.test.ts` (the
+`contract()` function, reproduced as section 1 of `test-checklist.md`, and a
+loopback restart) against `node:sqlite` and PostgreSQL. A packaged version is
+planned as a follow-up: the doc comments below that mention the
+`@homaiohq/napi-quickfix/store/sql` subpath export and the package's `sql/`
+directory describe that packaged form, which this package does not ship yet.
+
+What to copy from it, in order of importance:
+
+1. `load` reads the timestamp **as text** (`creation_time::text` /
+   `CAST(creation_time AS CHAR)`) and parses it as UTC (`fromSqlTime`); it
+   returns `null` for zero rows; it converts `NUMERIC`/`BIGINT` results with
+   `toSeq()` and validates them.
+2. `setSeqNums` is ONE `UPDATE` of both columns; note the parameter order
+   (`outgoing_seqnum = $sender, incoming_seqnum = $target`).
+3. `setMessage` is a native upsert (`ON CONFLICT ... DO UPDATE` /
+   `ON DUPLICATE KEY UPDATE`).
+4. `getMessages` is a range predicate with `ORDER BY msgseqnum ASC`, and
+   decodes `BLOB` bytes to UTF-8.
+5. `reset` is DELETE then an upsert of the session row, inside the caller's
+   `transaction` when one is given.
+6. Everything is parameterised; nothing is interpolated except the table names
+   and the placeholder syntax.
+
+It takes an `execute(sql, params)` over any driver (`pg`, `mysql2`,
+`node:sqlite`, Prisma `$queryRawUnsafe`, ...) and has no driver dependency.
+
+```ts
+/**
+ * A generic SQL {@link MessageStoreAdapter}: give it an `execute(sql, params)`
+ * over your own driver / pool and a dialect, and it persists session state in
+ * the table layout of QuickFIX's own PostgreSQL / MySQL stores (`sessions`,
+ * `messages`, optional table prefix), so an existing QuickFIX C++ deployment
+ * interoperates. Schema files for each dialect live in the package's `sql/`
+ * directory; {@link sqlSchema} returns the same statements.
+ *
+ * Subpath export: `@homaiohq/napi-quickfix/store/sql`. No driver dependency.
+ */
+import type { Awaitable, MessageStoreAdapter, MessageStoreState } from '../store.js';
+import type { SessionID } from '../session-id.js';
+
+export type SqlDialect = 'postgres' | 'mysql' | 'sqlite';
+
+/** A result row, as drivers return them (column name → value). */
+export type SqlRow = Record<string, unknown>;
+
+/**
+ * Run one statement with positional parameters and return its rows (anything
+ * array-like of rows; for statements without a result set the return value is
+ * ignored). Placeholders are `$1..$n` for `postgres`, `?` otherwise.
+ */
+export type SqlExecute = (sql: string, params: unknown[]) => Awaitable<SqlRow[] | unknown>;
+
+export interface SqlMessageStoreOptions {
+  dialect: SqlDialect;
+  execute: SqlExecute;
+  /**
+   * Run `fn` inside a transaction, handing it an `execute` bound to it. Used
+   * by `reset()` (delete the messages + rewrite the session row); without it
+   * the two statements run back to back on `execute`.
+   */
+  transaction?: (fn: (execute: SqlExecute) => Promise<void>) => Promise<void>;
+  /** Prepended to both table names (`sessions`, `messages`). Default `''`. */
+  tablePrefix?: string;
+}
+
+const KEY_COLUMNS = ['beginstring', 'sendercompid', 'targetcompid', 'session_qualifier'] as const;
+
+function key(id: SessionID): [string, string, string, string] {
+  return [id.beginString, id.senderCompID, id.targetCompID, id.sessionQualifier];
+}
+
+function placeholders(dialect: SqlDialect, from: number, count: number): string[] {
+  return Array.from({ length: count }, (_, i) => (dialect === 'postgres' ? `$${from + i}` : '?'));
+}
+
+/** `YYYY-MM-DD HH:MM:SS.mmm` in UTC, what upstream writes (at second precision). */
+function toSqlTime(d: Date): string {
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) {
+    throw new TypeError('creationTime must be a valid Date');
+  }
+  return d.toISOString().replace('T', ' ').replace('Z', '');
+}
+
+/** Parse what the driver gave back for a timestamp column read as text. */
+function fromSqlTime(v: unknown): Date {
+  if (v instanceof Date) return v;
+  if (typeof v === 'number') return new Date(v);
+  if (typeof v === 'string') {
+    // "YYYY-MM-DD HH:MM:SS[.ffffff][+00]" (no zone = UTC, as written).
+    const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}(?::?\d{2})?)?$/.exec(v.trim());
+    if (m) {
+      const frac = m[3] ? m[3].slice(0, 4) : '';
+      const zone = m[4] ? (m[4] === 'Z' ? 'Z' : m[4].length === 3 ? `${m[4]}:00` : m[4].replace(/(\d{2})(\d{2})$/, '$1:$2')) : 'Z';
+      const d = new Date(`${m[1]}T${m[2]}${frac}${zone}`);
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+    const d = new Date(v);
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+  throw new TypeError(`sql message store: cannot read creation_time ${String(v)}`);
+}
+
+function toSeq(v: unknown, what: string): number {
+  const n = typeof v === 'bigint' ? Number(v) : typeof v === 'string' ? Number(v) : (v as number);
+  if (!Number.isSafeInteger(n) || n < 1) {
+    throw new TypeError(`sql message store: ${what} is not a positive safe integer (${String(v)})`);
+  }
+  return n;
+}
+
+function rows(result: unknown): SqlRow[] {
+  if (Array.isArray(result)) return result as SqlRow[];
+  if (result && typeof result === 'object' && Array.isArray((result as { rows?: unknown }).rows)) {
+    return (result as { rows: SqlRow[] }).rows; // a pg Result passed through as is
+  }
+  return [];
+}
+
+/**
+ * The table-creation statements for `dialect` (one per table), as in the
+ * package's `sql/` files.
+ */
+export function sqlSchema(dialect: SqlDialect, options: { tablePrefix?: string } = {}): string[] {
+  const p = options.tablePrefix ?? '';
+  const pk = `PRIMARY KEY (${KEY_COLUMNS.join(', ')}`;
+  switch (dialect) {
+    case 'postgres':
+    case 'mysql':
+    case 'sqlite':
+      // DDL elided from this reproduction: the tables follow QuickFIX's own
+      // layout, see https://github.com/quickfix/quickfix/tree/master/src/sql
+      // (and `sql/*.sql` in this package on the branch that ships the adapter).
+      // Per dialect the real function returns two statements, one creating
+      // `${p}sessions` (the four key columns, creation_time, incoming_seqnum,
+      // outgoing_seqnum, `${pk})`) and one creating `${p}messages` (the four
+      // key columns, msgseqnum, message, `${pk}, msgseqnum)`), both
+      // `IF NOT EXISTS`; MySQL uses DATETIME(3) for creation_time and BLOB for
+      // message, SQLite plain TEXT/INTEGER columns.
+      return [`-- ${p}sessions: see sql/${dialect}.sql`, `-- ${p}messages: see sql/${dialect}.sql`];
+    default:
+      throw new TypeError(`sql message store: unknown dialect ${String(dialect)}`);
+  }
+}
+
+/**
+ * Build a {@link MessageStoreAdapter} over `execute`. Column mapping follows
+ * upstream: `outgoing_seqnum` is the next sender number, `incoming_seqnum` the
+ * next target number; timestamps are written and read as UTC text.
+ */
+export function createSqlMessageStore(options: SqlMessageStoreOptions): MessageStoreAdapter {
+  const { dialect, execute, transaction } = options;
+  if (dialect !== 'postgres' && dialect !== 'mysql' && dialect !== 'sqlite') {
+    throw new TypeError(`sql message store: unknown dialect ${String(dialect)}`);
+  }
+  if (typeof execute !== 'function') {
+    throw new TypeError('sql message store: execute must be a function');
+  }
+  const p = options.tablePrefix ?? '';
+  const sessions = `${p}sessions`;
+  const messages = `${p}messages`;
+  const ph = (from: number, count: number) => placeholders(dialect, from, count);
+  const where = (from: number) => KEY_COLUMNS.map((c, i) => `${c} = ${ph(from + i, 1)[0]}`).join(' AND ');
+  const timeText =
+    dialect === 'postgres'
+      ? 'creation_time::text AS creation_time'
+      : dialect === 'mysql'
+        ? 'CAST(creation_time AS CHAR) AS creation_time'
+        : 'creation_time';
+
+  const sql = {
+    load: `SELECT ${timeText}, incoming_seqnum, outgoing_seqnum FROM ${sessions} WHERE ${where(1)}`,
+    create: `INSERT INTO ${sessions} (${KEY_COLUMNS.join(', ')}, creation_time, incoming_seqnum, outgoing_seqnum) VALUES (${ph(1, 7).join(', ')})`,
+    setSeqNums: `UPDATE ${sessions} SET outgoing_seqnum = ${ph(1, 1)[0]}, incoming_seqnum = ${ph(2, 1)[0]} WHERE ${where(3)}`,
+    setMessage:
+      dialect === 'mysql'
+        ? `INSERT INTO ${messages} (${KEY_COLUMNS.join(', ')}, msgseqnum, message) VALUES (${ph(1, 6).join(', ')}) ON DUPLICATE KEY UPDATE message = VALUES(message)`
+        : `INSERT INTO ${messages} (${KEY_COLUMNS.join(', ')}, msgseqnum, message) VALUES (${ph(1, 6).join(', ')}) ON CONFLICT (${KEY_COLUMNS.join(', ')}, msgseqnum) DO UPDATE SET message = ${dialect === 'postgres' ? 'EXCLUDED' : 'excluded'}.message`,
+    getMessages: `SELECT message FROM ${messages} WHERE ${where(1)} AND msgseqnum >= ${ph(5, 1)[0]} AND msgseqnum <= ${ph(6, 1)[0]} ORDER BY msgseqnum ASC`,
+    deleteMessages: `DELETE FROM ${messages} WHERE ${where(1)}`,
+    resetSession:
+      dialect === 'mysql'
+        ? `INSERT INTO ${sessions} (${KEY_COLUMNS.join(', ')}, creation_time, incoming_seqnum, outgoing_seqnum) VALUES (${ph(1, 7).join(', ')}) ON DUPLICATE KEY UPDATE creation_time = VALUES(creation_time), incoming_seqnum = VALUES(incoming_seqnum), outgoing_seqnum = VALUES(outgoing_seqnum)`
+        : `INSERT INTO ${sessions} (${KEY_COLUMNS.join(', ')}, creation_time, incoming_seqnum, outgoing_seqnum) VALUES (${ph(1, 7).join(', ')}) ON CONFLICT (${KEY_COLUMNS.join(', ')}) DO UPDATE SET creation_time = ${dialect === 'postgres' ? 'EXCLUDED' : 'excluded'}.creation_time, incoming_seqnum = ${dialect === 'postgres' ? 'EXCLUDED' : 'excluded'}.incoming_seqnum, outgoing_seqnum = ${dialect === 'postgres' ? 'EXCLUDED' : 'excluded'}.outgoing_seqnum`,
+  };
+
+  const resetWith = async (run: SqlExecute, id: SessionID, state: MessageStoreState) => {
+    await run(sql.deleteMessages, key(id));
+    await run(sql.resetSession, [...key(id), toSqlTime(state.creationTime), state.nextTargetMsgSeqNum, state.nextSenderMsgSeqNum]);
+  };
+
+  return {
+    async load(id) {
+      const r = rows(await execute(sql.load, key(id)));
+      if (r.length === 0) return null;
+      const row = r[0];
+      return {
+        creationTime: fromSqlTime(row.creation_time),
+        nextSenderMsgSeqNum: toSeq(row.outgoing_seqnum, 'outgoing_seqnum'),
+        nextTargetMsgSeqNum: toSeq(row.incoming_seqnum, 'incoming_seqnum'),
+      };
+    },
+    async create(id, state) {
+      await execute(sql.create, [...key(id), toSqlTime(state.creationTime), state.nextTargetMsgSeqNum, state.nextSenderMsgSeqNum]);
+    },
+    async setSeqNums(id, nextSender, nextTarget) {
+      await execute(sql.setSeqNums, [nextSender, nextTarget, ...key(id)]);
+    },
+    async setMessage(id, seqNum, message) {
+      await execute(sql.setMessage, [...key(id), seqNum, message]);
+    },
+    async getMessages(id, begin, end) {
+      const r = rows(await execute(sql.getMessages, [...key(id), begin, end]));
+      return r.map((row) => {
+        const m = row.message;
+        if (typeof m === 'string') return m;
+        if (m instanceof Uint8Array) return Buffer.from(m).toString('utf8');
+        throw new TypeError('sql message store: message column is neither text nor bytes');
+      });
+    },
+    async reset(id, state) {
+      if (transaction) {
+        await transaction((run) => resetWith(run, id, state));
+      } else {
+        await resetWith(execute, id, state);
+      }
+    },
+  };
+}
+```
+
+## How it was wired to real drivers (from the README of the same revision)
+
+```ts
+// pg
+const store = createSqlMessageStore({
+  dialect: 'postgres',
+  execute: async (sql, params) => (await pool.query(sql, params)).rows,
+  transaction: async (fn) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await fn(async (sql, params) => (await client.query(sql, params)).rows);
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+});
+// mysql2 (promise API)
+const store = createSqlMessageStore({
+  dialect: 'mysql',
+  execute: async (sql, params) => (await pool.execute(sql, params))[0] as Record<string, unknown>[],
+});
+// node:sqlite (synchronous driver; the adapter still returns Promises, which is fine)
+const store = createSqlMessageStore({
+  dialect: 'sqlite',
+  execute: (sql, params) => db.prepare(sql).all(...params) as Record<string, unknown>[],
+  transaction: async (fn) => {
+    db.exec('BEGIN');
+    try {
+      await fn(execute);
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+  },
+});
+// Prisma
+const store = createSqlMessageStore({
+  dialect: 'postgres',
+  execute: (sql, params) => prisma.$queryRawUnsafe(sql, ...params),
+});
+```
+
+(The `transaction` wrappers are those of `test/store-sql.test.ts`
+`sqliteBackend()` / `postgresBackend()`.)
+
+Two things the adapter did NOT do, which a production copy should consider:
+
+- It did not reject a `setSeqNums` that updated zero rows (contract C3). With
+  `pg`, `result.rowCount === 0` is available; with `mysql2`,
+  `result.affectedRows`.
+- It did not set statement timeouts (contract I2); do that on the pool
+  (`statement_timeout` for PostgreSQL, `MAX_EXECUTION_TIME` / connect timeouts
+  for MySQL), shorter than `storeTimeoutMs`.

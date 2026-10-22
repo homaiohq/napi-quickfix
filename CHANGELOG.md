@@ -32,6 +32,10 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   reference implementation) is exported; README "Message store" has the threading and
   latency contract (bound in-flight sends; an adapter must not depend on the libuv
   threadpool).
+- `.agents/skills/custom-message-store`: an agent skill for writing a custom
+  `MessageStoreAdapter` (the contract as sourced rules, the column mapping onto
+  QuickFIX v1.16.0's `sessions`/`messages` tables for interop with links to the
+  upstream DDL, a test checklist).
 - `SessionSettings.getSessions(connectionType?)`: only the sessions an engine of that
   type would create.
 - `scripts/tsan.sh` and a ThreadSanitizer CI job over the suite, gating on reports in
