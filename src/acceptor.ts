@@ -2,9 +2,9 @@
  * FIX session acceptor (server side — listens for initiators).
  */
 import { native } from './native.js';
-import { Engine, type EngineOptions } from './engine.js';
+import { Engine, type CreateEngineOptions, type EngineOptions } from './engine.js';
 
-export type { EngineOptions } from './engine.js';
+export type { CreateEngineOptions, EngineOptions } from './engine.js';
 
 /**
  * A FIX session acceptor (wraps `FIX::SocketAcceptor`). Acceptors listen for
@@ -30,8 +30,27 @@ export type { EngineOptions } from './engine.js';
  * ```
  */
 export class Acceptor extends Engine {
-  /** @param options Engine options. */
+  /**
+   * @param options Engine options. A {@link MessageStoreAdapter} store is
+   *   only accepted by {@link Acceptor.create}.
+   */
   constructor(options: EngineOptions) {
     super(native.AcceptorWrap, options);
+  }
+
+  /**
+   * Build an Acceptor, loading the message store first when `store` is a
+   * {@link MessageStoreAdapter}: the adapter's `load()` (and `create()` for a
+   * session it has never seen) runs for every session the engine will own,
+   * then the engine is constructed from that state. With `'file'`/`'memory'`
+   * this is `new Acceptor(options)` behind a Promise, so there is one entry
+   * point for every store.
+   *
+   * Rejects without having created anything if `load()`/`create()` fail, and
+   * with the engine torn down if a store call the constructor made (a
+   * `reset()` for a session constructed outside its session time) fails.
+   */
+  static async create(options: CreateEngineOptions): Promise<Acceptor> {
+    return Engine.createEngine('acceptor', options, (o) => new Acceptor(o));
   }
 }
