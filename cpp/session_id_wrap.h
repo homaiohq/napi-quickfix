@@ -19,12 +19,6 @@ class SessionIDWrap : public Napi::ObjectWrap<SessionIDWrap> {
 
   // Build a JS SessionID wrapping a copy of the given FIX::SessionID.
   static Napi::Object NewInstance(Napi::Env env, const FIX::SessionID& id);
-  // The same by raw Node-API status: false, with nothing created, if the
-  // instance cannot be built -- in particular when the environment is
-  // stopping (worker.terminate()), where the throwing form would abort the
-  // process. For the ApplicationBridge trampoline.
-  static bool TryNewInstance(napi_env env, const FIX::SessionID& id,
-                             napi_value* out);
 
   explicit SessionIDWrap(const Napi::CallbackInfo& info);
 

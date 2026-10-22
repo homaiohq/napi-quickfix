@@ -39,14 +39,6 @@ class MessageWrap : public Napi::ObjectWrap<MessageWrap> {
   static Napi::Object NewInstance(
       Napi::Env env, FIX::Message&& msg,
       std::shared_ptr<const FIX::DataDictionary> sessionDictionary = nullptr);
-  // The same by raw Node-API status: false, with nothing created, if the
-  // instance cannot be built -- in particular when the environment is
-  // stopping (worker.terminate()), where the throwing form would abort the
-  // process. For the ApplicationBridge trampoline.
-  static bool TryNewInstance(
-      napi_env env, FIX::Message&& msg,
-      std::shared_ptr<const FIX::DataDictionary> sessionDictionary,
-      napi_value* out);
 
   explicit MessageWrap(const Napi::CallbackInfo& info);
 

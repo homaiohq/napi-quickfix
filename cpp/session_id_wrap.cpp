@@ -28,27 +28,12 @@ Napi::Object SessionIDWrap::Init(Napi::Env env, Napi::Object exports) {
 
 Napi::Object SessionIDWrap::NewInstance(Napi::Env env,
                                         const FIX::SessionID& id) {
-  napi_value obj = nullptr;
-  if (!TryNewInstance(env, id, &obj)) {
-    throw Napi::Error::New(env);
-  }
-  return Napi::Object(env, obj);
-}
-
-bool SessionIDWrap::TryNewInstance(napi_env env, const FIX::SessionID& id,
-                                   napi_value* out) {
-  const std::string parts[4] = {
-      id.getBeginString().getValue(), id.getSenderCompID().getValue(),
-      id.getTargetCompID().getValue(), id.getSessionQualifier()};
-  napi_value argv[4];
-  for (int i = 0; i < 4; i++) {
-    if (napi_create_string_utf8(env, parts[i].data(), parts[i].size(),
-                                &argv[i]) != napi_ok) {
-      return false;
-    }
-  }
-  napi_value ctor = AddonData::Get(env).sessionID.Value();
-  return napi_new_instance(env, ctor, 4, argv, out) == napi_ok;
+  return AddonData::Get(env).sessionID.New({
+      Napi::String::New(env, id.getBeginString().getValue()),
+      Napi::String::New(env, id.getSenderCompID().getValue()),
+      Napi::String::New(env, id.getTargetCompID().getValue()),
+      Napi::String::New(env, id.getSessionQualifier()),
+  });
 }
 
 SessionIDWrap* SessionIDWrap::UnwrapArg(Napi::Env env, Napi::Value value,

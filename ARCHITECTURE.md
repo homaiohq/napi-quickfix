@@ -164,15 +164,17 @@ sequenceDiagram
 - The message also carries the **session dictionary**, so `setField` & co. route its header/trailer fields as the
   parser does. The bridge caches, per session, a copy of the session's `DataDictionaryProvider` (which shares its
   dictionaries' ownership) taken on the QuickFIX thread, so a message kept by JS can outlive its session safely.
-- The trampoline (`CallJs`) drives the handler call and the wrapping of its arguments through **raw Node-API status
-  checks**, not the node-addon-api wrappers. A Worker's `terminate()` marks its environment unable to call into JS
-  from the parent thread, at any moment, while the Worker's loop still dispatches what the TSFN holds (and the
-  callback whose handler is running): from then on every Node-API call that may run JS fails with
-  `napi_pending_exception` and no exception, and the wrappers turn that into `throw Napi::Error::New(env)`, which
-  builds the error with the same failing calls and aborts the process. The trampoline instead probes the environment
-  first (`CanCallIntoJs`), checks each status, and lets a callback that can no longer reach JS pass through, exactly as
-  it does after `Deactivate()`. `MessageWrap::TryNewInstance` / `SessionIDWrap::TryNewInstance` are the status-returning
-  factories it uses.
+- The trampoline (`CallJs`) **catches everything** its body throws and lets the callback pass through. A Worker's
+  `terminate()` marks its environment unable to call into JS from the parent thread, at any moment, while the
+  Worker's loop still dispatches what the TSFN holds (and the callback whose handler is running): from then on every
+  Node-API call that may run JS fails, and the node-addon-api wrappers throw a `Napi::Error` for it, which the
+  trampoline treats exactly as it treats a callback arriving after `Deactivate()`. The one failure the wrappers
+  cannot build their error for is a handler interrupted mid-call: V8 reports the termination as a pending exception
+  whose value is `null`, and wrapping a non-object exception needs a call that fails in a stopping environment and
+  would abort the process. The build defines `NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS` (`CMakeLists.txt`) so that
+  node-addon-api treats that failure as success; the trampoline then probes the environment (`CanCallIntoJs`, only on
+  that failure path) to tell an interrupted handler from one that threw, so the interruption is not reported to
+  QuickFIX as a throw.
 
 ---
 

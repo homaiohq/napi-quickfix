@@ -29,11 +29,16 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   heap corruption, a V8 fatal check at Worker teardown and a segmentation fault. The
   constructors now live in per-environment instance data.
 - `worker.terminate()` aborted the whole process when an engine callback was being
-  dispatched in the Worker at that moment: once a Worker's environment is stopping,
-  every Node-API call that may run JS fails, and node-addon-api's wrappers abort while
-  building the error they would throw. The bridge's trampoline now drives the handler
-  call and the argument wrapping through raw Node-API status checks and lets such a
-  callback pass through, as it does after the engine's own teardown.
+  dispatched in the Worker at that moment. Once a Worker's environment is stopping,
+  every Node-API call that may run JS fails and node-addon-api's wrappers throw a
+  `Napi::Error`, which escaped the bridge's trampoline and terminated the process; and
+  a handler interrupted mid-call leaves V8's termination marker (`null`) as the pending
+  exception, which the wrappers cannot wrap without aborting. The trampoline now
+  catches everything and lets such a callback pass through, as it does after the
+  engine's own teardown, and the build defines node-addon-api's
+  `NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS` for the interrupted-handler case, which is
+  told apart from a handler that threw so the interruption is not reported to QuickFIX
+  as a throw.
 
 ### Known QuickFIX limitations
 

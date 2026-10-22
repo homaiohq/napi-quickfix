@@ -105,6 +105,10 @@ target_compile_definitions(napi_quickfix PRIVATE
   NAPI_VERSION=9
   NAPI_CPP_EXCEPTIONS
   NODE_ADDON_API_DISABLE_DEPRECATED
+  # A Worker's terminate() leaves the trampoline (cpp/application_bridge.cpp)
+  # with a pending exception it cannot wrap: let node-addon-api build the
+  # Napi::Error anyway instead of aborting the process.
+  NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS
 )
 
 target_link_libraries(napi_quickfix PRIVATE ${CMAKE_JS_LIB} quickfix)

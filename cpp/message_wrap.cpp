@@ -62,32 +62,11 @@ Napi::Object MessageWrap::NewInstance(Napi::Env env, const FIX::Message& msg) {
 Napi::Object MessageWrap::NewInstance(
     Napi::Env env, FIX::Message&& msg,
     std::shared_ptr<const FIX::DataDictionary> sessionDictionary) {
-  napi_value obj = nullptr;
-  if (!TryNewInstance(env, std::move(msg), std::move(sessionDictionary),
-                      &obj)) {
-    throw Napi::Error::New(env);
-  }
-  return Napi::Object(env, obj);
-}
-
-bool MessageWrap::TryNewInstance(
-    napi_env env, FIX::Message&& msg,
-    std::shared_ptr<const FIX::DataDictionary> sessionDictionary,
-    napi_value* out) {
-  napi_value ctor = AddonData::Get(env).message.Value();
-  napi_value obj = nullptr;
-  if (napi_new_instance(env, ctor, 0, nullptr, &obj) != napi_ok) {
-    return false;
-  }
-  MessageWrap* wrap = nullptr;
-  if (napi_unwrap(env, obj, reinterpret_cast<void**>(&wrap)) != napi_ok ||
-      wrap == nullptr) {
-    return false;
-  }
+  Napi::Object obj = AddonData::Get(env).message.New({});
+  MessageWrap* wrap = Napi::ObjectWrap<MessageWrap>::Unwrap(obj);
   wrap->message_ = std::move(msg);
   wrap->sessionDictionary_ = std::move(sessionDictionary);
-  *out = obj;
-  return true;
+  return obj;
 }
 
 MessageWrap* MessageWrap::UnwrapArg(Napi::Env env, Napi::Value value,

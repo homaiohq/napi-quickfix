@@ -365,54 +365,38 @@ void ApplicationBridge::fromApp(const FIX::Message& message,
 // ---------------------------------------------------------------------------
 // JS-thread trampoline. Runs on the Node event-loop thread.
 //
-// Written against raw Node-API, not the node-addon-api wrappers, for every
-// call that may run JS. The environment may be stopping while the trampoline
-// runs: worker.terminate() marks the Worker's environment unable to call into
-// JS from the parent thread, at any time, and its event loop still dispatches
-// what the TSFN already holds (plus the callback in progress, if the handler
-// was running). From then on every Node-API call that could run JS fails
-// with napi_pending_exception -- without an exception -- and the wrappers
-// turn that status into `throw Napi::Error::New(env)`, which builds the
-// error with the same calls and aborts the process (NAPI_FATAL) when they
-// fail too. Checking the status here instead lets such a callback pass
-// through, as it does after Deactivate(): no mutation, no throw.
+// The environment may be stopping while the trampoline runs: worker.terminate()
+// marks the Worker's environment unable to call into JS from the parent
+// thread, at any time, and its event loop still dispatches what the TSFN
+// already holds (plus the callback in progress, if the handler was running).
+// From then on every Node-API call that may run JS fails with
+// napi_pending_exception, and the node-addon-api wrappers throw a Napi::Error
+// for it; CallJs catches whatever CallJsBody throws and lets the callback
+// pass through, as it does after Deactivate(): no mutation, no throw.
+//
+// A handler interrupted by terminate() is the one case the wrappers cannot
+// build their error for: V8 reports the termination as a pending exception
+// whose value is `null`, and node-addon-api wraps a non-object exception in
+// a fresh object, with a call that fails in a stopping environment and aborts
+// the process. NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS (CMakeLists.txt) makes
+// node-addon-api treat exactly that failure as success. The handler's throw
+// then reaches the catch below like any other, and CanCallIntoJs tells the
+// two apart so the interruption is not reported to QuickFIX as a throw.
 // ---------------------------------------------------------------------------
 
 namespace {
 
 // Whether `env` can still run JS. Once its environment is stopping, every
 // Node-API call that may run JS reports napi_pending_exception; a property
-// read on a fresh object has no other way to fail.
+// lookup on a fresh object has no other way to fail. Only used after a failed
+// handler call, not on the dispatch path.
 bool CanCallIntoJs(napi_env env) {
   napi_value object = nullptr;
-  napi_value out = nullptr;
+  napi_value key = nullptr;
+  bool has = false;
   if (napi_create_object(env, &object) != napi_ok) return false;
-  return napi_get_named_property(env, object, "probe", &out) == napi_ok;
-}
-
-napi_valuetype TypeOf(napi_env env, napi_value value) {
-  napi_valuetype type = napi_undefined;
-  napi_typeof(env, value, &type);
-  return type;
-}
-
-// `object[name]` if it is a string, "" otherwise (or if it cannot be read).
-std::string StringProperty(napi_env env, napi_value object, const char* name) {
-  napi_value value = nullptr;
-  if (napi_get_named_property(env, object, name, &value) != napi_ok ||
-      TypeOf(env, value) != napi_string) {
-    return std::string();
-  }
-  size_t length = 0;
-  if (napi_get_value_string_utf8(env, value, nullptr, 0, &length) != napi_ok) {
-    return std::string();
-  }
-  std::string out(length, '\0');
-  if (napi_get_value_string_utf8(env, value, &out[0], length + 1, &length) !=
-      napi_ok) {
-    return std::string();
-  }
-  return out;
+  if (napi_create_string_utf8(env, "p", 1, &key) != napi_ok) return false;
+  return napi_has_own_property(env, object, key, &has) == napi_ok;
 }
 
 }  // namespace
@@ -442,15 +426,14 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
     }
   } guard{data, {}};
 
-  // The body reports a stopping environment by its status codes (see the
-  // section comment); this catch is for whatever else it may throw (a
-  // Napi::Error from a call that cannot run JS, a bad_alloc in a copy), which
-  // node-addon-api's TSFN wrapper would otherwise rethrow into JS -- and, from
-  // a callback libuv runs with no handler, that is std::terminate.
+  // Whatever the body throws -- a Napi::Error from a call that cannot run JS
+  // in a stopping environment (see the section comment), a bad_alloc in a
+  // copy, anything else -- node-addon-api's TSFN wrapper would otherwise
+  // rethrow into JS, and from a callback libuv runs with no handler that is
+  // std::terminate. The callback passes through instead.
   try {
     CallJsBody(env, context, data, guard.result);
-  } catch (const Napi::Error&) {
-  } catch (const std::exception&) {
+  } catch (...) {
   }
   // guard destructor signals the channel (for sync) and deletes data.
 }
@@ -472,71 +455,62 @@ void ApplicationBridge::CallJsBody(Napi::Env env, ApplicationBridge* context,
 
   Napi::HandleScope scope(env);
 
-  // A stopping environment (see above): pass-through.
-  if (!CanCallIntoJs(env)) {
-    return;
-  }
-
   // Resolve the handler function, if the user provided one.
-  napi_value handler = nullptr;
+  Napi::Function handler;
   if (!context->handlers_.IsEmpty()) {
-    napi_value handlers = context->handlers_.Value();
-    napi_value h = nullptr;
-    if (napi_get_named_property(env, handlers, HandlerName(data->type), &h) !=
-        napi_ok) {
-      return;
-    }
-    if (TypeOf(env, h) == napi_function) {
-      handler = h;
+    Napi::Object handlers = context->handlers_.Value();
+    Napi::Value h = handlers.Get(HandlerName(data->type));
+    if (h.IsFunction()) {
+      handler = h.As<Napi::Function>();
     }
   }
 
   // Build the JS arguments: (message?, sessionID).
-  napi_value sessionIdObj = nullptr;
-  if (!SessionIDWrap::TryNewInstance(env, data->sessionID, &sessionIdObj)) {
-    return;
-  }
+  Napi::Object sessionIdObj = SessionIDWrap::NewInstance(env, data->sessionID);
 
-  napi_value msgObj = nullptr;
+  Napi::Object msgObj;
+  bool haveMsg = false;
   if (data->hasMessage) {
     // Hand the structured copy over to the wrapper (data is deleted by the
     // guard above): no string round-trip and no second copy, so the repeating
     // groups the engine parsed stay intact for the handler.
-    if (!MessageWrap::TryNewInstance(env, std::move(data->message),
-                                     std::move(data->sessionDictionary),
-                                     &msgObj)) {
-      return;
-    }
+    msgObj = MessageWrap::NewInstance(env, std::move(data->message),
+                                      std::move(data->sessionDictionary));
+    haveMsg = true;
   }
 
-  if (handler == nullptr) {
+  if (handler.IsEmpty()) {
     // No handler for this callback: pass-through (no mutation, no throw).
     return;
   }
 
-  napi_value argv[2];
-  size_t argc = 0;
-  if (msgObj != nullptr) argv[argc++] = msgObj;
-  argv[argc++] = sessionIdObj;
-  napi_value receiver = nullptr;
-  napi_get_undefined(env, &receiver);
-  napi_value ignored = nullptr;
-  if (napi_call_function(env, receiver, handler, argc, argv, &ignored) !=
-      napi_ok) {
-    bool pending = false;
-    napi_is_exception_pending(env, &pending);
-    napi_value error = nullptr;
-    if (!pending || napi_get_and_clear_last_exception(env, &error) != napi_ok) {
-      // No exception: the environment is stopping. Pass-through.
+  try {
+    if (haveMsg) {
+      handler.Call({msgObj, sessionIdObj});
+    } else {
+      handler.Call({sessionIdObj});
+    }
+  } catch (const Napi::Error& e) {
+    // A handler interrupted by worker.terminate() fails the same way as one
+    // that threw (see the section comment). Not a throw: pass-through.
+    if (!CanCallIntoJs(env)) {
       return;
     }
     if (isSync) {
       result.threw = true;
       // Read `.fixError` and `.message` off the JS error to pick the FIX
       // exception; a non-object throw carries neither.
-      if (TypeOf(env, error) == napi_object) {
-        result.errorName = StringProperty(env, error, "fixError");
-        result.errorMessage = StringProperty(env, error, "message");
+      Napi::Value value = e.Value();
+      if (value.IsObject()) {
+        Napi::Object error = value.As<Napi::Object>();
+        Napi::Value name = error.Get("fixError");
+        if (name.IsString()) {
+          result.errorName = name.As<Napi::String>().Utf8Value();
+        }
+        Napi::Value message = error.Get("message");
+        if (message.IsString()) {
+          result.errorMessage = message.As<Napi::String>().Utf8Value();
+        }
       }
     }
     // For fire-and-forget, the JS error is swallowed here (there's no FIX-thread
@@ -545,10 +519,9 @@ void ApplicationBridge::CallJsBody(Napi::Env env, ApplicationBridge* context,
   }
 
   // For mutating sync callbacks, read back the (possibly edited) message.
-  if (isSync && IsMutating(data->type) && msgObj != nullptr) {
-    MessageWrap* w = nullptr;
-    if (napi_unwrap(env, msgObj, reinterpret_cast<void**>(&w)) == napi_ok &&
-        w != nullptr) {
+  if (isSync && IsMutating(data->type) && haveMsg) {
+    MessageWrap* w = Napi::ObjectWrap<MessageWrap>::Unwrap(msgObj);
+    if (w != nullptr) {
       result.editedMessage = w->Message();
       result.mutated = true;
     }
