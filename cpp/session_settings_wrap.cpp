@@ -5,6 +5,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "errors.h"
 #include "quickfix/SessionID.h"
@@ -81,13 +82,37 @@ Napi::Value SessionSettingsWrap::FromFile(const Napi::CallbackInfo& info) {
       {Napi::String::New(env, "file"), info[0].As<Napi::String>()});
 }
 
+// getSessions(connectionType?): every [SESSION], or only those an engine of
+// `connectionType` ("initiator" | "acceptor") would create -- the same filter
+// the engine wraps apply (RejectDuplicateSessions, engine_common.h), with the
+// [DEFAULT] section merged in. The TS create() factories use it to preload
+// the message store for exactly the sessions the engine will own.
 Napi::Value SessionSettingsWrap::GetSessions(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  const bool filtered = info.Length() >= 1 && !info[0].IsUndefined();
+  std::string connectionType;
+  if (filtered) {
+    if (!info[0].IsString()) {
+      throw Napi::TypeError::New(env, "getSessions(connectionType?: string)");
+    }
+    connectionType = info[0].As<Napi::String>().Utf8Value();
+  }
   NQ_TRY(env) {
     std::set<FIX::SessionID> sessions = settings_.getSessions();
-    Napi::Array arr = Napi::Array::New(env, sessions.size());
-    uint32_t i = 0;
+    std::vector<FIX::SessionID> selected;
     for (const auto& id : sessions) {
+      if (filtered) {
+        const FIX::Dictionary& dict = settings_.get(id);
+        if (!dict.has("ConnectionType") ||
+            dict.getString("ConnectionType") != connectionType) {
+          continue;
+        }
+      }
+      selected.push_back(id);
+    }
+    Napi::Array arr = Napi::Array::New(env, selected.size());
+    uint32_t i = 0;
+    for (const auto& id : selected) {
       arr.Set(i++, SessionIDWrap::NewInstance(env, id));
     }
     return arr;

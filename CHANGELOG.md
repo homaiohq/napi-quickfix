@@ -11,6 +11,32 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
 
+### Added
+
+- `MessageStoreAdapter`: a pluggable message store. Pass an adapter object (one per
+  engine, keyed by `SessionID`: `load`/`create`/`setSeqNums`/`setMessage`/`getMessages`/
+  `reset`/`close?`, each sync or async) to the new `Initiator.create()` /
+  `Acceptor.create()` factories to persist session state write-through in any database
+  Node can reach, through your own driver and pool. The factories preload the state
+  (`load()`, `create()` for a session never seen) before constructing the engine, and
+  also accept `'file'`/`'memory'`. `storeTimeoutMs` (default 30 s, `0` disables) bounds
+  how long an engine thread waits on one adapter call. Failures reach the engine as
+  `IOException` and are reported through the new `'storeError'` event: `setMessage`/
+  `getMessages` failures are never fatal; `setSeqNums`/`reset` rejections, timeouts and
+  late settlements (and `load` failures) poison the session's store until it has been
+  reloaded, which takes the session down and lets QuickFIX reconcile with the peer at
+  the next logon. `reset()`/`refresh()` never throw into QuickFIX (its
+  `ResetOnDisconnect`/`RefreshOnLogon` paths have no handler; observed `std::terminate`).
+  `stop(true)` fails pending store calls first; a graceful `stop()` lets them complete
+  and calls `close()` per session before settling. `MapMessageStore` (in-memory
+  reference implementation) is exported; README "Message store" has the threading and
+  latency contract (bound in-flight sends; an adapter must not depend on the libuv
+  threadpool).
+- `SessionSettings.getSessions(connectionType?)`: only the sessions an engine of that
+  type would create.
+- `scripts/tsan.sh` and a ThreadSanitizer CI job over the suite, gating on reports in
+  this addon's frames.
+
 ### Changed
 
 - **Breaking:** `Session.logon()`, `Session.logout()`, `Session.refresh()`,

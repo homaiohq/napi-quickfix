@@ -3,20 +3,18 @@
 
 #include <napi.h>
 
-#include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 
 #include "quickfix/Application.h"
 #include "quickfix/DataDictionary.h"
 #include "quickfix/Message.h"
 #include "quickfix/SessionID.h"
+#include "sync_channel.h"
 
 namespace napi_quickfix {
 
@@ -65,18 +63,10 @@ class ApplicationBridge : public FIX::Application {
     std::string errorMessage;
   };
 
-  // Reply channel for a synchronous call. Heap-allocated and shared (shared_ptr)
-  // between the waiting QuickFIX thread and the JS trampoline so neither can
-  // dangle. Guarded by a mutex + condition_variable so the waiter can be woken
-  // either by the trampoline (normal completion) or by Abort()/Deactivate()
-  // (teardown), instead of blocking forever on a future when the main loop is
-  // frozen inside a cleanup hook.
-  struct SyncChannel {
-    std::mutex mtx;
-    std::condition_variable cv;
-    bool done = false;
-    Result result;
-  };
+  // Reply channel for a synchronous call (sync_channel.h): shared between
+  // the waiting QuickFIX thread and the JS trampoline, woken either by the
+  // trampoline (normal completion) or by Abort()/Deactivate() (teardown).
+  using SyncChannel = napi_quickfix::SyncChannel<Result>;
 
   struct CallData {
     CallType type;
@@ -187,32 +177,21 @@ class ApplicationBridge : public FIX::Application {
   Napi::ObjectReference handlers_;
   TSFN tsfn_;
   bool released_ = false;
-  // Set true by Abort()/Release() (which may run on the MAIN thread during
-  // finalize) and read by the FIX::Application overrides (which run on QuickFIX
-  // network threads). Once true, the overrides must NOT touch the TSFN — during
-  // environment teardown the TSFN's internals may already be destroyed, and
-  // calling into it aborts the process. Atomic so the cross-thread read is safe.
-  std::atomic<bool> inactive_{false};
 
-  // Wake all in-flight synchronous callers (used by Deactivate/Abort so a
-  // network thread blocked in CallSync doesn't wait forever when the main loop
-  // is frozen inside a cleanup hook). Registers each SyncChannel while pending.
-  //
-  // Invariant: every path that sets inactive_ stores it BEFORE taking
-  // pendingMtx_ to run WakeAllPending(), and RegisterChannel() re-checks
-  // inactive_ UNDER pendingMtx_. So a registration that saw inactive_ unset is
-  // already in pending_ when the wake loop runs, and one that lost the race is
-  // refused; either way no caller can start waiting after the wake. The JS
-  // thread relies on this when it blocks on a network thread after
-  // Deactivate() (Teardown's stop() join, DestroyEngine's gate freeze).
-  std::mutex pendingMtx_;
-  std::unordered_map<std::uint64_t, std::shared_ptr<SyncChannel>> pending_;
-  std::uint64_t nextChannelId_ = 0;
+  // The in-flight synchronous calls, and the bridge's inactive flag
+  // (PendingChannels, sync_channel.h). The flag is set by Deactivate()/
+  // Abort()/Release() (which may run on the MAIN thread during finalize) and
+  // read by the FIX::Application overrides (QuickFIX network threads). Once
+  // set, the overrides must NOT touch the TSFN -- during environment teardown
+  // its internals may already be destroyed, and calling into it aborts the
+  // process -- and every waiter is woken with a pass-through Result, so a
+  // network thread blocked in CallSync never waits forever on a frozen loop.
+  // The registry's register/deactivate invariant is what lets the JS thread
+  // block on a network thread after Deactivate() (Teardown's stop() join,
+  // DestroyEngine's gate freeze).
+  PendingChannels<SyncChannel> pending_;
 
-  // Returns false (nothing registered) if the bridge is already inactive.
-  bool RegisterChannel(const std::shared_ptr<SyncChannel>& ch,
-                       std::uint64_t& id);
-  void UnregisterChannel(std::uint64_t id);
+  // Mark inactive and wake every in-flight caller (pass-through).
   void WakeAllPending();
 };
 
