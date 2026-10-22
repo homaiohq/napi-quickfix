@@ -512,9 +512,10 @@ session.sentLogon(): boolean;    session.sentLogout(): boolean;   session.receiv
 session.isInitiator(): boolean;  session.isAcceptor(): boolean;
 session.isSessionTime(now?: Date): boolean;   session.isLogonTime(now?: Date): boolean;
 
-// Sequence numbers (sync; setters write to the message store -- on a quiet session, see below)
-session.getExpectedSenderNum(): number;         session.getExpectedTargetNum(): number;
-session.setNextSenderMsgSeqNum(n: number): void; session.setNextTargetMsgSeqNum(n: number): void;
+// Sequence numbers (getters sync; the setters write to the message store on a
+// worker thread -- on a quiet session, see below)
+session.getExpectedSenderNum(): number;                  session.getExpectedTargetNum(): number;
+session.setNextSenderMsgSeqNum(n: number): Promise<void>; session.setNextTargetMsgSeqNum(n: number): Promise<void>;
 
 // Runtime options (sync; change the live session, not its SessionSettings)
 session.getResetOnLogon() / setResetOnLogon(v: boolean)        // likewise: ResetOnLogout,
@@ -525,31 +526,44 @@ session.getTimestampPrecision() / setTimestampPrecision(0..9)  //   CheckCompId,
                                                                //   ValidateLengthAndChecksum,
                                                                //   SendNextExpectedMsgSeqNum, IsNonStopSession
 
-// Control
-session.logon(): void;                   // enable; an initiator reconnects + logs on
-session.logout(reason?: string): void;   // disable + graceful Logout; stays down until logon()
-session.refresh(): void;                 // re-read state from the message store
+// Control (worker thread)
+session.logon(): Promise<void>;                   // enable; an initiator reconnects + logs on
+session.logout(reason?: string): Promise<void>;   // disable + graceful Logout; stays down until logon()
+session.refresh(): Promise<void>;                 // re-read state from the message store
 ```
 
-Everything is synchronous: none of these members takes the mutex QuickFIX holds
-while it runs your handlers, so they cannot deadlock the main thread — and
-because they run inline, `session.logout('x'); session.logon();` takes effect in
-that order. (`logon()`/`logout()` flip a plain flag the engine's network thread
-reads without a lock, exactly as QuickFIX's own `Initiator::stop()` does from
-the stopping thread; the engine picks the change up on its next pass.) The
-sequence-number setters are likewise not serialised against a message the
-engine is sending or receiving on that session at the same moment: QuickFIX
-reads the number, runs your handler, then increments from the store under a
-lock the setters do not take, so a value set in that window — from a handler,
-or while a `sendToTarget()` or a heartbeat is in flight — is overwritten and the
-session ends up one off from its counterparty. Renumber a **quiet** session:
-before `start()`, from a `'logout'` event, or when you know nothing is in
-flight. QuickFIX's `Session::disconnect()` and `reset()` are deliberately **not**
-exposed: they drop the transport through the engine's socket monitor, which is
-only safe from the engine's own network thread (QuickFIX itself never calls them
-from anywhere else). Bring a session down with `logout()` and renumber it with
-the sequence-number setters. Observe the outcome through the engine's
-`'logon'` / `'logout'` events:
+The state queries, the sequence-number getters and the option getters/setters
+are synchronous: none of them takes a QuickFIX mutex that another thread may
+hold while it waits on the event loop. `logon()`, `logout()`, `refresh()` and
+the two sequence-number setters return a Promise: they take the session-state
+mutex, the one the engine holds while it writes to the message store, and
+with a [message store adapter](#message-store) that write waits on the event
+loop, so taking the mutex on the main thread would deadlock the process. They
+run on a worker thread instead, like `sendToTarget()`, and calls on one
+session are serialised in program order whether you await them or not:
+`session.logout('x'); session.logon();` lands in that order. Their latency is
+that of the libuv worker pool: they queue behind in-flight `sendToTarget()`
+calls on any session, each of which may itself be waiting on a store write.
+Bound the number of sends in flight (await them, or cap them with a
+semaphore) and/or raise `UV_THREADPOOL_SIZE` if that latency matters. Once the
+owning engine is gone they reject with `SessionNotFound`; a `'logout'`
+listener fired by `engine.stop()` may see that, since the engine is destroyed
+when the stop settles. (`logon()`/`logout()` flip a plain flag the engine's
+network thread reads without a lock, exactly as QuickFIX's own
+`Initiator::stop()` does from the stopping thread; the engine picks the change
+up on its next pass.) The sequence-number setters are not serialised against a
+message the engine is sending or receiving on that session at the same
+moment: QuickFIX reads the number, runs your handler, then increments from the
+store under a lock the setters do not take, so a value set in that window —
+from a handler, or while a `sendToTarget()` or a heartbeat is in flight — is
+overwritten and the session ends up one off from its counterparty. Renumber a
+**quiet** session: before `start()`, from a `'logout'` event, or when you know
+nothing is in flight. QuickFIX's `Session::disconnect()` and `reset()` are
+deliberately **not** exposed: they drop the transport through the engine's
+socket monitor, which is only safe from the engine's own network thread
+(QuickFIX itself never calls them from anywhere else). Bring a session down
+with `logout()` and renumber it with the sequence-number setters. Observe the
+outcome through the engine's `'logon'` / `'logout'` events:
 
 ```ts
 initiator.on('logon', (id) => {
@@ -557,11 +571,13 @@ initiator.on('logon', (id) => {
 });
 initiator.on('logout', (id) => {
   // The session is quiet now: renumber it, e.g. after the counterparty reset.
-  initiator.getSession(id)?.setNextTargetMsgSeqNum(1);
+  // If this 'logout' was fired by stop(), the engine may be gone by the time
+  // the write runs: it then rejects SessionNotFound instead of succeeding.
+  void initiator.getSession(id)?.setNextTargetMsgSeqNum(1).catch(() => {});
 });
 
-lookupSession(id)?.logout('maintenance');   // -> 'logout' event, isLoggedOn() === false
-lookupSession(id)?.logon();                 // -> reconnects, 'logon' event
+await lookupSession(id)?.logout('maintenance');   // -> 'logout' event, isLoggedOn() === false
+await lookupSession(id)?.logon();                 // -> reconnects, 'logon' event
 ```
 
 ### Handlers vs. events

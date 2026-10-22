@@ -228,12 +228,16 @@ export interface NativeEngineOptions {
  * {@link QuickFixError} with `fixErrorName: 'SessionNotFound'` once the owning
  * engine has been stopped.
  *
- * Every member is synchronous: none takes the session mutex QuickFIX holds
- * across application callbacks, so they cannot deadlock the main thread
- * (`logon()`/`logout()` write a plain flag the network thread reads without a
- * lock, as QuickFIX's own `Initiator::stop()` does).
- * `FIX::Session::disconnect()`/`reset()` are not exposed; they are only safe
- * on the engine's own network thread (see `cpp/session_wrap.cpp`).
+ * The state queries, the sequence-number getters and the option getters /
+ * setters are synchronous: none takes a QuickFIX mutex another thread may hold
+ * while it waits on the JS event loop. `logon`/`logout`/`refresh` and the two
+ * sequence-number setters take `SessionState`'s mutex, which a network thread
+ * or a `sendToTarget` worker holds while it waits on a JS message store, so
+ * they run on a libuv worker under the engine's gate and return a Promise
+ * (rejected with `SessionNotFound` once the engine is gone). They are NOT
+ * serialised against each other here; the TS `Session` chains them per
+ * session. `FIX::Session::disconnect()`/`reset()` are not exposed; they are
+ * only safe on the engine's own network thread (see `cpp/session_wrap.cpp`).
  */
 export interface NativeSession {
   getSessionID(): NativeSessionID;
@@ -251,8 +255,9 @@ export interface NativeSession {
 
   getExpectedSenderNum(): number;
   getExpectedTargetNum(): number;
-  setNextSenderMsgSeqNum(seqNum: number): void;
-  setNextTargetMsgSeqNum(seqNum: number): void;
+  /** Throws `RangeError` synchronously for a bad argument; rejects `SessionNotFound` / `IOException`. */
+  setNextSenderMsgSeqNum(seqNum: number): Promise<void>;
+  setNextTargetMsgSeqNum(seqNum: number): Promise<void>;
 
   getResetOnLogon(): boolean;
   setResetOnLogon(value: boolean): void;
@@ -286,10 +291,10 @@ export interface NativeSession {
   /** Throws a `RangeError` unless `precision` is an integer in `0..9`. */
   setTimestampPrecision(precision: number): void;
 
-  logon(): void;
-  logout(reason?: string): void;
-  /** May throw a `QuickFixError` (`IOException`) from the message store. */
-  refresh(): void;
+  logon(): Promise<void>;
+  logout(reason?: string): Promise<void>;
+  /** Rejects with a `QuickFixError` (`IOException`) if the message store cannot be read. */
+  refresh(): Promise<void>;
 }
 
 /**
