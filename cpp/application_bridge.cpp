@@ -367,8 +367,9 @@ void ApplicationBridge::fromApp(const FIX::Message& message,
 //
 // worker.terminate() can mark the environment unable to call into JS at any
 // time while the TSFN still dispatches what it holds: every Node-API call that
-// may run JS then fails and node-addon-api throws, so CallJs catches
-// everything and lets the callback pass through, as after Deactivate().
+// may run JS then fails and node-addon-api throws, so CallJs catches what a
+// stopping environment throws and lets the callback pass through, as after
+// Deactivate().
 // A handler interrupted mid-call leaves V8's termination marker (null) as the
 // pending exception, which node-addon-api cannot wrap in a stopping
 // environment without aborting: NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS
@@ -415,9 +416,14 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
     }
   } guard{data, {}};
 
-  // Anything escaping would reach the TSFN wrapper and std::terminate.
+  // A Napi::Error from a stopping environment is the interruption: pass
+  // through. Any other one is a real failure (a throwing handlers getter, a
+  // failed wrapper): rethrow it so the TSFN wrapper raises it as an uncaught JS
+  // exception. Other C++ exceptions would std::terminate there.
   try {
     CallJsBody(env, context, data, guard.result);
+  } catch (const Napi::Error&) {
+    if (env != nullptr && CanCallIntoJs(env)) throw;
   } catch (...) {
   }
   // guard destructor signals the channel (for sync) and deletes data.
