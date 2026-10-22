@@ -53,7 +53,6 @@ class AcceptorWrap : public Napi::ObjectWrap<AcceptorWrap> {
   ~AcceptorWrap() override;
 
  private:
-  static Napi::FunctionReference constructor_;
 
   Napi::Value Start(const Napi::CallbackInfo& info);
   Napi::Value Stop(const Napi::CallbackInfo& info);

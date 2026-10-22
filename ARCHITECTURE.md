@@ -111,6 +111,17 @@ flowchart TD
 The loader is one authored `.cjs` file copied into both build outputs, so ESM and CJS resolve the exact same binary
 from the package root. The `napi` tag means a single prebuild per platform serves Node 22, 24 and 26.
 
+**One environment at a time, many environments per process.** The addon is context-aware: Node runs its `Init` once
+per environment that imports it, which with `worker_threads` is the main thread plus every Worker. Anything `Init`
+creates for an environment, in particular the constructors of the exported classes, is therefore kept in that
+environment's **instance data** (`AddonData`, `cpp/addon_data.h`, set with `env.SetInstanceData`) and read back with
+`AddonData::Get(env)`, never in a module static: a static `Napi::FunctionReference` is a reference into *one*
+environment, and the next Worker's `Init` would overwrite it, deleting the previous environment's reference from the
+wrong thread and leaving the main thread building its instances from a dead one. The state that *is* process-wide
+is QuickFIX's own session registry (`FIX::Session::lookupSession` is keyed by `SessionID` across every environment)
+and the `SessionOpGate` registry that mirrors it, both mutex-protected; a `SessionID` live in one Worker is a
+"Duplicate Session" in another.
+
 ---
 
 ## 4. The Application bridge (C++ threads → JS)
@@ -153,6 +164,15 @@ sequenceDiagram
 - The message also carries the **session dictionary**, so `setField` & co. route its header/trailer fields as the
   parser does. The bridge caches, per session, a copy of the session's `DataDictionaryProvider` (which shares its
   dictionaries' ownership) taken on the QuickFIX thread, so a message kept by JS can outlive its session safely.
+- The trampoline (`CallJs`) drives the handler call and the wrapping of its arguments through **raw Node-API status
+  checks**, not the node-addon-api wrappers. A Worker's `terminate()` marks its environment unable to call into JS
+  from the parent thread, at any moment, while the Worker's loop still dispatches what the TSFN holds (and the
+  callback whose handler is running): from then on every Node-API call that may run JS fails with
+  `napi_pending_exception` and no exception, and the wrappers turn that into `throw Napi::Error::New(env)`, which
+  builds the error with the same failing calls and aborts the process. The trampoline instead probes the environment
+  first (`CanCallIntoJs`), checks each status, and lets a callback that can no longer reach JS pass through, exactly as
+  it does after `Deactivate()`. `MessageWrap::TryNewInstance` / `SessionIDWrap::TryNewInstance` are the status-returning
+  factories it uses.
 
 ---
 
@@ -188,6 +208,12 @@ Synchronous, non-blocking members stay sync: `isLoggedOn()`, `getSessions()`, `g
 and the entire pure layer (`Message`, `SessionID`, `SessionSettings`, `DataDictionary`). On GC/process exit, a
 cleanup hook deactivates the bridge and force-stops the engine **before** the TSFN is torn down, so a live session
 never crashes on shutdown.
+
+The promise a `start()`/`stop()` returns is the AsyncWorker's own. The early-return cases (already started or
+stopped, a call in progress, the engine gone) build theirs where they settle it (`ResolvedPromise` /
+`RejectedPromise`, `engine_workers.h`): a `Napi::Promise::Deferred` created up front and then not used is never
+settled, and its `napi_deferred` is a strong handle that roots the Promise for the rest of the process — one per
+call, which is how 0.3.1 leaked.
 
 ### `Session`: why every member is synchronous
 

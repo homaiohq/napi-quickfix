@@ -37,6 +37,24 @@ class StopCompletion {
   bool done_ = false;
 };
 
+// Promises for the start()/stop() paths that settle on the spot (already
+// started, already stopped, call in progress, engine gone). Built where they
+// are returned: a Napi::Promise::Deferred created up front and then not used
+// -- the worker path builds its own -- is never settled, and its napi_deferred
+// (a strong handle on the Promise) is never released: one Promise rooted for
+// the rest of the process per start()/stop() call.
+inline Napi::Promise ResolvedPromise(Napi::Env env) {
+  auto deferred = Napi::Promise::Deferred::New(env);
+  deferred.Resolve(env.Undefined());
+  return deferred.Promise();
+}
+
+inline Napi::Promise RejectedPromise(Napi::Env env, const char* message) {
+  auto deferred = Napi::Promise::Deferred::New(env);
+  deferred.Reject(Napi::Error::New(env, message).Value());
+  return deferred.Promise();
+}
+
 // A generic AsyncWorker that runs a blocking QuickFIX engine operation
 // (start/stop) on a libuv worker thread and resolves/rejects a JS Promise.
 // (The per-message SendToTargetWorker lives in session_static.cpp.)

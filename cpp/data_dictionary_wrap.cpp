@@ -1,5 +1,7 @@
 #include "data_dictionary_wrap.h"
 
+#include "addon_data.h"
+
 #include <sstream>
 #include <string>
 
@@ -8,8 +10,6 @@
 #include "message_wrap.h"
 
 namespace napi_quickfix {
-
-Napi::FunctionReference DataDictionaryWrap::constructor_;
 
 Napi::Object DataDictionaryWrap::Init(Napi::Env env, Napi::Object exports) {
   Napi::Function func = DefineClass(
@@ -25,8 +25,7 @@ Napi::Object DataDictionaryWrap::Init(Napi::Env env, Napi::Object exports) {
           InstanceMethod("isMsgType", &DataDictionaryWrap::IsMsgType),
       });
 
-  constructor_ = Napi::Persistent(func);
-  constructor_.SuppressDestruct();
+  AddonData::Get(env).dataDictionary = Napi::Persistent(func);
 
   exports.Set("DataDictionaryWrap", func);
   return exports;
@@ -36,7 +35,7 @@ DataDictionaryWrap* DataDictionaryWrap::UnwrapArg(Napi::Env env,
                                                   Napi::Value value,
                                                   const char* argName) {
   if (!value.IsObject() ||
-      !value.As<Napi::Object>().InstanceOf(constructor_.Value())) {
+      !value.As<Napi::Object>().InstanceOf(AddonData::Get(env).dataDictionary.Value())) {
     throw Napi::TypeError::New(
         env, std::string(argName) + " must be a DataDictionary instance");
   }
@@ -71,7 +70,7 @@ Napi::Value DataDictionaryWrap::FromFile(const Napi::CallbackInfo& info) {
   if (info.Length() < 1 || !info[0].IsString()) {
     throw Napi::TypeError::New(env, "fromFile(path: string)");
   }
-  return constructor_.New(
+  return AddonData::Get(env).dataDictionary.New(
       {Napi::String::New(env, "file"), info[0].As<Napi::String>()});
 }
 
@@ -80,7 +79,7 @@ Napi::Value DataDictionaryWrap::FromString(const Napi::CallbackInfo& info) {
   if (info.Length() < 1 || !info[0].IsString()) {
     throw Napi::TypeError::New(env, "fromString(xml: string)");
   }
-  return constructor_.New(
+  return AddonData::Get(env).dataDictionary.New(
       {Napi::String::New(env, "string"), info[0].As<Napi::String>()});
 }
 

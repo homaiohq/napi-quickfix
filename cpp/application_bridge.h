@@ -102,6 +102,9 @@ class ApplicationBridge : public FIX::Application {
   // before the TSFN alias because it is used as a template argument.
   static void CallJs(Napi::Env env, Napi::Function jsCallback,
                      ApplicationBridge* context, CallData* data);
+  // The trampoline's body; CallJs runs it under a catch-all (see there).
+  static void CallJsBody(Napi::Env env, ApplicationBridge* context,
+                         CallData* data, Result& result);
 
   using TSFN = Napi::TypedThreadSafeFunction<ApplicationBridge, CallData,
                                              ApplicationBridge::CallJs>;

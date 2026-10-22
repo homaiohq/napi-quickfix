@@ -56,7 +56,6 @@ class SessionWrap : public Napi::ObjectWrap<SessionWrap> {
   const FIX::SessionID& SessionID() const { return id_; }
 
  private:
-  static Napi::FunctionReference constructor_;
 
   // Resolve the live FIX::Session of the engine this handle was created for,
   // or throw FIX::SessionNotFound (session gone, or the id now belongs to a

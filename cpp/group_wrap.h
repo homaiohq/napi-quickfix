@@ -41,7 +41,6 @@ class GroupWrap : public Napi::ObjectWrap<GroupWrap> {
                               const char* argName);
 
  private:
-  static Napi::FunctionReference constructor_;
 
   // The entry NewInstance passes to the constructor, or null for a JS call.
   static const FIX::FieldMap* EntryArg(const Napi::CallbackInfo& info);

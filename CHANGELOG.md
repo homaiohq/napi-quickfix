@@ -9,6 +9,46 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
+Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
+
+### Fixed
+
+- Every `start()` and `stop()` call rooted one `Promise` for the rest of the process. Both
+  methods created a Promise deferred up front and left it unsettled on the path that
+  hands the work to a worker thread (the only path a live engine takes); the
+  `napi_deferred` behind it is a strong handle on the Promise and was never released.
+  8 bytes of native memory plus a V8 `Promise` and its global handle per call, found
+  with LeakSanitizer and a heap-snapshot diff. The promise is now built only where it is
+  settled on the spot.
+- The addon could not be loaded in a `worker_threads` Worker. The constructors of the
+  exported classes were module statics shared by every environment the addon was loaded
+  in: each Worker that imported the module overwrote them, deleting the previous
+  environment's references from the wrong thread (a use-after-free once that Worker had
+  exited, a cross-isolate handle release when it was the main thread), and the main
+  thread was left building its instances from a dead environment. The symptoms were
+  heap corruption, a V8 fatal check at Worker teardown, or a `TypeError` on the main
+  thread. The constructors now live in per-environment instance data.
+- `worker.terminate()` aborted the whole process when an engine callback was being
+  dispatched in the Worker at that moment: once a Worker's environment is stopping,
+  every Node-API call that may run JS fails, and node-addon-api's wrappers abort while
+  building the error they would throw. The bridge's trampoline now drives the handler
+  call and the argument wrapping through raw Node-API status checks and lets such a
+  callback pass through, as it does after the engine's own teardown.
+
+### Known QuickFIX limitations
+
+Two file-descriptor leaks found by the same audit are in QuickFIX itself and are not
+patched by this binding (it never patches QuickFIX; see `ARCHITECTURE.md`):
+
+- An `Acceptor` whose `start()` fails because its port is already bound leaks the
+  listening socket it created (`socket_createAcceptor` returns without closing it on a
+  failed `bind`/`listen`): one fd per failed start.
+- An `Initiator` stopped while a connection attempt is still pending leaks that socket
+  (`SocketMonitor`'s destructor closes its read sockets and signal pipe but not the
+  sockets still in its connect set): one fd per stop that lands in that window, which
+  with an unreachable counterparty is most stops. Confirmed against bare `libquickfix`
+  with no binding involved.
+
 ## [0.3.1] - 2026-10-20
 
 Bundles **QuickFIX v1.16.0** (statically linked, unchanged).

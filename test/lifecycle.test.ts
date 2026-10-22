@@ -3,12 +3,16 @@ import assert from 'node:assert/strict';
 import { setImmediate as nextMacrotask } from 'node:timers/promises';
 import v8 from 'node:v8';
 import vm from 'node:vm';
+import { Worker } from 'node:worker_threads';
 
 import {
   Acceptor,
   Initiator,
   SessionSettings,
   SessionID,
+  createMessage,
+  FIELD,
+  MsgType,
   type ApplicationHandlers,
   type Engine,
 } from '../dist/esm/index.js';
@@ -215,4 +219,105 @@ describe('Engine garbage collection', () => {
       assert.equal(await collectUntil(() => finalized, n), n);
     });
   }
+});
+
+// --- regression: resources that must not accumulate per engine ---------------
+
+/**
+ * The number of `Promise` objects in the heap, after a full GC. Counted from a
+ * heap snapshot, so a Promise kept alive from native memory (a `napi_deferred`
+ * that is never settled) is seen even though nothing in JS can reach it.
+ */
+async function countPromises(): Promise<number> {
+  await collectUntil(() => 0, 1); // one GC + a macrotask
+  const chunks: Buffer[] = [];
+  for await (const chunk of v8.getHeapSnapshot()) chunks.push(chunk as Buffer);
+  const snapshot = JSON.parse(Buffer.concat(chunks).toString()) as {
+    snapshot: { meta: { node_fields: string[]; node_types: string[][] } };
+    nodes: number[];
+    strings: string[];
+  };
+  const fields = snapshot.snapshot.meta.node_fields;
+  const stride = fields.length;
+  const typeIndex = fields.indexOf('type');
+  const nameIndex = fields.indexOf('name');
+  const types = snapshot.snapshot.meta.node_types[typeIndex];
+  let count = 0;
+  for (let i = 0; i < snapshot.nodes.length; i += stride) {
+    if (
+      types[snapshot.nodes[i + typeIndex]] === 'object' &&
+      snapshot.strings[snapshot.nodes[i + nameIndex]] === 'Promise'
+    ) {
+      count++;
+    }
+  }
+  return count;
+}
+
+describe('Engine resource regressions', () => {
+  // start() and stop() used to create a Promise deferred up front and leave it
+  // unsettled on the path that hands the work to an AsyncWorker: one Promise
+  // rooted from native memory for the rest of the process, per call.
+  test('start()/stop() do not root a Promise per call', { timeout: 60000 }, async () => {
+    // Stopping a started engine joins its network thread (up to its 1 s poll
+    // timeout), so only the first cycles start one; the rest stop never-started
+    // engines, which take the same worker path.
+    const churn = async (n: number, started: number) => {
+      for (let i = 0; i < n; i++) {
+        const ini = new Initiator({ settings: SessionSettings.fromString(INITIATOR_CFG), store: 'memory', log: 'none' });
+        if (i < started) {
+          ini.unref();
+          await ini.start();
+        }
+        await ini.stop();
+        const acc = new Acceptor({ settings: SessionSettings.fromString(ACCEPTOR_CFG), store: 'memory', log: 'none' });
+        await acc.stop();
+      }
+    };
+    // First calls populate lazily created state: measure from a warm process.
+    await churn(2, 1);
+    const before = await countPromises();
+    const N = 20; // at least 2 stop() calls per cycle
+    await churn(N, 2);
+    const retained = (await countPromises()) - before;
+    assert.ok(retained < N, `${retained} Promises retained after ${N} engines were stopped`);
+  });
+
+  // The constructors of the exported classes were module statics shared by
+  // every environment the addon was loaded in. Each Worker overwrote them,
+  // deleting the previous environment's references from the wrong thread, and
+  // the main thread was left building its instances from a dead one.
+  describe('worker_threads', () => {
+    const WORKER = new URL('./fixtures/worker-load.mjs', import.meta.url);
+    const runWorker = (mode: string, until: 'exit' | 'message'): Promise<Worker> =>
+      new Promise((resolve, reject) => {
+        const worker = new Worker(WORKER, { workerData: { mode } });
+        worker.on('error', reject);
+        if (until === 'exit') {
+          worker.on('exit', (code) =>
+            code === 0 ? resolve(worker) : reject(new Error(`worker exited with ${code}`)),
+          );
+        } else {
+          worker.once('message', () => resolve(worker));
+        }
+      });
+
+    test('Workers that load the addon leave the main thread and each other intact', { timeout: 60000 }, async () => {
+      for (let i = 0; i < 3; i++) {
+        await runWorker('churn', 'exit');
+        // The main thread's constructors must still be the main thread's.
+        const ini = new Initiator({ settings: SessionSettings.fromString(INITIATOR_CFG), store: 'memory', log: 'none' });
+        assert.equal(ini.getSessions().length, 1);
+        await ini.stop();
+        assert.equal(createMessage({ [FIELD.MsgType]: MsgType.NewOrderSingle }).getMsgType(), MsgType.NewOrderSingle);
+      }
+    });
+
+    test('terminate() while a callback is being dispatched does not abort the process', { timeout: 60000 }, async () => {
+      for (let i = 0; i < 3; i++) {
+        const worker = await runWorker('terminate', 'message');
+        await worker.terminate();
+      }
+    });
+  });
 });

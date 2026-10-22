@@ -14,6 +14,7 @@
 #include "quickfix/Message.h"
 
 #include "acceptor_wrap.h"
+#include "addon_data.h"
 #include "data_dictionary_wrap.h"
 #include "group_wrap.h"
 #include "initiator_wrap.h"
@@ -58,6 +59,7 @@ Napi::Value QuickfixParseMsgType(const Napi::CallbackInfo& info) {
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
+  AddonData::Install(env);
   exports.Set("version", Napi::Function::New(env, Version, "version"));
   exports.Set("quickfixParseMsgType",
               Napi::Function::New(env, QuickfixParseMsgType, "quickfixParseMsgType"));

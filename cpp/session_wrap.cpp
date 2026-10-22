@@ -1,5 +1,7 @@
 #include "session_wrap.h"
 
+#include "addon_data.h"
+
 #include <cmath>
 #include <ctime>
 #include <limits>
@@ -13,8 +15,6 @@
 #include "session_id_wrap.h"
 
 namespace napi_quickfix {
-
-Napi::FunctionReference SessionWrap::constructor_;
 
 Napi::Object SessionWrap::Init(Napi::Env env, Napi::Object exports) {
   Napi::Function func = DefineClass(
@@ -91,8 +91,7 @@ Napi::Object SessionWrap::Init(Napi::Env env, Napi::Object exports) {
           InstanceMethod("refresh", &SessionWrap::Refresh),
       });
 
-  constructor_ = Napi::Persistent(func);
-  constructor_.SuppressDestruct();
+  AddonData::Get(env).session = Napi::Persistent(func);
 
   exports.Set("SessionWrap", func);
   return exports;
@@ -100,7 +99,7 @@ Napi::Object SessionWrap::Init(Napi::Env env, Napi::Object exports) {
 
 Napi::Object SessionWrap::NewInstance(Napi::Env env, const FIX::SessionID& id,
                                       std::shared_ptr<SessionOpGate> gate) {
-  Napi::Object obj = constructor_.New({SessionIDWrap::NewInstance(env, id)});
+  Napi::Object obj = AddonData::Get(env).session.New({SessionIDWrap::NewInstance(env, id)});
   Unwrap(obj)->gate_ = std::move(gate);
   return obj;
 }
