@@ -268,3 +268,70 @@ jobs:
           name: tsan-logs
           path: build-tsan/logs
           if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # The generic SQL message-store adapter against a real PostgreSQL (the
+  # node:sqlite path runs in every build-test job). One driver job is enough:
+  # the adapter only differs per dialect in its placeholders and upsert syntax.
+  # ---------------------------------------------------------------------------
+  postgres-adapter:
+    name: sql adapter (postgres, node 22)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      YARN_ENABLE_GLOBAL_CACHE: 'false'
+      PGURL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up CMake
+        uses: lukka/get-cmake@a89e43e22a96abafcd7a62db652a65ecd33052c9 # v4.4.4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Enable Corepack (pinned Yarn)
+        shell: bash
+        run: |
+          node -e "require('fs').mkdirSync(process.env.RUNNER_TEMP + '/corepack', { recursive: true })"
+          corepack enable --install-directory "$RUNNER_TEMP/corepack"
+          echo "$RUNNER_TEMP/corepack" >> "$GITHUB_PATH"
+
+      - name: Cache Yarn
+        uses: actions/cache@v6
+        with:
+          path: .yarn/cache
+          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-
+
+      - name: Cache CMake FetchContent deps
+        uses: actions/cache@v6
+        with:
+          path: build/_deps
+          key: cmake-deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            cmake-deps-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: yarn install --immutable --mode=skip-build
+
+      - name: Build
+        run: yarn build
+
+      - name: Test the SQL adapter against PostgreSQL
+        run: node --test --import tsx test/store-sql.test.ts

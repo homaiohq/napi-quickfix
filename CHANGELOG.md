@@ -33,6 +33,13 @@ Bundles **QuickFIX v1.16.0** (statically linked, with three upstream fixes carri
   the column mapping onto QuickFIX v1.16.0's `sessions`/`messages` tables for interop
   with links to the upstream DDL, driver guidance from a PostgreSQL adapter trial
   (issue #35), a test checklist).
+- `@homaiohq/napi-quickfix/store/sql`: a generic SQL adapter (`createSqlMessageStore`)
+  over an `execute(sql, params)` function and a dialect (`postgres` | `mysql` |
+  `sqlite`), with QuickFIX's own `sessions`/`messages` table layout (configurable
+  prefix) so an existing QuickFIX C++ deployment interoperates; `sqlSchema()` and the
+  `sql/` files hold the `CREATE TABLE` statements. No driver dependency: the README
+  shows `pg`, `mysql2`, `node:sqlite` and Prisma wiring. Tested against `node:sqlite`
+  in the suite and against PostgreSQL in CI.
 - `SessionSettings.getSessions(connectionType?)`: only the sessions an engine of that
   type would create.
 - `scripts/tsan.sh` and a ThreadSanitizer CI job over the suite, failing on a race in
