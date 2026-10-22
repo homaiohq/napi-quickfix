@@ -39,8 +39,7 @@ included.
   a separate stunnel process.
 - **Pluggable message store** — persist session state (sequence numbers, sent
   messages) write-through in any database Node can reach, through a small
-  `MessageStoreAdapter` over your own driver and pool; a generic SQL adapter for
-  Postgres, MySQL and SQLite ships as a subpath export.
+  `MessageStoreAdapter` over your own driver and pool.
 
 ## Install
 
@@ -627,8 +626,7 @@ engine will own (and `create()` for one it has never seen) before constructing
 the engine, which needs that state synchronously; they also accept `'file'` and
 `'memory'`, so there is one async entry point for every store. A ready-made
 `MapMessageStore` (an in-memory `Map` per session) is exported as the reference
-implementation and a test double, and `@homaiohq/napi-quickfix/store/sql`
-provides a generic SQL adapter (below).
+implementation and a test double.
 
 **Threads and latency.** The store is write-through: the engine persists a
 message and bumps the sequence number *before* the message hits the wire, and
@@ -705,45 +703,6 @@ logout grace applies on top. Once the sessions are destroyed the adapter's
 `await engine.stop(); await Initiator.create({ store: sameAdapter })` never
 races `close()` against `load()`. An engine dropped without `stop()` is torn
 down at process exit without calling `close()`.
-
-#### Generic SQL adapter
-
-`@homaiohq/napi-quickfix/store/sql` turns an `execute(sql, params)` function
-and a dialect into an adapter, with the upstream QuickFIX table layout
-(`sessions` / `messages`, configurable prefix) so an existing QuickFIX C++
-deployment interoperates. Schema files for each dialect are in the package's
-`sql/` directory.
-
-```ts
-import { createSqlMessageStore } from '@homaiohq/napi-quickfix/store/sql';
-
-// pg
-const store = createSqlMessageStore({
-  dialect: 'postgres',
-  execute: async (sql, params) => (await pool.query(sql, params)).rows,
-});
-// mysql2 (promise API)
-const store = createSqlMessageStore({
-  dialect: 'mysql',
-  execute: async (sql, params) => (await pool.execute(sql, params))[0] as Record<string, unknown>[],
-});
-// node:sqlite
-const store = createSqlMessageStore({
-  dialect: 'sqlite',
-  execute: (sql, params) => db.prepare(sql).all(...params) as Record<string, unknown>[],
-});
-// Prisma
-const store = createSqlMessageStore({
-  dialect: 'postgres',
-  execute: (sql, params) => prisma.$queryRawUnsafe(sql, ...params),
-});
-```
-
-`reset()` runs its two statements in a transaction when `transaction` is
-provided (`transaction: (fn) => pool.transaction(fn)`-style, receiving an
-`execute` bound to the transaction); without it they run back to back.
-Upstream stores keep `creation_time` at second precision; the adapter
-preserves whatever precision the column holds.
 
 ### Handlers vs. events
 
