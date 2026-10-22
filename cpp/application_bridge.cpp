@@ -365,31 +365,20 @@ void ApplicationBridge::fromApp(const FIX::Message& message,
 // ---------------------------------------------------------------------------
 // JS-thread trampoline. Runs on the Node event-loop thread.
 //
-// The environment may be stopping while the trampoline runs: worker.terminate()
-// marks the Worker's environment unable to call into JS from the parent
-// thread, at any time, and its event loop still dispatches what the TSFN
-// already holds (plus the callback in progress, if the handler was running).
-// From then on every Node-API call that may run JS fails with
-// napi_pending_exception, and the node-addon-api wrappers throw a Napi::Error
-// for it; CallJs catches whatever CallJsBody throws and lets the callback
-// pass through, as it does after Deactivate(): no mutation, no throw.
-//
-// A handler interrupted by terminate() is the one case the wrappers cannot
-// build their error for: V8 reports the termination as a pending exception
-// whose value is `null`, and node-addon-api wraps a non-object exception in
-// a fresh object, with a call that fails in a stopping environment and aborts
-// the process. NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS (CMakeLists.txt) makes
-// node-addon-api treat exactly that failure as success. The handler's throw
-// then reaches the catch below like any other, and CanCallIntoJs tells the
-// two apart so the interruption is not reported to QuickFIX as a throw.
+// worker.terminate() can mark the environment unable to call into JS at any
+// time while the TSFN still dispatches what it holds: every Node-API call that
+// may run JS then fails and node-addon-api throws, so CallJs catches
+// everything and lets the callback pass through, as after Deactivate().
+// A handler interrupted mid-call leaves V8's termination marker (null) as the
+// pending exception, which node-addon-api cannot wrap in a stopping
+// environment without aborting: NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS
+// (CMakeLists.txt) covers that, and CanCallIntoJs tells the interruption from
+// a throw.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-// Whether `env` can still run JS. Once its environment is stopping, every
-// Node-API call that may run JS reports napi_pending_exception; a property
-// lookup on a fresh object has no other way to fail. Only used after a failed
-// handler call, not on the dispatch path.
+// A property lookup on a fresh object fails only in a stopping environment.
 bool CanCallIntoJs(napi_env env) {
   napi_value object = nullptr;
   napi_value key = nullptr;
@@ -426,11 +415,7 @@ void ApplicationBridge::CallJs(Napi::Env env, Napi::Function /*jsCallback*/,
     }
   } guard{data, {}};
 
-  // Whatever the body throws -- a Napi::Error from a call that cannot run JS
-  // in a stopping environment (see the section comment), a bad_alloc in a
-  // copy, anything else -- node-addon-api's TSFN wrapper would otherwise
-  // rethrow into JS, and from a callback libuv runs with no handler that is
-  // std::terminate. The callback passes through instead.
+  // Anything escaping would reach the TSFN wrapper and std::terminate.
   try {
     CallJsBody(env, context, data, guard.result);
   } catch (...) {
@@ -491,15 +476,13 @@ void ApplicationBridge::CallJsBody(Napi::Env env, ApplicationBridge* context,
       handler.Call({sessionIdObj});
     }
   } catch (const Napi::Error& e) {
-    // A handler interrupted by worker.terminate() fails the same way as one
-    // that threw (see the section comment). Not a throw: pass-through.
+    // Interrupted by terminate(), not a throw: pass-through.
     if (!CanCallIntoJs(env)) {
       return;
     }
     if (isSync) {
       result.threw = true;
-      // Read `.fixError` and `.message` off the JS error to pick the FIX
-      // exception; a non-object throw carries neither.
+      // `.fixError` picks the FIX exception; a non-object throw has none.
       Napi::Value value = e.Value();
       if (value.IsObject()) {
         Napi::Object error = value.As<Napi::Object>();
@@ -526,7 +509,6 @@ void ApplicationBridge::CallJsBody(Napi::Env env, ApplicationBridge* context,
       result.mutated = true;
     }
   }
-  // guard destructor signals the channel (for sync) and deletes data.
 }
 
 }  // namespace napi_quickfix
