@@ -383,6 +383,10 @@ describe('MessageStoreAdapter: write-through over a loopback', () => {
       iniStore.mode = () => 'ok';
       assert.equal(session.getExpectedSenderNum(), before, 'cache not advanced');
       assert.equal(session.isLoggedOn(), true, 'an outbound store failure is not fatal');
+      // The report crosses the bridge on its own (a non-blocking TSFN item)
+      // while the send settles through the worker's completion: the two
+      // reach the loop in either order, so wait for the report.
+      assert.ok(await waitUntil(() => storeErrors.length >= 1, T));
       assert.deepEqual(
         storeErrors.map((e) => [e.method, e.poisoned]),
         [['setMessage', false]],
@@ -553,6 +557,17 @@ describe('MessageStoreAdapter: failure policy', () => {
     try {
       await logonBoth(acc, ini);
       iniStore.set('reset', 'reject');
+      // Keep the adapter down for load() too. The poison a rejected reset()
+      // leaves is transient by design: the engine's very next store call
+      // reloads through load() and, with a healthy adapter, lifts it. Here
+      // that next call comes within milliseconds: nextLogout() runs
+      // disconnect() (reset() rejected: poisoned), then nextQueued() reads
+      // getExpectedTargetNum() (reload: poison lifted); QuickFIX then runs
+      // disconnect() once more from SocketInitiator::onDisconnect() (reset()
+      // rejected: poisoned again). The getter below would see whichever
+      // state the 25 ms poll landed on; a rejecting load() keeps it poisoned
+      // until the adapter is back.
+      iniStore.set('load', 'reject');
       const logout = waitForEvent(ini, 'logout', 'initiator logout', T);
       await ini.getSession(INI_ID)!.logout('bye');
       await logout;
@@ -704,13 +719,33 @@ describe('MessageStoreAdapter: failure policy', () => {
       const loads = iniStore.count('load') - loadsBefore;
       assert.ok(loads >= 2 && loads <= 8, `reload attempts in 3 s with a 500 ms timeout: ${loads}`);
       assert.throws(() => session.getExpectedSenderNum(), isIOException);
-      // A setter from JS: it waits for the session-state mutex (held by the
-      // thread in the current reload attempt, at most one timeout) and then
-      // either fails at once (a reload is in flight) or starts the next
-      // attempt itself (one more timeout). Never longer.
+      // A setter from JS runs on a worker that waits for the session-state
+      // mutex, then runs its own reload attempt under it (one timeout; the
+      // "reload in flight" fast-fail cannot apply to a thread that holds the
+      // mutex, since every reload runs under it). The wait is longer than
+      // the one attempt in flight at t1: the network thread makes several
+      // store calls back to back per pass -- on a reconnect, setResponder()
+      // -> checkSessionTime() -> getCreationTime(), next() -> checkSessionTime()
+      // again, generateLogon() -> reset() (ResetOnLogon=Y), shouldSendReset()
+      // -> getExpectedSenderNum() (throws) -- each a full-timeout attempt that
+      // re-takes the mutex within microseconds, and std::mutex is not FIFO,
+      // so the worker loses that handoff k times (measured: k = 0 or 2). The
+      // bound is therefore per attempt, not a fixed count: the remainder of
+      // the attempt in flight at t1 (at most one timeout; it was counted
+      // before t1), plus one timeout for every load() the adapter saw while
+      // the setter was pending (the k barged attempts and the setter's own),
+      // plus slop for the timer and thread wake-ups. The absolute cap is the
+      // 10 s check below.
       const t1 = Date.now();
+      const loadsAtT1 = iniStore.count('load');
       await assert.rejects(() => session.setNextTargetMsgSeqNum(5), isIOException);
-      assert.ok(Date.now() - t1 < 2 * 500 + 500, 'bounded by two timeouts');
+      const setterMs = Date.now() - t1;
+      const loadsWhilePending = iniStore.count('load') - loadsAtT1;
+      assert.ok(loadsWhilePending >= 1, 'the setter ran a reload attempt of its own');
+      assert.ok(
+        setterMs < (1 + loadsWhilePending) * 500 + 500,
+        `setter settled in ${setterMs} ms with ${loadsWhilePending} reload attempt(s) while pending (500 ms timeout)`,
+      );
       assert.ok(storeErrors.filter((e) => e.method === 'load').length >= 1, 'reload failures are reported');
       assert.ok(Date.now() - t0 < 10_000);
     } finally {
