@@ -2,16 +2,14 @@
 
 This is `src/store/sql.ts` as it existed on `@homaiohq/napi-quickfix` branch
 `feat/js-message-store` @ `f802818` (introduced by commit `6b8caa0` "feat:
-generic SQL message-store adapter"). It was removed from that pull request to
-be shipped separately; it is reproduced here, abridged (the body of
-`sqlSchema()` is elided: this skill links to schemas, it does not copy them,
-see `upstream-schemas.md` section 5), as the executable form of the
+generic SQL message-store adapter"). The package ships it as
+`@homaiohq/napi-quickfix/store/sql` (`createSqlMessageStore`); this file
+mirrors `src/store/sql.ts`, abridged (the body of `sqlSchema()` is elided:
+this skill links to schemas, it does not copy them; the real statements are
+`sql/*.sql` in this repository), and is reproduced here as the executable form of the
 contract in `contract.md`, because it passed `test/store-sql.test.ts` (the
 `contract()` function, reproduced as section 1 of `test-checklist.md`, and a
-loopback restart) against `node:sqlite` and PostgreSQL. A packaged version is
-planned as a follow-up: the doc comments below that mention the
-`@homaiohq/napi-quickfix/store/sql` subpath export and the package's `sql/`
-directory describe that packaged form, which this package does not ship yet.
+loopback restart) against `node:sqlite` and PostgreSQL.
 
 What to copy from it, in order of importance:
 
@@ -237,7 +235,7 @@ export function createSqlMessageStore(options: SqlMessageStoreOptions): MessageS
 }
 ```
 
-## How it was wired to real drivers (from the README of the same revision)
+## How it is wired to real drivers (from the README "Generic SQL adapter")
 
 ```ts
 // pg
@@ -288,11 +286,11 @@ const store = createSqlMessageStore({
 (The `transaction` wrappers are those of `test/store-sql.test.ts`
 `sqliteBackend()` / `postgresBackend()`.)
 
-Two things the adapter did NOT do, which a production copy should consider:
+Two things the adapter does NOT do, which a production copy should consider:
 
-- It did not reject a `setSeqNums` that updated zero rows (contract C3). With
+- It does not reject a `setSeqNums` that updated zero rows (contract C3). With
   `pg`, `result.rowCount === 0` is available; with `mysql2`,
   `result.affectedRows`.
-- It did not set statement timeouts (contract I2); do that on the pool
+- It does not set statement timeouts (contract I2); do that on the pool
   (`statement_timeout` for PostgreSQL, `MAX_EXECUTION_TIME` / connect timeouts
   for MySQL), shorter than `storeTimeoutMs`.

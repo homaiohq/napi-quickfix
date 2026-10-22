@@ -9,7 +9,7 @@ Every rule below is sourced. The sources, and the versions they were read at:
 | `[README]` | `README.md` section "Message store", same revision |
 | `[ARCH]` | `ARCHITECTURE.md` §4b "The message-store bridge" and §5 "Lock order", same revision |
 | `[store.test]` | `test/store.test.ts`, same revision; cited by test title |
-| `[store-sql.test]` | the SQL adapter test, `test/store-sql.test.ts` at the same revision (identical at `6b8caa0`, the commit that introduced the SQL adapter): `contract()`, reproduced as section 1 of `test-checklist.md`, and `loopback()`. Not part of every checkout that carries this skill |
+| `[store-sql.test]` | `test/store-sql.test.ts`, same revision (identical at `6b8caa0`, the commit that introduced the SQL adapter): `contract()`, reproduced as section 1 of `test-checklist.md`, and `loopback()` |
 | `[QF <file>:<line>]` | QuickFIX C++ **v1.16.0** (the tag pinned by `CMakeLists.txt` `GIT_TAG v1.16.0`; FetchContent checkout `2ce8a60667d95a55cdc57a210f165e19cb757126`), path under `src/C++/` |
 
 Where a rule is *derived* (a consequence of sourced facts rather than a
@@ -279,8 +279,8 @@ timeout is discarded. Sources: `[README]` "Failure policy";
 `[js_message_store.cpp]` `get()` → `Forward(r, /*fatal=*/false)`.
 
 **E9. Return JS strings.** If your driver hands back bytes (MySQL `BLOB`), decode
-as UTF-8 (the removed SQL adapter did `Buffer.from(m).toString('utf8')`, see
-`sql-adapter-reference.md`).
+as UTF-8 (the shipped SQL adapter, `src/store/sql.ts`, does
+`Buffer.from(m).toString('utf8')`, see `sql-adapter-reference.md`).
 
 ---
 
@@ -560,5 +560,5 @@ is ignored; a returned Promise is awaited. Source: `[js_message_store.cpp]`
 **K4. Numbers cross as JS `number`s** (doubles holding safe integers). When your
 backend returns `string` or `bigint` (PostgreSQL `NUMERIC` through `pg`, MySQL
 `BIGINT UNSIGNED` with `supportBigNumbers`), convert with `Number()` and
-validate before returning. Source: the removed SQL adapter's `toSeq()`
-(`sql-adapter-reference.md`).
+validate before returning. Source: the shipped SQL adapter's `toSeq()`
+(`src/store/sql.ts`, reproduced in `sql-adapter-reference.md`).

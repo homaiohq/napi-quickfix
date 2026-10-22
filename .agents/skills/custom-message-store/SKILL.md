@@ -18,9 +18,9 @@ upstream tables' columns really mean. This skill is that knowledge, sourced.
 **Sources and versions.** The binding at `@homaiohq/napi-quickfix` 0.3.1, branch
 `feat/js-message-store` @ `f802818` (`src/store.ts`, `cpp/js_message_store.{h,cpp}`,
 `README.md` "Message store", `ARCHITECTURE.md` §4b/§5, `test/store.test.ts`,
-`test/store-adapters.ts`, and that revision's SQL adapter test, whose `contract()`
-is reproduced as section 1 of `references/test-checklist.md`), and QuickFIX C++
-**v1.16.0**
+`test/store-adapters.ts`, `test/store-sql.test.ts`, whose `contract()` is
+reproduced as section 1 of `references/test-checklist.md`, and the shipped SQL
+adapter `src/store/sql.ts` with its `sql/*.sql`), and QuickFIX C++ **v1.16.0**
 (the tag `CMakeLists.txt` pins). Every rule in the references cites one of them;
 when the skill and a newer repository disagree, the repository wins: re-read the
 cited file.
@@ -31,7 +31,7 @@ Reference files next to this one:
 | --- | --- |
 | `references/contract.md` | always: the rules (A-K), each with its source |
 | `references/upstream-schemas.md` | the backend is SQL, or the data must interoperate with a QuickFIX C++ deployment: the column mapping, the statements upstream issues, timestamps, the table-prefix convention, gotchas, and where to fetch the upstream DDL (linked, not reproduced) |
-| `references/sql-adapter-reference.md` | you want a worked, tested SQL implementation to adapt (a reference SQL adapter, reproduced abridged: its `sqlSchema()` DDL is elided; a packaged version is planned as a follow-up) |
+| `references/sql-adapter-reference.md` | you want a worked, tested SQL implementation to adapt (the shipped adapter, `@homaiohq/napi-quickfix/store/sql`, reproduced abridged: its `sqlSchema()` DDL is elided, the statements are `sql/*.sql` in this repository; it mirrors `src/store/sql.ts`) |
 | `references/test-checklist.md` | always, before declaring the adapter done: differential tests against `MapMessageStore`, engine-level scenarios, failure injection |
 
 ## Workflow
