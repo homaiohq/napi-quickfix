@@ -195,7 +195,9 @@ async function loopback(makeStore: () => MessageStoreAdapter) {
 describe('generic SQL message store', () => {
   test('the schema files match sqlSchema()', () => {
     for (const dialect of ['postgres', 'mysql', 'sqlite'] as const) {
-      const file = readFileSync(fileURLToPath(new URL(`../sql/${dialect}.sql`, import.meta.url)), 'utf8');
+      // .gitattributes pins sql/*.sql to LF; normalise anyway so a checkout
+      // with core.autocrlf=true (the Windows runners) cannot fail this.
+      const file = readFileSync(fileURLToPath(new URL(`../sql/${dialect}.sql`, import.meta.url)), 'utf8').replace(/\r\n/g, '\n');
       for (const stmt of sqlSchema(dialect)) assert.ok(file.includes(stmt), `${dialect}.sql holds ${stmt.slice(0, 40)}...`);
     }
     assert.ok(sqlSchema('mysql', { tablePrefix: 'fix_' })[0].includes('fix_sessions'));
