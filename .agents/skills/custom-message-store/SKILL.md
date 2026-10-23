@@ -129,7 +129,7 @@ is unclear: it is the oracle the test checklist compares against.
 | each outbound message | `setMessage(id, n, wire)` then `setSeqNums(id, n+1, target)` **then** the bytes go out | the engine's network thread or a `sendToTarget()` worker, holding the session-state mutex | Write-through: your ack precedes the wire |
 | each inbound message | `setSeqNums(id, sender, target+1)` | network thread | After your `fromApp` handler ran |
 | peer's ResendRequest | `getMessages(id, begin, end)` | network thread | Range already bounded by the engine |
-| `ResetOnLogon=Y`, `ResetOnLogout=Y`, `ResetOnDisconnect=Y`, a Logon sent or received with `ResetSeqNumFlag=Y`, session-time rollover (there is no JS-side `reset()`: `setNextSenderMsgSeqNum()` / `setNextTargetMsgSeqNum()` reach the adapter as `setSeqNums`) | `reset(id, {now, 1, 1})` | network thread (a `sendToTarget()` worker only if the application itself sends a Logon carrying `ResetSeqNumFlag=Y`, `Session.cpp:559-567`) | Never fatal to QuickFIX; failure poisons |
+| `ResetOnLogon=Y`, `ResetOnLogout=Y`, `ResetOnDisconnect=Y`, a Logon sent or received with `ResetSeqNumFlag=Y`, session-time rollover (there is no JS-side `reset()`: `setNextSenderMsgSeqNum()` / `setNextTargetMsgSeqNum()` reach the adapter as `setSeqNums`) | `reset(id, {now, 1, 1})` | network thread (a `sendToTarget()` worker only if the application itself sends a Logon carrying `ResetSeqNumFlag=Y`, `Session.cpp:559-567`) | Never fatal to QuickFIX; failure poisons, and the same `reset` (same `creationTime`) is retried by every later call until it succeeds |
 | `RefreshOnLogon=Y`, `session.refresh()`, and the reload that lifts a poisoned store | `load(id)`, then `create(id, {now, 1, 1})` if it returned `null` | network thread / worker | `null` means the row is gone: the numbering restarts at `1/1`, as upstream's `refresh()` does |
 | `await engine.stop()` | `close(id)` once per session, after the sessions are destroyed | JS | Also when `create()` rejects after building the engine (constructor-time `reset()` failed); not when the engine is dropped without `stop()` |
 
@@ -179,7 +179,8 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   above the old next number too) and write the given state (upsert the session
   row); one transaction where possible, else DELETE first. Persist the
   `creationTime` you are given. Fatal on failure, but never thrown into
-  QuickFIX.
+  QuickFIX; a failed reset is retried with the same state until it succeeds,
+  so it must be idempotent.
 - **Durability (G).** Return only once durable: no write-behind, no cache
   standing in for the database; the engine advances its cached numbers after
   your ack and sends after that. Upstream's floor is "survives a process

@@ -676,17 +676,9 @@ describe('MessageStoreAdapter: failure policy', () => {
     try {
       await logonBoth(acc, ini);
       iniStore.set('reset', 'reject');
-      // Keep the adapter down for load() too. The poison a rejected reset()
-      // leaves is transient by design: the engine's very next store call
-      // reloads through load() and, with a healthy adapter, lifts it. Here
-      // that next call comes within milliseconds: nextLogout() runs
-      // disconnect() (reset() rejected: poisoned), then nextQueued() reads
-      // getExpectedTargetNum() (reload: poison lifted); QuickFIX then runs
-      // disconnect() once more from SocketInitiator::onDisconnect() (reset()
-      // rejected: poisoned again). The getter below would see whichever
-      // state the 25 ms poll landed on; a rejecting load() keeps it poisoned
-      // until the adapter is back.
-      iniStore.set('load', 'reject');
+      // A failed reset() stays pending: no reload undoes it (that would bring
+      // back the numbers it meant to discard); every later store call
+      // retries the reset instead, and fails while the adapter is down.
       const logout = waitForEvent(ini, 'logout', 'initiator logout', T);
       await ini.getSession(INI_ID)!.logout('bye');
       await logout;
@@ -696,12 +688,16 @@ describe('MessageStoreAdapter: failure policy', () => {
       // the store may not hold.
       assert.throws(() => ini.getSession(INI_ID)!.getExpectedSenderNum(), isIOException);
       // The poison lifts on the next store call once the adapter is back:
-      // logon() -> the engine reconnects -> the reload serves the state.
+      // logon() -> the engine reconnects -> the reset is retried, not undone.
+      const loadsBefore = iniStore.count('load');
+      const resetsBefore = iniStore.count('reset');
       iniStore.mode = () => 'ok';
       const relogon = waitForEvent(ini, 'logon', 'initiator re-logon', T);
       await ini.getSession(INI_ID)!.logon();
       await relogon;
-      assert.ok(iniStore.calls.includes('load'), 'the cache was reloaded through load()');
+      assert.equal(iniStore.count('load'), loadsBefore, 'no reload while the reset was pending');
+      assert.ok(iniStore.count('reset') > resetsBefore, 'the reset was retried');
+      assert.ok(iniStore.row(INI_ID).state.nextSenderMsgSeqNum <= 3, 'the row was reset before the re-logon');
       assert.doesNotThrow(() => ini.getSession(INI_ID)!.getExpectedSenderNum());
     } finally {
       await stopBoth(acc, ini);
@@ -711,15 +707,21 @@ describe('MessageStoreAdapter: failure policy', () => {
   test('RefreshOnLogon=Y + rejecting refresh() (load): poisoned, the logon fails, the process survives', { timeout: 30_000 }, async () => {
     const port = await freePort();
     const iniStore = new ControlledStore(undefined, 1);
-    const { acc, ini, storeErrors } = await makePair(port, { iniStore, ini: { RefreshOnLogon: 'Y' } });
+    // ResetOnLogon=N: with a reset on logon, the reset() that follows the
+    // failed refresh is retried and its success lifts the poison (the state
+    // is then fully known: 1/1), so the logon would go through.
+    const { acc, ini, storeErrors } = await makePair(port, {
+      iniStore,
+      ini: { RefreshOnLogon: 'Y', ResetOnLogon: 'N', LogonTimeout: '1' },
+    });
     try {
       const logons = waitForEvent(acc, 'logon', 'acceptor logon', T);
       await acc.start();
       iniStore.set('load', 'reject');
       await ini.start();
       // The initiator's generateLogon() refreshes first; the rejection
-      // poisons the store, and sending the Logon fails on the poisoned
-      // getter, so no logon completes.
+      // poisons the store, and the Logon cannot be persisted (sendRaw()
+      // fails, LogonTimeout ends the attempt), so no logon completes.
       assert.ok(await waitUntil(() => storeErrors.some((e) => e.method === 'load' && e.poisoned), T));
       assert.equal(ini.isLoggedOn(), false);
       await assert.rejects(() => ini.getSession(INI_ID)!.refresh(), isIOException);
@@ -735,11 +737,13 @@ describe('MessageStoreAdapter: failure policy', () => {
   test('a poisoned acceptor whose fromAdmin rejects the Logon (RejectLogon): the handler\'s Logout does not abort the process', { timeout: 40_000 }, async () => {
     // Before the fix: generateLogout() -> fill() -> getNextSenderMsgSeqNum()
     // threw outside any guard in QuickFIX's catch (RejectLogon&): exit 134.
+    // The sender getter now never throws.
     const { result } = await runChild('reject-logon-poisoned', 30_000);
     assert.ok((result.rejected as number) >= 2, 'the Logon was rejected (twice)');
     assert.equal(result.accLoggedOn, false);
     assert.ok((result.errors as string[]).includes('reset:true'), "the Logon's reset() poisoned the store");
-    assert.ok((result.errors as string[]).includes('load:true'), 'the reloads failed');
+    // A failed reset is retried, never undone by a plain reload.
+    assert.ok(!(result.errors as string[]).includes('load:true'), 'no reload while the reset is pending');
   });
 
   test('a poisoned initiator receiving a wrong BeginString (UnsupportedVersion): no abort, the logout timeout disconnects', { timeout: 40_000 }, async () => {
@@ -749,6 +753,58 @@ describe('MessageStoreAdapter: failure policy', () => {
     assert.equal(result.sent, false, 'the poisoning send failed');
     assert.equal(result.stillLoggedOn, true, 'a failed send poisons without disconnecting');
     assert.equal(result.disconnected, true);
+  });
+
+  test('a connect after the session period ended, on a poisoned acceptor (RefreshOnLogon=Y): Session::reset() in setResponder() does not abort the process', { timeout: 40_000 }, async () => {
+    // Before the fix: setResponder() -> Session::reset() -> generateLogout()
+    // -> fill() -> getNextSenderMsgSeqNum() threw with no handler on the
+    // acceptor's network thread: exit 134.
+    const { result } = await runChild('rollover-connect-poisoned', 30_000);
+    assert.ok((result.loads as number) >= 3, 'the initiator connected (each connect refreshes)');
+    assert.equal(result.accLoggedOn, false);
+    assert.ok((result.errors as string[]).includes('load:true'), 'the refresh poisoned the store');
+  });
+
+  test('ResetOnLogon=Y + a reset() that rejects once: the reset is retried before the Logon goes out, never undone by a reload', { timeout: 30_000 }, async () => {
+    // generateLogon() resets, then reads the sender seqnum for
+    // ResetSeqNumFlag and MsgSeqNum. Before the fix that read reloaded the
+    // old row and lifted the poison: the Logon left with 34=57 and no 141=Y,
+    // as if the reset had happened.
+    const port = await freePort();
+    const logons: Array<{ seq: number; reset: string }> = [];
+    const acc = await Acceptor.create({
+      settings: SessionSettings.fromString(acceptorCfg(port)),
+      store: 'memory',
+      log: 'none',
+      handlers: {
+        fromAdmin(msg: Message) {
+          if (msg.getHeaderField(FIELD.MsgType) === MsgType.Logon) {
+            logons.push({ seq: Number(msg.getHeaderField(FIELD.MsgSeqNum)), reset: msg.getFieldIfSet(FIELD.ResetSeqNumFlag) ?? '' });
+          }
+        },
+      },
+    });
+    const iniStore = new ControlledStore(undefined, 1);
+    iniStore.inner.create(INI_ID, { creationTime: new Date(), nextSenderMsgSeqNum: 57, nextTargetMsgSeqNum: 40 });
+    let rejections = 1;
+    iniStore.set('reset', 'reject', () => rejections-- > 0);
+    const ini = await Initiator.create({
+      settings: SessionSettings.fromString(initiatorCfg(port)),
+      store: iniStore,
+      log: 'none',
+    });
+    const storeErrors: StoreErrorSeen[] = [];
+    ini.on('storeError', (_id, method, err, poisoned) => storeErrors.push({ method, message: err.message, poisoned }));
+    try {
+      await logonBoth(acc, ini);
+      assert.ok(storeErrors.some((e) => e.method === 'reset' && e.poisoned), 'the first reset() was rejected');
+      assert.ok(iniStore.count('reset') >= 2, 'the rejected reset was retried');
+      assert.deepEqual(logons[0], { seq: 1, reset: 'Y' });
+      assert.ok(iniStore.row(INI_ID).state.nextSenderMsgSeqNum < 57, 'the row was reset');
+      assert.equal(ini.getSession(INI_ID)!.getExpectedSenderNum(), iniStore.row(INI_ID).state.nextSenderMsgSeqNum);
+    } finally {
+      await stopBoth(acc, ini);
+    }
   });
 
   test('refresh() / a reload after the row was deleted: like upstream, the row is recreated at 1/1 and the cache follows', { timeout: 30_000 }, async () => {
@@ -829,10 +885,12 @@ describe('MessageStoreAdapter: failure policy', () => {
     const port = await freePort();
     const iniStore = new ControlledStore();
     const noReset = { ResetOnLogon: 'N' };
+    // A reconnect while poisoned sends a Logon that cannot be persisted, and
+    // QuickFIX has already marked it sent: the attempt ends at LogonTimeout.
     const { acc, ini, received, storeErrors } = await makePair(port, {
       iniStore,
       acc: noReset,
-      ini: noReset,
+      ini: { ...noReset, LogonTimeout: '1' },
       storeTimeoutMs: 300,
     });
     try {
@@ -850,7 +908,7 @@ describe('MessageStoreAdapter: failure policy', () => {
       // Down on the network thread's next tick or inbound message.
       await logout;
       assert.equal(session.isLoggedOn(), false);
-      // A send now fails on the poisoned getter (fill() cannot stamp a seqnum).
+      // A send now fails on the poisoned store (persist() cannot write).
       assert.equal(await sendToTarget(newOrder('while-down'), INI_ID), false);
       // Still poisoned while the timed-out write is unsettled: no reload
       // attempt is made, the engine's reconnects fail on the store.

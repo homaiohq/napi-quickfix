@@ -37,15 +37,26 @@
 //     answered by a disconnect and the peer re-requests).
 //   * setSeqNums / reset: a rejection, a timeout or a late settlement
 //     poisons the store; refresh (load): a rejection or timeout does too. A
-//     poisoned store fails every write and every read of the SENDER seqnum
-//     at once with IOException (so Session::fill() cannot stamp a stale
-//     seqnum on the wire: the session's sends fail), and every inbound
-//     message ends in an incrNextTargetMsgSeqNum() that throws, so QuickFIX
-//     disconnects the session at its next inbound message (a heartbeat at
-//     the latest). Poison lifts once every timed-out write has settled (so
-//     a late write has landed) and the next call of any kind has reloaded
-//     the cache through load(); at most one reload is in flight, and a
-//     failed reload keeps the store poisoned for the next attempt.
+//     poisoned store fails every write at once with IOException (inside
+//     sendRaw()'s try, so nothing stamped from its cache reaches the wire:
+//     the session's sends fail), and every inbound message ends in an
+//     incrNextTargetMsgSeqNum() that throws, so QuickFIX disconnects the
+//     session at its next inbound message (a heartbeat at the latest).
+//     Poison lifts once every timed-out write has settled (so a late write
+//     has landed) and the next call of any kind has reloaded the cache
+//     through load(); at most one reload is in flight, and a failed reload
+//     keeps the store poisoned for the next attempt.
+//   * A failed reset() is not undone by that reload, which would restore the
+//     numbers QuickFIX meant to discard (a ResetOnLogon=Y Logon would leave
+//     with the old MsgSeqNum and no ResetSeqNumFlag). It stays pending, and
+//     the reload that lifts the poison is the reset itself, retried with its
+//     original timestamp (refresh() included).
+//   * A message stamped from the cache while the store was poisoned, whose
+//     persist() then finds the poison lifted by a reload that moved the
+//     sender seqnum, is refused (set(): its MsgSeqNum is no longer the next
+//     sender seqnum; incrNextSenderMsgSeqNum() with PersistMessages=N: the
+//     store was poisoned on entry): IOException + non-poisoning 'storeError',
+//     nothing sent.
 //   * A reload (refresh or poison) whose load() returns null finds the row
 //     gone: like upstream's refresh() (cache reset, then populateCache()
 //     INSERTs a 1/1 row), the numbering restarts at 1/1 with a new creation
@@ -59,32 +70,32 @@
 //     setNextTargetMsgSeqNum()). Refused like a non-fatal adapter failure:
 //     IOException + 'storeError', no poison (nothing was sent, cache and DB
 //     are still equal), and QuickFIX's handler disconnects the session.
-//   * reset(), refresh(), getCreationTime() and getNextTargetMsgSeqNum()
-//     NEVER throw into QuickFIX, because each has a call site with no
-//     handler: Session::disconnect() (ResetOnDisconnect=Y) runs reset()
-//     inside the catch(IOException&) handlers of Session::next();
-//     Session::setResponder() runs refresh() (RefreshOnLogon=Y), reset() and
-//     -- through checkSessionTime() -- getCreationTime() on the connect
-//     path, where the acceptor has no handler (std::terminate, observed) and
-//     the initiator swallows the exception with the session left "pending"
-//     for good; Session::next(Message) reads getExpectedTargetNum() in
-//     nextQueued() after its handlers, on every inbound message. The two
-//     writes poison and report instead; the two getters still attempt the
-//     reload while poisoned, then return the cached value.
+//   * reset(), refresh(), and the three getters NEVER throw into QuickFIX,
+//     because each has a call site with no handler: Session::disconnect()
+//     (ResetOnDisconnect=Y) runs reset() inside the catch(IOException&)
+//     handlers of Session::next(); Session::setResponder() on the connect
+//     path runs refresh() (RefreshOnLogon=Y), getCreationTime() (through
+//     checkSessionTime()) and, outside the session period, Session::reset(),
+//     whose generateLogout() -> fill() reads the sender seqnum before
+//     sendRaw()'s try; there the acceptor has no handler (std::terminate,
+//     observed) and the initiator swallows the exception with the session
+//     left "pending" for good. QuickFIX's own catch (RejectLogon&) and catch
+//     (UnsupportedVersion&) also call generateLogout(), and
+//     Session::next(Message) reads getExpectedTargetNum() in nextQueued()
+//     after its handlers, on every inbound message. The two writes poison and
+//     report instead; the getters still attempt the reload while poisoned,
+//     then return the cached value. With the sender getter never throwing, a
+//     poisoned initiator's Logon fails at persist() after QuickFIX marked it
+//     sent, so that connection attempt ends at LogonTimeout.
 //   * Inside one of QuickFIX's own catch handlers (std::current_exception()
-//     is set), getNextSenderMsgSeqNum() and incrNextTargetMsgSeqNum() do not
-//     throw either: Session::next(Message)'s catch (RejectLogon&) and catch
-//     (UnsupportedVersion&) call generateLogout() -- whose fill() reads the
-//     sender seqnum before sendRaw()'s try -- and the latter also increments
-//     the target seqnum, all with no guard (std::terminate, observed: a
-//     fromAdmin rejecting a Logon on a poisoned store; a wrong BeginString
-//     from the peer). The failure is recorded (poison / 'storeError') and
-//     the cache returned or left as is; nothing reaches the wire, since
-//     persist()'s writes still throw inside sendRaw()'s try. (nextQueued()
-//     can also incrNextTargetMsgSeqNum() unguarded and outside any handler,
-//     for a queued Logon or ResendRequest at exactly the expected seqnum;
-//     that exposure is upstream's own, a FileStore write failure terminates
-//     there too.)
+//     is set), incrNextTargetMsgSeqNum() does not throw either: catch
+//     (UnsupportedVersion&) increments the target seqnum with no guard
+//     (std::terminate, observed: a wrong BeginString from the peer). The
+//     failure is recorded (poison / 'storeError') and the cache left as is.
+//     (nextQueued() can also incrNextTargetMsgSeqNum() unguarded and outside
+//     any handler, for a queued Logon or ResendRequest at exactly the
+//     expected seqnum; that exposure is upstream's own, a FileStore write
+//     failure terminates there too.)
 //   * A per-call timeout (storeTimeoutMs, default 30 s, 0 = none) bounds how
 //     long a QuickFIX thread can be parked: a never-settling adapter would
 //     otherwise freeze every session of the engine and make a graceful
@@ -309,12 +320,18 @@ class JsMessageStore : public FIX::MessageStore {
   void Apply(const Factory::State& s) const;  // under C
   // Poison gate for every call that reaches the store: throws IOException if
   // the store is poisoned and cannot be reloaded now; otherwise reloads the
-  // cache (one reload at a time, through the bridge) and lifts the poison,
-  // or throws if the reload failed. `what` names the caller for the message.
+  // cache (one reload at a time, through the bridge; a pending reset is
+  // retried instead, see RetryReset()) and lifts the poison, or throws if
+  // that failed. `what` names the caller for the message.
   void Gate(const char* what) const;
   // load() and apply; a missing row is recreated at 1/1 through create().
   // Not under C. On failure returns the outcome, `failed` names the method.
   Factory::Outcome Reload(Factory::Method& failed) const;
+  // reset() through the bridge with `when`, the timestamp of the reset a
+  // failure left pending, and apply it. Not under C. On failure returns the
+  // outcome, `failed` is kReset.
+  Factory::Outcome RetryReset(const FIX::UtcTimeStamp& when,
+                              Factory::Method& failed) const;
   // Forward to the factory and translate: kOk returns; anything else throws
   // IOException. For `fatal` methods a rejection or timeout poisons first.
   Factory::Outcome Forward(Factory::Request req, bool fatal) const;
@@ -331,15 +348,24 @@ class JsMessageStore : public FIX::MessageStore {
   // before it is forwarded: reports a non-poisoning 'storeError' for
   // `method` and throws IOException. `what` names the member for the text.
   void CheckSafeSeq(FIX::SEQNUM n, Factory::Method method, const char* what) const;
+  // Refuse a message whose MsgSeqNum is no longer the next sender seqnum (a
+  // reload moved the cache between fill() and persist()): reports a
+  // non-poisoning 'storeError' and throws IOException.
+  void CheckStamp(FIX::SEQNUM seq) const;
 
   Factory& factory_;
   FIX::SessionID id_;
   mutable std::mutex mtx_;  // C
   mutable FIX::MemoryStore cache_;
   mutable bool poisoned_ = false;
-  // Timed-out setSeqNums/reset calls whose Promise has not settled yet: the
-  // poison cannot lift while one is pending (its write may still land).
+  // Timed-out setSeqNums/reset/create calls whose Promise has not settled
+  // yet: the poison cannot lift while one is pending (its write may still
+  // land). May read -1 for a moment (see OnLateSettlement()).
   mutable int unsettled_ = 0;
+  // A reset() that failed: Gate() retries it (RetryReset()) instead of
+  // reloading. Implies poisoned_.
+  mutable bool pendingReset_ = false;
+  mutable FIX::UtcTimeStamp pendingResetTime_ = FIX::UtcTimeStamp::now();
   mutable bool reloadInFlight_ = false;
   mutable std::string lastError_;
 };

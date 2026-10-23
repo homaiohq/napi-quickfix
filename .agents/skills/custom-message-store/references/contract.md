@@ -520,7 +520,9 @@ in `sendRaw()`); every other trigger runs on the network thread.
 
 **F6. `reset()` is FATAL on failure but never throws into QuickFIX**: a rejection,
 timeout or late settlement poisons the store and fires `'storeError'`; the
-engine goes on. The constructor-time `reset()` is the exception: its rejection
+engine goes on, with the reset pending: every later store call retries it (I4)
+before anything else, and the session sends nothing until it succeeded. The
+constructor-time `reset()` is the exception: its rejection
 rejects `create()` and the half-built engine is torn down. Sources: `[README]`
 "Failure policy" and "`reset()` and `refresh()` never raise into QuickFIX";
 `[js_message_store.cpp]` `reset()` (`catch (const FIX::IOException&) {}` and the
@@ -692,25 +694,34 @@ Sources: `[README]` "Failure policy" and "`stop()`"; `[js_message_store.cpp]`
 `kSetSeqNums`/`kReset`/`kCreate` only), `refresh()`, `Reload()`; `[store.ts]` `preload()`,
 `closeAll()`; `[store.test]` the "failure policy" describe block.
 
-**I4. What poison means for your users.** While poisoned, every write and every
-read of the outbound sequence number fails with `IOException` (except the reads
-and the inbound increment QuickFIX makes from inside its own `RejectLogon`/
-`UnsupportedVersion` handlers, which have no guard: there the failure is
-recorded and nothing reaches the wire); every inbound
-message ends in a sequence-number write that fails, so the engine disconnects
-the session at its next inbound message (a heartbeat at the latest);
-`'storeError'` fires with `poisoned: true`; `session.getExpected*()` throw.
+**I4. What poison means for your users.** While poisoned, every write fails
+with `IOException`, so every send fails before it reaches the wire. The engine's
+own reads of the sequence numbers fall back to the cache (QuickFIX stamps
+messages outside its guards on the connect path and in its `RejectLogon`/
+`UnsupportedVersion` handlers), and so does the inbound increment inside those
+handlers: the failure is recorded and nothing stamped while poisoned is sent.
+A poisoned initiator's Logon fails the same way, after QuickFIX counted it as
+sent, so that attempt ends at `LogonTimeout`. Every inbound message ends in a
+sequence-number write that fails, so the engine disconnects the session at its
+next inbound message (a heartbeat at the latest); `'storeError'` fires with
+`poisoned: true`; `session.getExpected*()` throw.
 Poison lifts in two steps: once every timed-out write has settled, the next
 store call of any kind first reloads the state through `load()` (one reload in
 flight at a time), then proceeds; QuickFIX reconciles with the peer at the next
-logon (resend request, or redelivery with `PossDupFlag=Y`). A timed-out
-`setSeqNums`/`reset` that never settles keeps the session poisoned until the
-engine is stopped (I2). Sources: `[README]`
-"Failure policy"; `[js_message_store.cpp]` `Gate()`; `[store.test]`
-"ResetOnDisconnect=Y + rejecting reset() ..." and "poisoned store with a dead
-adapter: calls fail immediately, one reload attempt per timeout". For the
-adapter this means: during an outage, reject fast; on recovery, make `load()`
-work first.
+logon (resend request, or redelivery with `PossDupFlag=Y`). A failed `reset` is
+the exception: that step is the reset itself, retried as `reset(id, {the
+original creationTime, 1, 1})` until it succeeds, never a `load()` (which
+would bring back the numbers QuickFIX meant to discard). A message stamped
+while poisoned, whose sender number the lifting reload then moved, is refused
+(non-poisoning `'storeError'`, not sent). A timed-out `setSeqNums`/`reset` that
+never settles keeps the session poisoned until the engine is stopped (I2).
+Sources: `[README]` "Failure policy"; `[js_message_store.cpp]` `Gate()`,
+`RetryReset()`, `CheckStamp()`; `[store.test]` "ResetOnDisconnect=Y +
+rejecting reset() ...", "ResetOnLogon=Y + a reset() that rejects once ..." and
+"poisoned store with a dead adapter: calls fail immediately, one reload attempt
+per timeout". For the adapter this means: during an outage, reject fast; on
+recovery, make `load()` and `reset()` work first; `reset()` must be idempotent
+(F3: an upsert), since a timed-out reset that landed late is retried.
 
 **I5. Do not retry for long inside a call.** Internal retries consume
 `storeTimeoutMs` while an engine thread is parked, and with one network thread

@@ -691,16 +691,24 @@ the session log.
   out, **poison** the session's store. The engine cannot know whether a rejected
   or late write was committed: a late increment leaves the cache one behind the
   database, a late reset leaves it with the old numbers while the database says
-  `1/1` with the messages gone. A poisoned store fails every write and every
-  read of the outbound sequence number at once (no stale number ever reaches
-  the wire), and every inbound message ends in a sequence-number write, so the
-  engine disconnects the session at its next inbound message (a heartbeat at
-  the latest); `'storeError'` fires with `poisoned: true`, and the
+  `1/1` with the messages gone. A poisoned store fails every write at once, so
+  every send fails before it reaches the wire (no stale number is ever sent),
+  and every inbound message ends in a sequence-number write, so the engine
+  disconnects the session at its next inbound message (a heartbeat at the
+  latest). A poisoned initiator's Logon cannot be persisted either; QuickFIX has
+  already counted it as sent, so that connection attempt ends at
+  `LogonTimeout`. `'storeError'` fires with `poisoned: true`, and the
   `getExpected*()` getters throw `IOException` until it lifts. **Poison lifts in
   two steps**, whatever `RefreshOnLogon` says: once every timed-out write has
   settled (so a late write has landed), the next store call of any kind first
   reloads the state through `load()` (one reload in flight at a time, so a dead
-  adapter costs one timeout per attempt, not per call), then proceeds; QuickFIX's
+  adapter costs one timeout per attempt, not per call), then proceeds. A
+  failed `reset` is the exception: reloading would bring back the numbers
+  QuickFIX meant to discard, so the reset itself is retried (`reset()` with
+  the original creation time) until it succeeds, and only then does the
+  poison lift. A message stamped while the store was poisoned is refused
+  (non-poisoning `'storeError'`, not sent) if the reload moved the sender
+  number before it could be written. QuickFIX's
   own sequence logic then reconciles with the peer at the next logon (a resend
   request, or redelivery with `PossDupFlag=Y`). An inbound message whose
   sequence-number write failed after `fromApp` ran is therefore delivered
@@ -713,12 +721,15 @@ the session log.
 - `reset()` and `refresh()` never raise into QuickFIX, which runs them on
   paths without a handler (`ResetOnDisconnect=Y` inside its own error handler,
   `RefreshOnLogon=Y` on the connect path); they poison and report instead.
-  Neither do the sequence-number reads and the inbound increment when QuickFIX
-  makes them from inside its own error handlers (a `fromAdmin` rejecting a
-  Logon with `'RejectLogon'`, a message with the wrong BeginString), which have
-  no guard either: the failure is recorded, nothing reaches the wire, and the
-  Logout those handlers send (unpersisted) lets QuickFIX's logout timeout drop
-  the session.
+  Neither do the sequence-number reads: QuickFIX stamps outbound messages
+  outside its own guards on the connect path (a connect after the session
+  period ended resets the session and sends a Logout first) and inside its
+  error handlers (a `fromAdmin` rejecting a Logon with `'RejectLogon'`, a
+  message with the wrong BeginString). They fall back to the cached number
+  while poisoned, and nothing stamped with it reaches the wire, since the
+  write that follows fails. Neither does the inbound increment inside those
+  handlers: the failure is recorded, and the Logout those handlers send
+  (unpersisted) lets QuickFIX's logout timeout drop the session.
 - A reload (`refresh()`, `RefreshOnLogon=Y`, or lifting the poison) whose
   `load()` returns `null` means the session's row is gone. As QuickFIX's own
   SQL stores do in `refresh()`, the numbering restarts: the engine calls

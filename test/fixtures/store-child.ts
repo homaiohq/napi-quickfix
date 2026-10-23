@@ -20,7 +20,7 @@ import {
   Side,
 } from '../../dist/esm/index.js';
 import { acceptorCfg, initiatorCfg } from '../helpers.js';
-import { ControlledStore, withSettings } from '../store-adapters.js';
+import { ControlledStore, utcClock, withSettings } from '../store-adapters.js';
 
 const INI_ID = new SessionID('FIX.4.4', 'CLIENT', 'SERVER');
 const ACC_ID = new SessionID('FIX.4.4', 'SERVER', 'CLIENT');
@@ -115,7 +115,7 @@ if (mode === 'graceful-stop-hang' || mode === 'graceful-stop-dead') {
   console.log(`result ${JSON.stringify({ parkedReset, errors })}`);
 } else if (mode === 'reject-logon-poisoned') {
   // An acceptor whose database is down (ResetOnLogon=Y: the Logon's reset()
-  // poisons, every reload fails) and a fromAdmin that rejects the Logon.
+  // poisons, every retry of it fails) and a fromAdmin that rejects the Logon.
   // QuickFIX's catch (RejectLogon&) runs generateLogout(), whose fill()
   // reads the sender seqnum outside any guard: an IOException there escaped
   // the network thread (std::terminate, exit 134).
@@ -191,6 +191,39 @@ if (mode === 'graceful-stop-hang' || mode === 'graceful-stop-dead') {
   await ini.stop(true);
   await acc.stop(true);
   console.log(`result ${JSON.stringify({ sent, stillLoggedOn, disconnected })}`);
+} else if (mode === 'rollover-connect-poisoned') {
+  // A connect after the acceptor's session period ended, with the database
+  // down (RefreshOnLogon=Y: the connect's refresh() poisons, every reload
+  // fails). Session::setResponder() sees checkSessionTime() fail on the
+  // cached creation time and runs Session::reset(), whose generateLogout()
+  // -> fill() reads the sender seqnum outside any guard; the acceptor's
+  // network thread has no handler (std::terminate, exit 134, before the fix).
+  // The acceptor ticks connected sessions only, so nothing resets the session
+  // between EndTime and the connect.
+  const port = await freePort();
+  const store = new ControlledStore();
+  const window = { StartTime: utcClock(-1), EndTime: utcClock(3 / 3600), RefreshOnLogon: 'Y' };
+  const acc = await Acceptor.create({
+    settings: SessionSettings.fromString(withSettings(acceptorCfg(port), window)),
+    store,
+    storeTimeoutMs: TIMEOUT_MS,
+    log: 'none',
+  });
+  const errors: string[] = [];
+  acc.on('storeError', (_id, method, _err, poisoned) => errors.push(`${method}:${poisoned}`));
+  const ini = await Initiator.create({ settings: SessionSettings.fromString(initiatorCfg(port)), store: 'memory', log: 'none' });
+  await acc.start();
+  // Past EndTime: the session period of the preloaded creation time is over.
+  await sleep(4500);
+  for (const m of ['load', 'reset', 'setSeqNums', 'setMessage'] as const) store.set(m, 'reject');
+  await ini.start();
+  // ReconnectInterval=1: let the initiator connect a few times.
+  for (let i = 0; i < 200 && store.count('load') < 3; i++) await sleep(25);
+  await sleep(200);
+  const accLoggedOn = acc.getSession(ACC_ID)!.isLoggedOn();
+  await ini.stop(true);
+  await acc.stop(true);
+  console.log(`result ${JSON.stringify({ loads: store.count('load'), accLoggedOn, errors: [...new Set(errors)] })}`);
 } else {
   throw new Error(`unknown mode ${mode}`);
 }

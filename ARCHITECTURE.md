@@ -227,22 +227,29 @@ sequenceDiagram
   record that (poison bookkeeping) before erasing it.
 - **Failure policy** (README "Message store"): `setMessage`/`getMessages` failures are `IOException`s QuickFIX
   already handles; `setSeqNums`/`reset` rejections, timeouts and late settlements, and `load` failures, **poison**
-  the store (every write and the sender-seqnum getter throw until a reload through `load()` succeeds, after every
-  timed-out write has settled). Sequence numbers cross the bridge as doubles: `ReadSeq()` refuses a value above
+  the store (every write throws until a reload through `load()` succeeds, after every timed-out write has settled; a
+  failed `reset` is instead retried with its original timestamp, since a reload would bring back the numbers QuickFIX
+  meant to discard). A message stamped from the cache of a poisoned store is refused at `persist()` if the reload
+  that lifted the poison moved the sender seqnum (`CheckStamp()`; `incrNextSenderMsgSeqNum()` with
+  `PersistMessages=N`). Sequence numbers cross the bridge as doubles: `ReadSeq()` refuses a value above
   2^53-1 coming back from JS, and `CheckSafeSeq()` refuses one going out (`set()`, `setNext*()`, hence `incr*()`;
   reachable by a counterparty's `SequenceReset` with a 64-bit `NewSeqNo`) before `Forward()`, as a non-poisoning
   `IOException` + `storeError` (nothing reached the adapter), which QuickFIX's handler turns into a disconnect.
-  Four members never throw into QuickFIX, because each has a call site with no
+  Five members never throw into QuickFIX, because each has a call site with no
   handler: `reset()` (`Session::disconnect()` with `ResetOnDisconnect=Y` runs inside `Session::next()`'s own
-  `catch (IOException&)`), `refresh()` and `getCreationTime()` (`Session::setResponder()` on the connect path: the
-  acceptor has no handler there, `std::terminate`; the initiator swallows the exception with the session stuck
-  "pending" for good), and `getNextTargetMsgSeqNum()` (`Session::next(Message)` reads it in `nextQueued()` after its
-  handlers, on every inbound message). The writes poison and report; the getters attempt the reload, then return the
-  cache. Inside one of QuickFIX's own catch handlers (`std::current_exception()` set) `getNextSenderMsgSeqNum()` and
-  `incrNextTargetMsgSeqNum()` do not throw either: `Session::next(Message)`'s `catch (RejectLogon&)` and
-  `catch (UnsupportedVersion&)` call `generateLogout()` (whose `fill()` reads the sender seqnum before `sendRaw()`'s
-  `try`) and the latter increments the target seqnum, all unguarded (`std::terminate`, observed). No stale number
-  reaches the wire: `persist()`'s writes still throw inside `sendRaw()`'s `try`. A reload whose `load()` returns `null`
+  `catch (IOException&)`); `refresh()`, `getCreationTime()` and `getNextSenderMsgSeqNum()` (`Session::setResponder()`
+  on the connect path runs `refresh()`, `checkSessionTime()` and, outside the session period, `Session::reset()`,
+  whose `generateLogout()` → `fill()` reads the sender seqnum before `sendRaw()`'s `try`: the acceptor has no handler
+  there, `std::terminate`; the initiator swallows the exception with the session stuck "pending" for good;
+  `catch (RejectLogon&)`/`catch (UnsupportedVersion&)` call `generateLogout()` too); and `getNextTargetMsgSeqNum()`
+  (`Session::next(Message)` reads it in `nextQueued()` after its handlers, on every inbound message). The writes poison
+  and report; the getters attempt the reload, then return the cache. No stale number reaches the wire:
+  `persist()`'s writes still throw inside `sendRaw()`'s `try`. A poisoned initiator's Logon therefore fails at
+  `persist()` after `generateLogon()` marked it sent, and the attempt ends at `LogonTimeout`. Inside one of
+  QuickFIX's own catch handlers (`std::current_exception()` set) `incrNextTargetMsgSeqNum()` does not throw either:
+  `catch (UnsupportedVersion&)` increments the target seqnum unguarded (`std::terminate`, observed). A late
+  settlement can race the timed-out waiter's own bookkeeping (it counts the write only after `Call()` returned), so
+  the unsettled counter is not clamped at 0: it may read -1 for a moment. A reload whose `load()` returns `null`
   (the row is gone) recreates it at 1/1 through `create()`, as upstream's `refresh()` → `populateCache()` does; a
   timed-out `create()` there is tracked as an unsettled write like `setSeqNums`/`reset`. The calls the TS layer makes
   itself (preload, the constructor-time `reset()`, `close()`) are bounded by the same timeout in `src/store.ts`

@@ -25,11 +25,15 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   `getMessages` failures are never fatal; `setSeqNums`/`reset` rejections, timeouts and
   late settlements (and `load` failures) poison the session's store until it has been
   reloaded, which takes the session down and lets QuickFIX reconcile with the peer at
-  the next logon. `reset()`/`refresh()` never throw into QuickFIX (its
-  `ResetOnDisconnect`/`RefreshOnLogon` paths have no handler; observed `std::terminate`),
-  nor do the seqnum reads and the inbound increment QuickFIX makes from inside its own
-  `RejectLogon`/`UnsupportedVersion` handlers. A reload that finds the session's row
-  gone recreates it at 1/1 through `create()`, as upstream's `refresh()` does.
+  the next logon; a failed `reset` is retried rather than undone by that reload, so
+  the session never goes on with the numbers it meant to discard. `reset()`/`refresh()`
+  and the seqnum reads never throw into QuickFIX (its `ResetOnDisconnect`/`RefreshOnLogon`
+  paths, a connect after the session period ended, and its `RejectLogon`/
+  `UnsupportedVersion` handlers have no guard; observed `std::terminate`); a poisoned
+  store fails the write instead, so nothing stamped while poisoned reaches the wire, and
+  a poisoned initiator's logon attempt ends at `LogonTimeout`. Nor does the inbound
+  increment QuickFIX makes from inside those handlers. A reload that finds the session's
+  row gone recreates it at 1/1 through `create()`, as upstream's `refresh()` does.
   `storeTimeoutMs` also bounds the calls `create()`/`stop()` await (preload,
   constructor-time `reset()`, `close()`).
   `stop(true)` fails pending store calls first; a graceful `stop()` lets them complete

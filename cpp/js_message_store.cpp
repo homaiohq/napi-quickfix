@@ -86,12 +86,12 @@ Outcome Failed(Status status, std::string error) {
 
 // True while the calling thread is inside a catch handler. QuickFIX makes
 // store calls from its own handlers in Session::next(Message) with no
-// IOException guard of their own: catch (RejectLogon&) and catch
-// (UnsupportedVersion&) run generateLogout(), whose fill() reads the sender
-// seqnum before sendRaw()'s try, and the latter's incrNextTargetMsgSeqNum()
-// (or nextLogout()'s). An IOException thrown there escapes the network
-// thread: std::terminate. Must be evaluated before entering a try whose catch
-// asks the question (inside it, the store's own IOException is current).
+// IOException guard of their own: catch (UnsupportedVersion&) runs
+// incrNextTargetMsgSeqNum() (or nextLogout()'s) after generateLogout(). An
+// IOException thrown there escapes the network thread: std::terminate. (The
+// sender getter those handlers also read never throws at all.) Must be
+// evaluated before entering a try whose catch asks the question (inside it,
+// the store's own IOException is current).
 bool InQuickFixHandler() { return std::current_exception() != nullptr; }
 
 }  // namespace
@@ -639,6 +639,29 @@ void JsMessageStore::CheckSafeSeq(FIX::SEQNUM n, Factory::Method method,
   Throw(method, why);
 }
 
+// Session::persist() stores the message under the MsgSeqNum fill() stamped,
+// which is the next sender seqnum unless the cache moved in between: on a
+// poisoned store the stamp came from the cache and this call's Gate() then
+// reloaded it (a late write that landed) or retried a pending reset. Stored
+// and sent, the message would carry a number the store no longer agrees
+// with. Refused like a non-fatal adapter failure: IOException inside
+// sendRaw()'s try (nothing is sent) and a non-poisoning 'storeError'.
+void JsMessageStore::CheckStamp(FIX::SEQNUM seq) const {
+  FIX::SEQNUM next;
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    next = cache_.getNextSenderMsgSeqNum();
+  }
+  if (seq == next) return;
+  const std::string why =
+      "set(" + std::to_string(seq) + "): the message was stamped MsgSeqNum=" +
+      std::to_string(seq) + " but the next sender seqnum is now " +
+      std::to_string(next) + " (the cache was reloaded after the stamp); refused, not sent";
+  factory_.ReportError(id_, Factory::Method::kSetMessage, why, /*poisoned=*/false,
+                       /*late=*/false);
+  Throw(Factory::Method::kSetMessage, why);
+}
+
 void JsMessageStore::LogEvent(const std::string& text) const {
   if (factory_.OnJsThread()) return;
   FIX::Session* session = FIX::Session::lookupSession(id_);
@@ -680,9 +703,11 @@ void JsMessageStore::Gate(const char* what) const {
                            ": store poisoned (" + lastError_ + ")");
   }
   reloadInFlight_ = true;
+  const bool retryReset = pendingReset_;
+  const FIX::UtcTimeStamp resetTime = pendingResetTime_;
   lock.unlock();
   Factory::Method failed = Factory::Method::kLoad;
-  Factory::Outcome o = Reload(failed);
+  Factory::Outcome o = retryReset ? RetryReset(resetTime, failed) : Reload(failed);
   lock.lock();
   reloadInFlight_ = false;
   if (o.status != Factory::Status::kOk) {
@@ -700,7 +725,38 @@ void JsMessageStore::Gate(const char* what) const {
   poisoned_ = false;
   lastError_.clear();
   lock.unlock();
-  LogEvent("Message store reloaded: poison lifted");
+  LogEvent(retryReset ? "Message store: the failed reset was retried: poison lifted"
+                      : "Message store reloaded: poison lifted");
+}
+
+// The reset a failure left pending (see reset()), retried with its original
+// timestamp: a reload would restore the numbers QuickFIX meant to discard,
+// and the session would go on as if the reset had happened (a Logon with
+// ResetOnLogon=Y would leave with the old MsgSeqNum and no ResetSeqNumFlag).
+// Idempotent, so a timed-out reset that landed late is harmless to repeat. A
+// timed-out retry is an unsettled write like a timed-out reset().
+JsMessageStore::Factory::Outcome JsMessageStore::RetryReset(
+    const FIX::UtcTimeStamp& when, Factory::Method& failed) const {
+  Factory::Request r;
+  r.method = Factory::Method::kReset;
+  r.id = id_;
+  r.state.creationTime = when;
+  r.state.nextSender = 1;
+  r.state.nextTarget = 1;
+  Factory::Outcome o = factory_.Call(r);
+  if (o.status != Factory::Status::kOk) {
+    failed = Factory::Method::kReset;
+    o.error = "retrying the failed reset: " + o.error;
+    if (o.status == Factory::Status::kTimedOut) {
+      std::lock_guard<std::mutex> lock(mtx_);
+      ++unsettled_;
+    }
+    return o;
+  }
+  std::lock_guard<std::mutex> lock(mtx_);
+  cache_.reset(when);
+  pendingReset_ = false;
+  return o;
 }
 
 // load() through the bridge and apply it to the cache. A null result means
@@ -772,6 +828,7 @@ bool JsMessageStore::set(FIX::SEQNUM seq, const std::string& msg)
     EXCEPT(FIX::IOException) {
   CheckSafeSeq(seq, Factory::Method::kSetMessage, "set");
   Gate("setMessage");
+  CheckStamp(seq);
   Factory::Request r;
   r.method = Factory::Method::kSetMessage;
   r.a = seq;
@@ -791,18 +848,18 @@ void JsMessageStore::get(FIX::SEQNUM b, FIX::SEQNUM e,
   out = Forward(r, /*fatal=*/false).strings;
 }
 
-// Throws while poisoned (so the timer tick's fill() fails into its handler
-// and disconnects), except inside one of QuickFIX's own catch handlers (see
-// InQuickFixHandler()): generateLogout() reads it there before sendRaw()'s
-// try. Returning the cache is safe there: nothing reaches the wire without
-// persist(), whose set()/incrNextSenderMsgSeqNum() still throw inside
-// sendRaw()'s try.
+// Never throws (see the header): Session::fill() reads it outside sendRaw()'s
+// try, from generateLogout() in Session::reset() on the connect path
+// (setResponder(), no handler on the acceptor) and in QuickFIX's own catch
+// handlers. Like the other getters it still drives a reload attempt while
+// poisoned, then returns the cache. Nothing stamped with it reaches the wire
+// without persist(), whose writes throw inside sendRaw()'s try while the
+// store is poisoned, and set() refuses a stamp a reload has since moved
+// (CheckStamp()).
 FIX::SEQNUM JsMessageStore::getNextSenderMsgSeqNum() const EXCEPT(FIX::IOException) {
-  const bool inHandler = InQuickFixHandler();
   try {
     Gate("getNextSenderMsgSeqNum");
   } catch (const FIX::IOException&) {
-    if (!inHandler) throw;
   }
   std::lock_guard<std::mutex> lock(mtx_);
   return cache_.getNextSenderMsgSeqNum();
@@ -868,8 +925,21 @@ void JsMessageStore::setNextTargetMsgSeqNum(FIX::SEQNUM n) EXCEPT(FIX::IOExcepti
   cache_.setNextTargetMsgSeqNum(n);
 }
 
+// Session::persist() calls it right after set(), or alone with
+// PersistMessages=N. In the latter case there is no MsgSeqNum to check (see
+// CheckStamp()): a store poisoned on entry means the message was stamped from
+// the cache of a poisoned store, so it is refused even if this call's reload
+// lifts the poison.
 void JsMessageStore::incrNextSenderMsgSeqNum() EXCEPT(FIX::IOException) {
+  const bool wasPoisoned = Poisoned();
   Gate("incrNextSenderMsgSeqNum");
+  if (wasPoisoned) {
+    const std::string why =
+        "the message was stamped while the store was poisoned; refused, not sent";
+    factory_.ReportError(id_, Factory::Method::kSetSeqNums, why, /*poisoned=*/false,
+                         /*late=*/false);
+    Throw(Factory::Method::kSetSeqNums, why);
+  }
   FIX::SEQNUM next;
   {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -928,7 +998,14 @@ void JsMessageStore::reset(const FIX::UtcTimeStamp& now) EXCEPT(FIX::IOException
     cache_.reset(now);
   } catch (const FIX::IOException&) {
     // Never throws into QuickFIX (see the header): the failure has been
-    // recorded (poison + storeError) by Gate()/Forward().
+    // recorded (poison + storeError) by Gate()/Forward(). The reset itself
+    // is remembered: the poison lifts only once Gate() has retried it
+    // (RetryReset()), never through a plain reload of the old numbers.
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (poisoned_) {
+      pendingReset_ = true;
+      pendingResetTime_ = now;
+    }
   }
 }
 
@@ -989,9 +1066,15 @@ std::string JsMessageStore::LastError() const {
   return lastError_;
 }
 
+// Not clamped at 0: the waiter counts its timed-out write (Poison(), or
+// Reload()/RetryReset() for create()/reset) only after Call() returned, so a
+// settlement racing that window arrives first and takes the counter to -1;
+// the increment then brings it back to 0. Every kExpired fatal call is
+// counted exactly once (CallDirect() never times out; teardown's ForceFulfil()
+// leaves nothing late), so the count is exact once both have run.
 void JsMessageStore::OnLateSettlement(Factory::Method /*method*/, bool /*fulfilled*/) {
   std::lock_guard<std::mutex> lock(mtx_);
-  if (unsettled_ > 0) --unsettled_;
+  --unsettled_;
 }
 
 }  // namespace napi_quickfix
