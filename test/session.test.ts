@@ -829,4 +829,45 @@ StartDay=Monday
       await engine.stop();
     }
   });
+
+  test("a peer's Logout disconnects the initiator once: one 'logout', no Logon generated without a connection", async () => {
+    // QuickFIX v1.16.0 ticks a session whose connection was just dropped
+    // (SocketInitiator::onTimeout() runs before the drop is processed): with
+    // no responder and sentLogon cleared, Session::next() generated a Logon,
+    // persisted it under a fresh MsgSeqNum it never sent, and the real
+    // disconnect that followed fired onLogout a second time. Patched in
+    // CMakeLists.txt.
+    const port = await freePort();
+    // No reconnect within the test: its Logon would advance the counters.
+    const iniCfg = initiatorCfg(port).replace('ReconnectInterval=1', 'ReconnectInterval=30');
+    const acc = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
+    const ini = new Initiator({ settings: SessionSettings.fromString(iniCfg), store: 'memory', log: 'none' });
+    let logouts = 0;
+    ini.on('logout', () => logouts++);
+    try {
+      const logons = Promise.all([
+        waitForEvent(ini, 'logon', 'initiator logon', HANDSHAKE_TIMEOUT_MS),
+        waitForEvent(acc, 'logon', 'acceptor logon', HANDSHAKE_TIMEOUT_MS),
+      ]);
+      await acc.start();
+      await ini.start();
+      await logons;
+      await acc.getSession(ACC_ID)!.logout('peer logout');
+      assert.ok(await waitUntil(() => logouts > 0, HANDSHAKE_TIMEOUT_MS), "the initiator saw the peer's Logout");
+      // The orphan Logon and the second 'logout' came within one network
+      // thread tick (1 s) of the first.
+      await new Promise((r) => setTimeout(r, 2500));
+      assert.equal(logouts, 1, "one 'logout' per disconnect");
+      // The acceptor received every message the initiator numbered: no
+      // sequence number went to a message that never reached the wire.
+      assert.equal(
+        ini.getSession(INI_ID)!.getExpectedSenderNum(),
+        acc.getSession(ACC_ID)!.getExpectedTargetNum(),
+        'the initiator numbered no message it did not send',
+      );
+    } finally {
+      await ini.stop(true);
+      await acc.stop(true);
+    }
+  });
 });

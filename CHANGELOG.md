@@ -9,7 +9,8 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
-Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
+Bundles **QuickFIX v1.16.0** (statically linked, with one upstream fix carried: see
+"Fixed").
 
 ### Added
 
@@ -113,11 +114,21 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   From then on the exiting engines run no handler and act on nothing a handler has not
   seen: an outbound message is neither stored nor sent, an inbound one is not consumed
   (see "Process exit" in the README).
+- An initiator whose session was disconnected by an inbound message (a peer's Logout,
+  a failed store write) generated a Logon with no connection to send it on, stored it
+  under a fresh `MsgSeqNum` that never reached the wire (the peer saw a gap and had to
+  gap-fill it), and emitted `'logout'` twice for the one disconnect. A QuickFIX v1.16.0
+  bug with any store: the engine ticks the session once more before it has processed
+  the dropped connection. With a `MessageStoreAdapter` whose store was poisoned, that
+  tick also retried `load()` several times on the engine's single network thread,
+  stalling every other session of the engine for as long. The build now carries the
+  one-line upstream fix (no Logon without a connection).
 
 ### Known QuickFIX limitations
 
 Two file-descriptor leaks found by the same audit are in QuickFIX itself and are not
-patched by this binding (it never patches QuickFIX; see `ARCHITECTURE.md`):
+patched by this binding (it carries a single upstream fix, see "Fixed" and
+`ARCHITECTURE.md`):
 
 - An `Acceptor` whose `start()` fails because its port is already bound leaks the
   listening socket it created (`socket_createAcceptor` returns without closing it on a

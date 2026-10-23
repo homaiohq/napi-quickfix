@@ -94,6 +94,17 @@ flowchart LR
 Key detail: QuickFIX ships headers **flat** in `src/C++/*.h` but code includes them as `quickfix/Message.h`, so
 `CMakeLists.txt` copies them into a generated `quickfix/` include tree at configure time (Windows-safe, no symlinks).
 
+**The one upstream fix carried.** QuickFIX v1.16.0 generates and persists a Logon for an initiator session whose
+connection was just dropped (`Session::disconnect()` only queues the socket for `SocketMonitor::drop()`, and
+`SocketInitiator::onStart()` ticks every connection through `onTimeout()` before the drop is processed), then fires
+`onLogout` twice. With a `MessageStoreAdapter` it is also costly: each store call of that extra tick retries the
+poisoned store's `load()` on the engine's only network thread, stalling every other session. `CMakeLists.txt` adds
+`&& m_pResponder` to the guard in `Session::next()`. It edits `${quickfix_SOURCE_DIR}/src/C++/Session.cpp` at
+configure time, not through a FetchContent `PATCH_COMMAND`, which is skipped for a source tree restored from the CI
+cache or given through `FETCHCONTENT_SOURCE_DIR_QUICKFIX`; the edit is idempotent, and the configure fails if the
+anchor line is gone (a new pin: drop the patch if upstream has the guard). This is the only change to QuickFIX's
+sources; anything else upstream does wrong is worked around in the binding or documented.
+
 ---
 
 ## 3. Module loading (dual ESM + CJS)
@@ -352,7 +363,7 @@ onto its dropped queue with **no lock**, while the engine's network thread itera
 `SocketMonitor::block()`. QuickFIX only ever calls them from that thread itself (timeouts, logout handling,
 remote disconnects); from any other thread they are a data race with a crash window of a few instructions
 (upstream quickfix/quickfix#346, closed "not planned"). There is no public hook to run code on the network thread,
-and this binding does not patch QuickFIX, so the supported way to bring a session down is `logout()` — exactly
+and this binding does not carry a patch for it (it carries exactly one, see §2), so the supported way to bring a session down is `logout()` — exactly
 what `Initiator::stop()` itself does — and to renumber it, the sequence-number setters.
 
 **Lifetime.** `FIX::Session` objects are owned by the engine and `FIX::Session::lookupSession` returns a raw,

@@ -89,6 +89,15 @@ Watch the configure step: it should log a git checkout of the **new** tag. If
 the fetch itself fails (bad tag, network), fix that before anything else — the
 tag may not exist or you normalized it wrong.
 
+The configure step also applies the one upstream fix the build carries (the
+`m_pResponder` guard on `generateLogon()` in `Session::next()`, see the block
+after `FetchContent_MakeAvailable` in `CMakeLists.txt`). If it fails with "the
+line the no-responder Logon patch applies to was not found", read the new
+`src/C++/Session.cpp`: if upstream now has an equivalent guard, delete the
+block (and say so in the CHANGELOG's provenance line); otherwise re-anchor it.
+Either way the regression test "a peer's Logout disconnects the initiator once"
+in `test/session.test.ts` must still pass.
+
 Once the fetch has landed, regenerate the typed `FIELD` table and the value
 groups (`MsgType`, `Side`, `ExecType`, ... plus the `VALUES` tree) from the new
 sources and rebuild the TypeScript so the checked-in files track the pin:

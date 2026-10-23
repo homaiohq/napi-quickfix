@@ -28,6 +28,39 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(quickfix)
 
+# Carry one upstream fix until QuickFIX ships it: never generate a Logon for a
+# session that has no connection. Session::disconnect() only queues the socket
+# for SocketMonitor::drop(), and SocketInitiator::onStart() calls onTimeout()
+# after every block(), before the drop is processed, so a session just
+# disconnected by an inbound message (a peer's Logout, a store failure) is
+# ticked once more with no responder and sentLogon cleared: Session::next()
+# generates a Logon, sendRaw() persists it under a fresh MsgSeqNum and send()
+# drops it, and the real onDisconnect() then fires onLogout a second time.
+# test/session.test.ts covers it.
+#
+# Applied here, at configure time, rather than as a FetchContent
+# PATCH_COMMAND: that step is skipped for a source tree restored from a cache
+# or given through FETCHCONTENT_SOURCE_DIR_QUICKFIX. Idempotent, and the file
+# is rewritten only when it changes (no needless rebuild). When the pin moves,
+# the anchor must still be found or the configure fails: drop the patch if the
+# new release has the guard.
+set(_qf_session_cpp "${quickfix_SOURCE_DIR}/src/C++/Session.cpp")
+set(_qf_unpatched "if (m_state.shouldSendLogon() && isLogonTime(now)) {")
+set(_qf_patched "if (m_state.shouldSendLogon() && isLogonTime(now) && m_pResponder) {")
+file(READ "${_qf_session_cpp}" _qf_source)
+string(FIND "${_qf_source}" "${_qf_patched}" _qf_at)
+if(_qf_at EQUAL -1)
+  string(FIND "${_qf_source}" "${_qf_unpatched}" _qf_at)
+  if(_qf_at EQUAL -1)
+    message(FATAL_ERROR
+      "${_qf_session_cpp}: the line the no-responder Logon patch applies to "
+      "was not found. See the comment above this check in CMakeLists.txt.")
+  endif()
+  string(REPLACE "${_qf_unpatched}" "${_qf_patched}" _qf_source "${_qf_source}")
+  file(WRITE "${_qf_session_cpp}" "${_qf_source}")
+  message(STATUS "QuickFIX: patched Session.cpp (no Logon without a responder)")
+endif()
+
 # Give musl the same clock as glibc. QuickFIX picks its clock in
 # src/C++/FieldTypes.cpp:
 #     #if defined(_POSIX_SOURCE) || defined(HAVE_GETTIMEOFDAY)   -> gettimeofday, us
