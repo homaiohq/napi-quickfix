@@ -35,7 +35,8 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   rounded value. `MapMessageStore` (in-memory
   reference implementation) is exported; README "Message store" has the threading and
   latency contract (bound in-flight sends; an adapter must not depend on the libuv
-  threadpool).
+  threadpool; keep one session's writes in call order, since a timed-out `setMessage`
+  can still commit after the retry's write on a connection pool).
 - `.agents/skills/custom-message-store`: an agent skill for writing a custom
   `MessageStoreAdapter` (the contract as sourced rules, the column mapping onto
   QuickFIX v1.16.0's `sessions`/`messages` tables for interop with links to the

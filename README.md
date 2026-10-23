@@ -675,8 +675,15 @@ the session log.
   makes `sendToTarget()` resolve `false` (nothing was sent, the sequence number
   is reused by the next send: hence the upsert), and a failed `getMessages`
   makes the engine disconnect so the peer reconnects and re-requests — QuickFIX's
-  own behaviour. A `setMessage` that settles after its timeout is simply a
-  late upsert.
+  own behaviour. A `setMessage` that settles after its timeout is not reported,
+  but its write still lands, and nothing holds back the session's next call
+  meanwhile: on a connection pool the late write can commit *after* the retry's
+  write for the same sequence number, and a later resend of that number then
+  delivers the message whose send resolved `false`. Keep one session's writes
+  in call order (a per-session queue in front of the adapter, or one connection
+  per session), and settle a Promise only once the database is done with the
+  statement (a server-side `statement_timeout`, not a client-side query timeout
+  that rejects while the statement still commits).
 - `setSeqNums` and `reset` failing, timing out or settling **late** (after the
   timeout already failed the call), and `load` (a `refresh`) failing or timing
   out, **poison** the session's store. The engine cannot know whether a rejected
