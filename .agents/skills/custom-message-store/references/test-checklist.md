@@ -112,9 +112,14 @@ Additional adapter-level checks worth a line each:
 - **1.12 Two adapters, one database.** Create two adapter instances over the
   same backend; what one writes the other loads. (The engine reads only through
   the adapter it was given, but this catches per-instance caches, G2.)
-- **1.13 Rejection shape.** Point the adapter at an unreachable backend: every
-  method must reject (or throw) within your driver's timeout, which must be
-  shorter than `storeTimeoutMs` (I2). None may hang, none may resolve.
+- **1.13 Rejection shape (nothing sent).** Point the adapter at a backend that
+  refuses connections (a closed port) or rejects the password: every method
+  must reject (or throw) within your connect/checkout timeout, which must be
+  shorter than `storeTimeoutMs` (I2). None may hang, none may resolve. If your
+  adapter connects when it is constructed, construct it against a healthy
+  backend first and stop the backend afterwards; it must still reject per
+  call, and recover once the backend is back. (A backend that accepts the
+  connection and then stops answering is 3.5 and 3.7, not this.)
 - **1.14 Concurrency across sessions.** Fire 50 interleaved `setMessage`/
   `setSeqNums` calls for 5 different sessions concurrently; afterwards each
   session's `load()` and `getMessages()` must match what the oracle holds (H1).
@@ -326,12 +331,18 @@ an array your listener fills) instead of asserting on it right after
   exit within the timeout plus a margin, and kills it otherwise). Then the same
   with an explicit `process.exit(1)` while the send is parked: it must exit at
   once.
-- **3.5 Driver timeouts beat the engine timeout.** Point the adapter at a
-  black-holed address (e.g. a firewall-dropped port) and confirm each method
-  rejects before `storeTimeoutMs` elapses (I2).
+- **3.5 A black hole, two ways (I2).** (a) At connect time: point a fresh
+  adapter at a firewall-dropped address (nothing answers the SYN): each method
+  rejects before `storeTimeoutMs` elapses, through the connect/checkout
+  timeout. (b) Mid-statement: with the adapter connected, freeze the server
+  (`docker pause`, `kill -STOP` of the server process) while a write is in
+  flight: the call must NOT reject before the server is back (the engine times
+  it out: `'storeError'` "timed out"); after the thaw it settles, and the row
+  then holds what the engine's later calls wrote, never the frozen write's
+  value over a newer one.
 - **3.6 A late `setMessage` must not overwrite a newer one (D7).** The stall
   has to sit BELOW the candidate's own ordering, in its driver: wrapping the
-  candidate in `ControlledStore` would park the call before the candidate's
+  candidate in the `faulty()` wrapper above would park the call before the candidate's
   FIFO ever sees it. Wrap the candidate's backend call (its `execute`, its pool
   client, ...) so the first write whose parameters contain `11=A` waits on a
   Promise you release by hand; `storeTimeoutMs: 300`. Then:
@@ -343,6 +354,26 @@ an array your listener fills) instead of asserting on it right after
   held A and the acceptor's `fromApp` received A with `PossDupFlag=Y`. With a
   per-session FIFO, `send(B)` failed (queued behind A), A then B landed in
   order, `send(C)` succeeded, and the row held C.
+- **3.7 A statement the client gave up on must not commit after newer writes
+  (I2, D7).** 3.6 stalls inside your process; this one stalls on the wire,
+  where a client-side timeout cannot see it. Put a TCP proxy between the
+  adapter and a real server (~40 lines of `node:net`: pipe both ways, and a
+  switch that holds, per connection, the client-to-server bytes in a buffer
+  instead of forwarding them, and flushes them on release). Hold one pool
+  connection's bytes, then:
+  - *the D7 repro*: `send(A)` parks on that connection and the engine times it
+    out (`storeTimeoutMs: 300`); `send(B)`; release the bytes; `send(C)`;
+    then a 2.7 resend from A's seqnum must not deliver A;
+  - *the seqnum regression*: let a `setSeqNums` park the same way, let the
+    session go on (it reconnects after the poison), release the bytes, then
+    `kill -9` the process and restart it on the same rows: the peer must not
+    answer the Logon with "MsgSeqNum too low".
+
+  `[trial]`: an adapter with a client-side `query_timeout` above the server's
+  `statement_timeout` failed both, 3/3 each (A delivered with
+  `PossDupFlag=Y`; the row moved from `12/4` back to `5/3`, then "expecting 12
+  but received 8"). Ending the backend and confirming it gone before
+  rejecting (contract I2) passed both.
 
 ## 4. Interop (only when targeting QuickFIX C++ tables)
 

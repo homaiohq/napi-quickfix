@@ -345,15 +345,18 @@ against two engines owning one session, which G3 already rules out
 operationally, and each adds failure modes of its own: a clock behind the
 previous writer's refuses every legitimate write (poison), a conditional
 `load()` becomes a write. (Observed in this skill's own evaluation runs, where
-fences were added unasked; derived.) The FIFO only orders what your Promises report, so the Promise
-must settle when the backend is done with the statement: a client-side
-timeout (`pg` `query_timeout`, `mysql2` `timeout`) rejects while the statement may still
-commit on the server; prefer a server-side limit (`statement_timeout`) that
-aborts the statement before the Promise rejects. Where the backend has no such
-limit (HTTP APIs such as DynamoDB, which may still apply a request the client
-aborted), a client-side abort leaves the outcome unknown and the window open:
-set the abort well above the backend's normal latency so it stays rare, and
-document the residual window instead of claiming late writes are impossible. The same reasoning covers a
+fences were added unasked; derived.) The FIFO only orders what your Promises
+report, so a Promise must settle only once nothing more can land: a server
+error is final, but a client-side timeout or a dropped connection after the
+statement was sent leaves it alive on the server, and it commits after the
+FIFO has moved on (`[trial]`: the probe below happened for real, I2). I2 has
+the rule and the per-server recipe (end the backend and confirm before
+rejecting; stay pending while the server is unreachable). Where the backend
+offers no way to end a request (HTTP APIs such as DynamoDB, which may still
+apply a request the client aborted), the outcome of an aborted call is unknown
+and the window stays open: set the abort well above the backend's normal
+latency so it stays rare, and document the residual window instead of
+claiming late writes are impossible. The same reasoning covers a
 late `setMessage` landing after a `reset()` of that session (it would leave a
 stale old-epoch row): the FIFO runs it before the reset's DELETE, and a
 `setSeqNums` whose Promise rejected while its statement kept running (I2).
@@ -671,19 +674,64 @@ be reloaded, hence cannot recover, until that Promise settles. Sources:
 `[js_message_store.cpp]` `Call()` (`kTimedOut`), `Gate()` (`unsettled_ > 0` →
 "a timed-out write has not settled yet"); `[store.test]` "setSeqNums timeout
 then late resolve ..." (`'no reload before the late write settled'`).
-Recommendation (derived): give your driver statement/connect/acquire timeouts
-SHORTER than `storeTimeoutMs`, so you reject instead of timing out: a rejection
-is settled, and the poison can lift on the very next call. Prefer limits the
-SERVER enforces (PostgreSQL `statement_timeout`, `lock_timeout`) to a
-client-side one (`pg` `query_timeout`, `mysql2` `timeout`): a client-side
-timeout rejects your Promise while the statement may still run and commit on
-the server. The engine's protection against late writes (no reload while a
-timed-out `setSeqNums`/`reset` is unsettled, I4) trusts your Promise: once it
-has rejected, the engine reloads and moves on, and a statement still running
-on the server can then commit AFTER newer writes: an old `nextSender` written
-over a newer one (sequence numbers reused after the next restart), or the
-D7 failure for `setMessage`. Settle only when the backend is done with the
-statement, and keep per-session writes in call order (D7).
+**Settle only when the outcome is final.** The engine's protection against
+late writes (no reload while a timed-out `setSeqNums`/`reset` is unsettled,
+I4) and the per-session FIFO (D7) both trust your Promise: once it has
+settled, the engine reloads and moves on, the FIFO starts the next call, and a
+statement still alive on the server can then commit AFTER newer writes. Sort
+every failure by what the server told you:
+
+| Failure | Outcome | What to do |
+| --- | --- | --- |
+| Nothing was sent: the checkout, the connect or the authentication failed (`ECONNREFUSED`, a pool acquire timeout, a password error) | nothing can land | reject at once |
+| The server answered with an error (`pg`: an `instanceof DatabaseError`, e.g. `57014` from `statement_timeout`, `55P03` from `lock_timeout`, a constraint violation) | final: the statement is dead | reject at once |
+| The statement was written to the socket and no answer came: a client-side timeout (`pg` `query_timeout`, `mysql2` `timeout`, an `AbortSignal`), `ECONNRESET`, "Connection terminated" | **unknown**: the statement may still be queued or running, and may commit later | do NOT settle yet: destroy the connection, then make the server end its backend and confirm it is gone (below), and only then reject. While the server cannot be reached, leave the Promise pending |
+
+The middle row is why a server-side limit (`statement_timeout`,
+`lock_timeout`) is the right timeout: it ends the statement and tells you so.
+A client-side timeout "above the server's, as a backstop" is NOT safe: it
+fires exactly when the server is unreachable (frozen, paused, black-holed
+network), the moment the statement's bytes may sit in a socket buffer, and the
+server executes and commits it after the thaw. `[trial]`: against a frozen
+server, two `setMessage` INSERTs that the client had rejected committed 9-12 s
+later; with one connection's bytes held by a proxy, a rejected
+`setMessage(n, A)` committed after `B` went out as `n`, and a resend of `n`
+delivered A with `PossDupFlag=Y` (D7, 3/3); a rejected `setSeqNums` UPDATE
+committed late and moved the row from `12/4` back to `5/3`, behind the wire,
+and after a `kill -9` and restart the peer answered "MsgSeqNum too low,
+expecting 12 but received 8" (3/3). Both repros are scenario 3.7 of
+`test-checklist.md`.
+
+How to confirm the backend is gone, per server (PostgreSQL was verified in the
+`[trial]` on every fault scenario; the others are the same recipe through
+their documented commands, derived):
+
+- **PostgreSQL**: note `client.processID` (the backend pid, set once `pg`
+  connected) before each statement. On an unknown outcome, destroy the client
+  (`release(err)` for a pool client), then from ANOTHER connection run
+  `SELECT pg_terminate_backend($1)` and poll `SELECT 1 FROM pg_stat_activity
+  WHERE pid = $1` until it returns no row; then reject. Terminating a backend
+  rolls back its open transaction, and an autocommit statement either
+  committed before (the row shows it, a reload reads it) or never will. The
+  role needs to be the backend's own or a member of `pg_signal_backend`.
+- **MySQL/MariaDB**: note `connection.threadId`; `KILL <id>` from another
+  connection, then poll `SELECT 1 FROM information_schema.PROCESSLIST WHERE
+  ID = ?` until empty.
+- **SQL Server**: note `@@SPID` at connect; `KILL <spid>`, then poll
+  `sys.dm_exec_sessions` for it.
+
+The trade-off, to document for your operators: under a full outage (the
+server unreachable, not just slow) the call stays pending until the server can
+confirm the kill, so the engine's `storeTimeoutMs` ends it as a timeout, the
+session stays poisoned (for `setSeqNums`/`reset`, I4) or queues behind it (the
+FIFO, D7) until then. That is the correct outcome: the alternative is a write
+that may land under a number the engine has already reused.
+
+Driver limits still go SHORTER than `storeTimeoutMs`, but count them per
+call, not per limit: the bound of one call is checkout/connect + statement
+(+ the kill-and-confirm step when the outcome is unknown), and that sum must
+stay below `storeTimeoutMs`, or a healthy-but-slow call becomes a timeout.
+(Derived; `[trial]`.)
 
 **I3. Severity by method**
 
@@ -746,9 +794,26 @@ recovery, make `load()` and `reset()` work first; `reset()` must be idempotent
 **I5. Do not retry for long inside a call.** Internal retries consume
 `storeTimeoutMs` while an engine thread is parked, and with one network thread
 per engine that freezes heartbeats of EVERY session of that engine. Fail fast
-and let the engine's policy (I3) do its work. Source: `[README]` "Timeout"
-("a longer timeout freezes heartbeats of *every* session of the engine ... when
-the adapter stalls"). (Derived recommendation.)
+when nothing was sent or the server answered (I2), and let the engine's policy
+(I3) do its work. "Fail fast" never means settling an unknown outcome early
+(I2). Source: `[README]` "Timeout" ("a longer timeout freezes heartbeats of
+*every* session of the engine ... when the adapter stalls"). (Derived
+recommendation.)
+
+The reload that lifts a poison runs on the engine's network thread, before the
+store call that triggered it, and while a session stays poisoned every store
+call of that session tries it again. So a slow failure costs the WHOLE engine:
+`[trial]`, a `load()` that failed after 800 ms (a connect timeout) on one
+session kept a healthy session of the same engine from processing its inbound
+TestRequest until the database came back, and a 2 s `load()` delayed a
+bystander's inbound messages by 8 s. The stall is roughly `load()` latency ×
+store calls per tick × poisoned sessions. Keep the connect timeout of the
+reload path (and the checkout timeout) far below `HeartBtInt`, and make
+`load()` fail fast when the server refuses connections. A fast failure has the
+opposite cost: `[trial]`, 18,000-40,000 `load()` attempts during a 20 s server
+stop (about 850/s); the engine does not pace them, so an adapter that opens a
+connection per attempt should rate-limit its reconnects (reject at once while
+a reconnect is cooling down).
 
 **I6. Never swallow a failed write.** Returning normally after a write that did
 not land is the one unrecoverable error: the engine's cache advances (C5) and

@@ -218,9 +218,15 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
 - **Errors (I).** Throw or reject; never hang. `storeTimeoutMs` (default 30 s)
   bounds every call (`0` disables it); a timed-out `setSeqNums`/`reset` blocks
   recovery until it settles (never settles: poisoned until `stop()`), so give
-  the driver shorter timeouts than `storeTimeoutMs`, enforced
-  by the server (`statement_timeout`) rather than the client: a Promise that
-  rejects while the statement still commits defeats the engine's ordering.
+  the driver shorter timeouts than `storeTimeoutMs`, enforced by the server
+  (`statement_timeout`, `lock_timeout`). **Settle only a final outcome**: reject
+  at once when nothing was sent or the server answered with an error; when a
+  statement was sent and no answer came (a client-side timeout, a dropped
+  connection), its outcome is unknown and it can still commit: end the backend
+  from another connection and confirm it is gone before rejecting, and stay
+  pending while the server is unreachable (I2). A client-side query timeout
+  "above the server's, as a backstop" is exactly the bug: against a frozen
+  server it rejects, and the statement commits after the thaw.
   Poison = the session's writes fail until the next call after all late
   writes settled has reloaded through `load()`. A reload that succeeds at once
   (a plain rejection) lifts it with the session still up; while it cannot, the
@@ -366,9 +372,15 @@ engine.on('storeError', (sessionID, method, error, poisoned) => {
 });
 ```
 
-- Give the driver connect/acquire/statement timeouts shorter than
-  `storeTimeoutMs`, so failures are rejections (settled) rather than timeouts
-  (unsettled, which delay recovery).
+- Give the driver connect/acquire timeouts and a SERVER-side statement limit
+  (`statement_timeout`, `lock_timeout`), so failures are rejections (settled)
+  rather than timeouts (unsettled, which delay recovery). They add up: one
+  call costs checkout/connect + statement (+ the kill-and-confirm step of an
+  unknown outcome), and that sum must stay below `storeTimeoutMs`. No
+  client-side query timeout as a backstop; on an unknown outcome follow
+  contract I2 (PostgreSQL: `pg_terminate_backend(client.processID)` from
+  another connection, poll `pg_stat_activity` until the pid is gone, then
+  reject).
 - Warm the connection pool before `Initiator.create()` and keep a minimum pool
   size: a reconnect inside a store call needs `dns.lookup`, which needs a libuv
   threadpool slot that may be parked in another store write.
@@ -413,9 +425,9 @@ export function serialisePerSession(inner: MessageStoreAdapter): MessageStoreAda
 ```
 
   The order it enforces is the order your Promises report: settle only when
-  the backend is done with the statement (server-side `statement_timeout`,
-  not a client-side query timeout that rejects while the server still
-  commits).
+  the backend is done with the statement (a server answer, or a backend you
+  ended and saw gone; contract I2), never on a client-side timeout that
+  rejects while the server still commits.
 
 ## Pitfalls checklist
 
@@ -440,8 +452,12 @@ Before declaring the adapter done, confirm each of these explicitly:
    `crypto`, or a pool-using native addon.
 9. No store method awaits `session.*()`, `sendToTarget()` on that session, or
    `engine.stop()`.
-10. Every method rejects within the driver timeout when the backend is down;
-    none hangs past `storeTimeoutMs`.
+10. Every method rejects at once when the backend refuses connections or
+    answers with an error, within checkout + statement limits that sum below
+    `storeTimeoutMs`. A call whose statement was sent and got no answer is
+    rejected only after the backend was ended and confirmed gone; while the
+    server is unreachable it stays pending (the engine times it out). No
+    client-side query timeout settles a call (test 3.7).
 11. Seqnums returned from the backend are converted to safe-integer `number`s.
 12. `close()` does not tear down a pool another engine or session still uses.
 13. Two sessions whose CompIDs differ only by case get two rows (MySQL and
@@ -459,7 +475,7 @@ Before declaring the adapter done, confirm each of these explicitly:
     condition, no reject on a decrease: test 1.15).
 18. A late write cannot overtake a newer one for the same session: one
     connection per session, or the `serialisePerSession` wrapper, with
-    server-side statement timeouts (test 3.6).
+    server-side statement timeouts (tests 3.6, 3.7).
 19. `getMessages` returns one entry per seqnum, the last written, even after
     many rewrites; `begin = 0` works (test 1.16).
 20. `reset` deletes every message of the session, including numbers above the

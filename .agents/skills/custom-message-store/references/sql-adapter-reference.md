@@ -343,9 +343,14 @@ Two things the adapter did NOT do, which a production copy should consider:
 - It did not reject a `setSeqNums` that updated zero rows (contract C3). With
   `pg`, `result.rowCount === 0` is available; with `mysql2`,
   `result.affectedRows`.
-- It did not set statement timeouts (contract I2); do that on the pool
-  (`statement_timeout` for PostgreSQL, `MAX_EXECUTION_TIME` / connect timeouts
-  for MySQL), shorter than `storeTimeoutMs`.
+- It did not set timeouts (contract I2); do that on the store's pool
+  (`statement_timeout`, `lock_timeout` and `connectionTimeoutMillis` for
+  PostgreSQL; `connectTimeout` and `innodb_lock_wait_timeout` for MySQL, whose
+  `max_execution_time` covers `SELECT`s only), checkout + statement together
+  shorter than `storeTimeoutMs`. And it settles whatever `execute` reports: an
+  `execute` built on a client-side query timeout rejects while the statement
+  may still commit. Settle only a final outcome (contract I2: end the backend
+  and confirm it gone before rejecting an unanswered statement).
 
 ## Known defects (found by running it against upstream's stores, 2026-10-23)
 
