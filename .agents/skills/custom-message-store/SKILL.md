@@ -19,7 +19,8 @@ upstream tables' columns really mean. This skill is that knowledge, sourced.
 `feat/js-message-store` @ `f802818` (`src/store.ts`, `cpp/js_message_store.{h,cpp}`,
 `README.md` "Message store", `ARCHITECTURE.md` §4b/§5, `test/store.test.ts`,
 `test/store-adapters.ts`, and that revision's SQL adapter test, whose `contract()`
-is reproduced as section 1 of `references/test-checklist.md`), and QuickFIX C++
+section 1 of `references/test-checklist.md` extends: begin > end, gaps, numeric
+order, seqnums at 2^40), and QuickFIX C++
 **v1.16.0**
 (the tag `CMakeLists.txt` pins). Every rule in the references cites one of them;
 when the skill and a newer repository disagree, the repository wins: re-read the
@@ -129,8 +130,8 @@ is unclear: it is the oracle the test checklist compares against.
 | each inbound message | `setSeqNums(id, sender, target+1)` | network thread | After your `fromApp` handler ran |
 | peer's ResendRequest | `getMessages(id, begin, end)` | network thread | Range already bounded by the engine |
 | `ResetOnLogon=Y`, `ResetOnLogout=Y`, `ResetOnDisconnect=Y`, a Logon sent or received with `ResetSeqNumFlag=Y`, session-time rollover (there is no JS-side `reset()`: `setNextSenderMsgSeqNum()` / `setNextTargetMsgSeqNum()` reach the adapter as `setSeqNums`) | `reset(id, {now, 1, 1})` | network thread (a `sendToTarget()` worker only if the application itself sends a Logon carrying `ResetSeqNumFlag=Y`, `Session.cpp:559-567`) | Never fatal to QuickFIX; failure poisons |
-| `RefreshOnLogon=Y`, `session.refresh()`, and the reload that lifts a poisoned store | `load(id)` | network thread / worker | `null` means "nothing to apply" |
-| `await engine.stop()` | `close(id)` once per session, after the sessions are destroyed | JS | Not called when the engine is dropped without `stop()` |
+| `RefreshOnLogon=Y`, `session.refresh()`, and the reload that lifts a poisoned store | `load(id)`, then `create(id, {now, 1, 1})` if it returned `null` | network thread / worker | `null` means the row is gone: the numbering restarts at `1/1`, as upstream's `refresh()` does |
+| `await engine.stop()` | `close(id)` once per session, after the sessions are destroyed | JS | Also when `create()` rejects after building the engine (constructor-time `reset()` failed); not when the engine is dropped without `stop()` |
 
 For one session the engine never overlaps two calls (it holds
 `SessionState::m_mutex` across each); different sessions and engines run
@@ -149,7 +150,8 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   CheckSum on every resend, and one changed byte aborts the resend of the
   whole range and wedges the session (A8). Sessions are independent.
 - **`load` / `create` (B).** `load` returns `null` for an unknown session and
-  never creates; it is also the refresh and the recovery read. `create` inserts.
+  never creates; it is also the refresh and the recovery read, where `null`
+  (row gone) makes the engine `create` a `1/1` row. `create` inserts.
   A malformed state is a `TypeError` at startup, an `IOException` later.
 - **`setSeqNums` (C).** Both numbers, every call, one write by primary key;
   fatal on failure (poison). Resolve after commit. **No monotonic guard**: the
@@ -165,7 +167,8 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   number given; the engine trusts tag 34 inside the string (D8).
 - **`getMessages` (E).** Inclusive `[begin, end]`, ascending **numerically**,
   gaps omitted, **exactly one entry per seqnum (the last written)**, `[]` when
-  none (also when `begin > end` or `begin` is 0), strings only. Order and
+  none (also when `begin > end`), strings only; never throw on `begin = 0`,
+  answer it as `[1, end]`. Order and
   uniqueness are load-bearing: the engine gap-fills between consecutive
   entries, so a reversed list silently drops every message in the range and a
   duplicate produces backwards `SequenceReset`s (E2, E10). An append-only or
@@ -192,15 +195,17 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   `UV_THREADPOOL_SIZE`. Never await an engine operation on the same session
   from inside a store method.
 - **Errors (I).** Throw or reject; never hang. `storeTimeoutMs` (default 30 s)
-  bounds every call; a timed-out `setSeqNums`/`reset` blocks recovery until it
-  settles, so give the driver shorter timeouts than `storeTimeoutMs`, enforced
+  bounds every call (`0` disables it); a timed-out `setSeqNums`/`reset` blocks
+  recovery until it settles (never settles: poisoned until `stop()`), so give
+  the driver shorter timeouts than `storeTimeoutMs`, enforced
   by the server (`statement_timeout`) rather than the client: a Promise that
   rejects while the statement still commits defeats the engine's ordering.
   Poison = the session's writes fail, the engine disconnects it, and the next
   call after all late writes settled reloads through `load()`; QuickFIX
   reconciles with the peer at the next logon.
-- **`close` (J).** Optional, per session, after `stop()`; not a durability
-  hook; do not close a pool shared with other engines from it.
+- **`close` (J).** Optional, per session, after `stop()` (and when `create()`
+  rejects after building the engine); not a durability hook; do not close a
+  pool shared with other engines from it.
 
 ## Data model: SQL and non-SQL
 
@@ -214,7 +219,8 @@ messages      : key(begin, sender, target, qualifier, seqNum) -> wireString
 **SQL.** Use the upstream layout (tables `sessions` and `messages`,
 `references/upstream-schemas.md` section 5 links to the upstream DDL) unless you have a reason not
 to; it is proven and interoperable. Statements, in PostgreSQL syntax (the
-worked example in `sql-adapter-reference.md` has all three dialects):
+worked example in `sql-adapter-reference.md` covers PostgreSQL, MySQL and
+SQLite; no SQL Server):
 
 | Method | Statement |
 | --- | --- |
@@ -273,6 +279,13 @@ cluster client, wrap it in `serialisePerSession()`):
 
 ```ts
 const k = (id: SessionID) => `fix:${id.toString()}`;
+// MULTI/EXEC resolves even when a queued command fails (one [err, result] per
+// command), and null when aborted: check, or a failed write is swallowed (I6).
+async function exec(m: ReturnType<typeof redis.multi>): Promise<void> {
+  const results = await m.exec();
+  if (results === null) throw new Error('transaction aborted');
+  for (const [err] of results) if (err) throw err;
+}
 const adapter: MessageStoreAdapter = {
   async load(id) {
     const h = await redis.hgetall(`${k(id)}:state`);
@@ -283,10 +296,17 @@ const adapter: MessageStoreAdapter = {
     await redis.hset(`${k(id)}:state`, { creationTime: s.creationTime.toISOString(), nextSender: s.nextSenderMsgSeqNum, nextTarget: s.nextTargetMsgSeqNum });
   },
   async setSeqNums(id, sender, target) {
-    await redis.hset(`${k(id)}:state`, { nextSender: sender, nextTarget: target }); // one command, both fields
+    // One atomic script, both fields; a missing row is an error (C3), not a
+    // partial hash that load() would then report as null.
+    const ok = await redis.eval(
+      "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end " +
+        "redis.call('HSET', KEYS[1], 'nextSender', ARGV[1], 'nextTarget', ARGV[2]) return 1",
+      1, `${k(id)}:state`, sender, target,
+    );
+    if (ok !== 1) throw new Error(`no state row for ${id.toString()}`);
   },
   async setMessage(id, seq, msg) {
-    await redis.multi().hset(`${k(id)}:msgs`, String(seq), msg).zadd(`${k(id)}:idx`, seq, String(seq)).exec(); // upsert: HSET overwrites, ZADD re-scores
+    await exec(redis.multi().hset(`${k(id)}:msgs`, String(seq), msg).zadd(`${k(id)}:idx`, seq, String(seq))); // upsert: HSET overwrites, ZADD re-scores
   },
   async getMessages(id, begin, end) {
     const seqs = await redis.zrangebyscore(`${k(id)}:idx`, begin, end); // numeric score order, inclusive
@@ -295,10 +315,11 @@ const adapter: MessageStoreAdapter = {
     return msgs.filter((m): m is string => typeof m === 'string');
   },
   async reset(id, s) {
-    await redis.multi()
-      .del(`${k(id)}:msgs`, `${k(id)}:idx`)
-      .hset(`${k(id)}:state`, { creationTime: s.creationTime.toISOString(), nextSender: s.nextSenderMsgSeqNum, nextTarget: s.nextTargetMsgSeqNum })
-      .exec();
+    await exec(
+      redis.multi()
+        .del(`${k(id)}:msgs`, `${k(id)}:idx`)
+        .hset(`${k(id)}:state`, { creationTime: s.creationTime.toISOString(), nextSender: s.nextSenderMsgSeqNum, nextTarget: s.nextTargetMsgSeqNum }),
+    );
   },
 };
 ```

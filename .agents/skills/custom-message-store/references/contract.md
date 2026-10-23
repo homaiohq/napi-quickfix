@@ -145,8 +145,17 @@ session; (b) by `refresh()` (`RefreshOnLogon=Y`, `session.refresh()`); (c) as
 the reload that lifts a poisoned store (see I4). Sources: `[store.ts]` JSDoc of
 `load`; `[store.test]` "create() preloads exactly the sessions the engine owns:
 load(), then create() for a missing row" (`calls == ['load', 'create']`);
-`[js_message_store.cpp]` `refresh()` and `Gate()` both issue `Method::kLoad`.
+`[js_message_store.cpp]` `refresh()` and `Gate()` both issue `Method::kLoad`
+(through `Reload()`).
 Consequence: `load()` is on the recovery path; keep it a single indexed read.
+At (b) and (c), `null` means the row is gone: as upstream's `refresh()` does
+(`m_cache.reset(now)`, then `populateCache()` INSERTs a `1/1` row,
+`[QF PostgreSQLStore.cpp:107-127]`), the engine restarts the numbering: it calls
+`create(sessionID, { now, 1, 1 })` and the cache takes that state once it
+resolved; a failing `create()` poisons the store. So `null` must mean "no row",
+never "could not read" (reject for that). Sources: `[js_message_store.cpp]`
+`Reload()`; `[store.test]` "refresh() / a reload after the row was deleted
+...".
 
 **B4. The returned object must satisfy A3** (a valid `Date`, two positive safe
 integers). A malformed object is a `TypeError` from `create()` at preload time,
@@ -160,7 +169,8 @@ or null"`, `ReadSeq()`, `FromDate()`. Return a fresh object each time
 (`MapMessageStore` returns `{ ...row.state }`).
 
 **B5. `create(sessionID, state)` inserts the session row.** It is only called
-after `load()` returned `null` for that session, with
+after `load()` returned `null` for that session (at preload, or at a reload,
+B3), with
 `state = { creationTime: now, nextSenderMsgSeqNum: 1, nextTargetMsgSeqNum: 1 }`.
 Source: `[store.ts]` `preload()`. Upstream does the same in one step
 (`populateCache()` inserts a `1/1` row when the `SELECT` finds none,
@@ -393,9 +403,12 @@ there. Sources: `[store.ts]` JSDoc ("missing seqnums omitted (never padded)");
 
 **E4. Return `[]` when nothing matches**, including when `begin > end`; never
 `null`/`undefined`. Do not throw on an odd range either: `begin` comes from
-the peer's ResendRequest unvalidated, so `0` is possible (upstream
-`FileStore::get()` simply skips 0, `[QF FileStore.cpp:281]`; the SQL stores'
-range predicate returns from 1). Sources: `[QF test/MessageStoreTestCase.h]`
+the peer's ResendRequest unvalidated, so `0` is possible: answer it as
+`[1, end]`, as the SQL stores' range predicate does (`msgseqnum >= 0 AND
+msgseqnum <= end`). Upstream `FileStore::get()` does NOT: its loop
+`for (i = begin; i <= end && i != 0; ++i)` (`[QF FileStore.cpp:281]`, the
+`i != 0` guards the wrap-around at `UINT64_MAX`) returns nothing at all for
+`begin = 0`. Sources: `[QF test/MessageStoreTestCase.h]`
 `CHECK_MESSAGE_STORE_SET_GET` (`get(4, 6)` → `0` messages; `get(2, 6)` with
 1..3 stored → 2 messages); `[store-sql.test]` `contract()`
 (`getMessages(4, 6) == []`, `getMessages(2, 6) == [quotes, 'm3']`);
@@ -404,9 +417,9 @@ range predicate returns from 1). Sources: `[QF test/MessageStoreTestCase.h]`
 **E5. Do NOT copy upstream `MemoryStore::get()`.** It starts at
 `m_messages.find(begin)` (`[QF MessageStore.cpp:40]`), so when `begin` itself
 is absent it returns nothing at all even if later numbers exist. The SQL stores
-(range predicate) and `FileStore::get()` (iterates `begin..end` and pushes what
-exists, `[QF FileStore.cpp:278-286]`) are the behaviour to reproduce, and so is
-`MapMessageStore` `[store.ts]`.
+(range predicate) and `MapMessageStore` `[store.ts]` are the behaviour to
+reproduce; `FileStore::get()` (iterates `begin..end` and pushes what exists,
+`[QF FileStore.cpp:278-286]`) too, except for `begin = 0` (E4).
 
 **E6. The range is bounded before it reaches you.** `EndSeqNo` `0` (FIX >= 4.2),
 `999999` (FIX <= 4.2) or anything `>= nextSender` is replaced by
@@ -637,7 +650,10 @@ rejection reason's `.message` becomes the `'storeError'` message. Sources:
 `[store.ts]` `settle()`, `ioError()`; `[js_message_store.cpp]` `ErrorMessage()`.
 
 **I2. Never hang.** A call that has not settled after `storeTimeoutMs` (default
-`30000`; `0` disables) is failed with `"timed out after N ms"`. For
+`30000`; `0` disables) is failed with `"timed out after N ms"`: on an engine
+thread (`Call()`), and in the calls the TS layer awaits itself (`load()`/
+`create()` at preload, a constructor-time `reset()`, `close()`;
+`[store.ts]` `withTimeout()`). For
 `setSeqNums`/`reset` a timed-out call is an UNSETTLED write: the store cannot
 be reloaded, hence cannot recover, until that Promise settles. Sources:
 `[js_message_store.cpp]` `Call()` (`kTimedOut`), `Gate()` (`unsettled_ > 0` →
@@ -661,29 +677,35 @@ statement, and keep per-session writes in call order (D7).
 
 | Method | Failure (throw / reject / malformed / timeout) | Settlement after the timeout |
 | --- | --- | --- |
-| `load` (preload, in `create()`) | `Initiator.create()` / `Acceptor.create()` rejects; no engine | n/a (awaited) |
-| `create` (preload) | same | n/a |
+| `load` (preload, in `create()`) | `Initiator.create()` / `Acceptor.create()` rejects; no engine | discarded |
+| `create` (preload) | same | discarded |
 | `load` (refresh / reload) | store poisoned (or stays poisoned), `'storeError'` | discarded |
+| `create` (a reload found no row, B3) | **poison** | **poison**, "late" |
 | `setSeqNums` | **poison** | **poison**, reported as "late" |
 | `setMessage` | not fatal: send resolves `false`, `'storeError'` | discarded by the engine, but the write still lands in your backend: keep it ordered (D7) |
 | `getMessages` | not fatal: engine disconnects, peer re-requests | discarded |
 | `reset` | **poison**; never thrown into QuickFIX; constructor-time: `create()` rejects | **poison**, "late" |
-| `close` | `'storeError'` only; `stop()` still resolves | n/a |
+| `close` | `'storeError'` only; `stop()` still resolves (a timeout included) | discarded |
 
 Sources: `[README]` "Failure policy" and "`stop()`"; `[js_message_store.cpp]`
 `Forward()` (`fatal` flag), `OnSettled()` (late handling for
-`kSetSeqNums`/`kReset` only), `refresh()`; `[store.ts]` `preload()`,
+`kSetSeqNums`/`kReset`/`kCreate` only), `refresh()`, `Reload()`; `[store.ts]` `preload()`,
 `closeAll()`; `[store.test]` the "failure policy" describe block.
 
 **I4. What poison means for your users.** While poisoned, every write and every
-read of the outbound sequence number fails with `IOException`; every inbound
+read of the outbound sequence number fails with `IOException` (except the reads
+and the inbound increment QuickFIX makes from inside its own `RejectLogon`/
+`UnsupportedVersion` handlers, which have no guard: there the failure is
+recorded and nothing reaches the wire); every inbound
 message ends in a sequence-number write that fails, so the engine disconnects
 the session at its next inbound message (a heartbeat at the latest);
 `'storeError'` fires with `poisoned: true`; `session.getExpected*()` throw.
 Poison lifts in two steps: once every timed-out write has settled, the next
 store call of any kind first reloads the state through `load()` (one reload in
 flight at a time), then proceeds; QuickFIX reconciles with the peer at the next
-logon (resend request, or redelivery with `PossDupFlag=Y`). Sources: `[README]`
+logon (resend request, or redelivery with `PossDupFlag=Y`). A timed-out
+`setSeqNums`/`reset` that never settles keeps the session poisoned until the
+engine is stopped (I2). Sources: `[README]`
 "Failure policy"; `[js_message_store.cpp]` `Gate()`; `[store.test]`
 "ResetOnDisconnect=Y + rejecting reset() ..." and "poisoned store with a dead
 adapter: calls fail immediately, one reload attempt per timeout". For the
@@ -725,7 +747,11 @@ settles".
 
 **J1. Optional.** When present it is called once PER SESSION after `stop()` has
 destroyed the engine's sessions, before the `stop()` Promise settles; no store
-call for that session follows. Sources: `[store.ts]` JSDoc of `close` and
+call for that session follows. It is also called when `Initiator.create()` /
+`Acceptor.create()` rejects AFTER constructing the engine (a constructor-time
+`reset()` failed or timed out: `createEngine()` runs `stop(true)` before
+rejecting), so `close()` can run for an engine the application never received.
+Not when the preload (`load()`/`create()`) fails: no engine exists then. Sources: `[store.ts]` JSDoc of `close` and
 `closeAll()`; `[store.test]` "await stop(); await create({ store: same }) sees
 close() before load()" and "create() preloads ..." (`calls.at(-1) == 'close'`).
 
@@ -738,7 +764,9 @@ not close a shared pool from `close()` unless you reference-count; let the
 application own the pool's lifetime. (Derived from J1.)
 
 **J4. A `close()` failure is reported** as `'storeError'` (`method: 'close'`,
-`poisoned: false`) and never blocks `stop()`. Source: `[store.ts]` `closeAll()`.
+`poisoned: false`) and never fails `stop()`; a `close()` that hangs delays it
+by `storeTimeoutMs` at most (`0`: indefinitely). Source: `[store.ts]`
+`closeAll()`, `withTimeout()`.
 
 ---
 

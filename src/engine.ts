@@ -19,6 +19,7 @@ import {
   StoreBinding,
   isMessageStoreAdapter,
   isStoreBinding,
+  withTimeout,
   type MessageStoreAdapter,
   type MessageStoreMethod,
 } from './store.js';
@@ -55,8 +56,10 @@ export interface CreateEngineOptions extends Omit<EngineOptions, 'store'> {
    */
   store?: 'file' | 'memory' | MessageStoreAdapter;
   /**
-   * With an adapter: how long an engine thread waits on one adapter call
-   * before failing it with `IOException`, in milliseconds. Default `30_000`;
+   * With an adapter: how long one adapter call may take before it is failed
+   * with `IOException`, in milliseconds: every call an engine thread waits
+   * on, and the ones `create()` and `stop()` await (`load()`/`create()` at
+   * preload, a constructor-time `reset()`, `close()`). Default `30_000`;
    * `0` disables the timeout, accepting that a stalled adapter then stalls
    * every session of the engine, a graceful `stop()` and process exit with
    * it. See the README for the trade-off. Passing it with `'file'`/`'memory'`
@@ -229,9 +232,10 @@ export abstract class Engine extends EventEmitter {
     if (storeTimeoutMs !== undefined && (!Number.isInteger(storeTimeoutMs) || storeTimeoutMs < 0)) {
       throw new RangeError('storeTimeoutMs must be a non-negative integer (0 disables the timeout)');
     }
+    const timeoutMs = storeTimeoutMs ?? 30_000;
     const ids = options.settings.getSessions(connectionType);
-    const states = await StoreBinding.preload(store, ids);
-    const binding = new StoreBinding(store, storeTimeoutMs ?? 30_000, states);
+    const states = await StoreBinding.preload(store, ids, timeoutMs);
+    const binding = new StoreBinding(store, timeoutMs, states);
     binding.collecting = [];
     let engine: T;
     let collected: Promise<unknown>[];
@@ -247,7 +251,8 @@ export abstract class Engine extends EventEmitter {
       binding.collecting = null;
     }
     try {
-      await Promise.all(collected);
+      // Only reset() is called on the JS thread (see createEngine's JSDoc).
+      await withTimeout(Promise.all(collected), timeoutMs, 'reset');
     } catch (err) {
       await engine.stop(true).catch(() => {});
       throw err;
@@ -282,8 +287,9 @@ export abstract class Engine extends EventEmitter {
    * `force` applies to both. With a {@link MessageStoreAdapter}, a graceful
    * stop lets the store's in-flight writes complete (each bounded by
    * `storeTimeoutMs`, one per session at most) and calls the adapter's
-   * `close()` for every session before settling; `stop(true)` fails every
-   * pending store call first.
+   * `close()` for every session before settling (each bounded by
+   * `storeTimeoutMs` too; a failure or timeout is a `'storeError'`, never a
+   * rejection); `stop(true)` fails every pending store call first.
    *
    * @param force When `true`, aborts immediately instead of draining gracefully.
    *

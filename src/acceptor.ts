@@ -46,9 +46,11 @@ export class Acceptor extends Engine {
    * this is `new Acceptor(options)` behind a Promise, so there is one entry
    * point for every store.
    *
-   * Rejects without having created anything if `load()`/`create()` fail, and
-   * with the engine torn down if a store call the constructor made (a
-   * `reset()` for a session constructed outside its session time) fails.
+   * Rejects without having created anything if `load()`/`create()` fail or
+   * time out (`storeTimeoutMs`), and with the engine torn down (its
+   * adapter's `close()` called) if a store call the constructor made (a
+   * `reset()` for a session constructed outside its session time) fails or
+   * times out.
    */
   static async create(options: CreateEngineOptions): Promise<Acceptor> {
     return Engine.createEngine('acceptor', options, (o) => new Acceptor(o));

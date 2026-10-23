@@ -202,7 +202,8 @@ against the C++ in sections 1-2): `sessions` has the four key columns plus
 `creation_time`, `incoming_seqnum`, `outgoing_seqnum`, primary key on the four
 key columns; `messages` has the four key columns plus `msgseqnum`, `message`,
 primary key on the four key columns plus `msgseqnum`. `messages_log`,
-`event_log` and their `*_backup_log` twins belong to `MySQLLog` /
+`event_log` and their `*_backup_log` twins (MySQL and MSSQL have both;
+PostgreSQL has `event_backup_log` only) belong to `MySQLLog` /
 `PostgreSQLLog` / `OdbcLog`; an adapter never touches them, create them only
 if the deployment's C++ side also logs to SQL. The column types that matter to
 an adapter are discussed where they bite: section 3 (`creation_time`) and

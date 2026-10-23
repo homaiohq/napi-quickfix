@@ -1,6 +1,7 @@
 #include "js_message_store.h"
 
 #include <cmath>
+#include <exception>
 #include <utility>
 
 #include "quickfix/Exceptions.h"
@@ -82,6 +83,16 @@ Outcome Failed(Status status, std::string error) {
   o.error = std::move(error);
   return o;
 }
+
+// True while the calling thread is inside a catch handler. QuickFIX makes
+// store calls from its own handlers in Session::next(Message) with no
+// IOException guard of their own: catch (RejectLogon&) and catch
+// (UnsupportedVersion&) run generateLogout(), whose fill() reads the sender
+// seqnum before sendRaw()'s try, and the latter's incrNextTargetMsgSeqNum()
+// (or nextLogout()'s). An IOException thrown there escapes the network
+// thread: std::terminate. Must be evaluated before entering a try whose catch
+// asks the question (inside it, the store's own IOException is current).
+bool InQuickFixHandler() { return std::current_exception() != nullptr; }
 
 }  // namespace
 
@@ -561,8 +572,12 @@ void JsMessageStoreFactory::OnSettled(const std::shared_ptr<Shared>& shared,
   if (!late) return;
   // A timed-out call settled after its waiter was released with IOException.
   // Only the fatal writes track this (the poison cannot lift before the
-  // write has landed); a late setMessage/getMessages/load is discarded.
-  if (method != Method::kSetSeqNums && method != Method::kReset) return;
+  // write has landed): setSeqNums, reset, and the create() a reload issues
+  // for a missing row; a late setMessage/getMessages/load is discarded.
+  if (method != Method::kSetSeqNums && method != Method::kReset &&
+      method != Method::kCreate) {
+    return;
+  }
   if (JsMessageStore* store = Lookup(id)) {
     store->OnLateSettlement(method, fulfilled);
   }
@@ -666,29 +681,66 @@ void JsMessageStore::Gate(const char* what) const {
   }
   reloadInFlight_ = true;
   lock.unlock();
-  Factory::Request req;
-  req.method = Factory::Method::kLoad;
-  req.id = id_;
-  Factory::Outcome o = factory_.Call(req);
+  Factory::Method failed = Factory::Method::kLoad;
+  Factory::Outcome o = Reload(failed);
   lock.lock();
   reloadInFlight_ = false;
   if (o.status != Factory::Status::kOk) {
-    lastError_ = "load: " + o.error;
+    lastError_ = std::string(Factory::MethodName(failed)) + ": " + o.error;
     const std::string why = o.error;
     lock.unlock();
     if (o.status != Factory::Status::kAborted) {
-      LogEvent("Message store reload failed (" + why + ")");
-      factory_.ReportError(id_, Factory::Method::kLoad, why, /*poisoned=*/true,
-                           /*late=*/false);
+      LogEvent("Message store reload failed (" + std::string(Factory::MethodName(failed)) +
+               " " + why + ")");
+      factory_.ReportError(id_, failed, why, /*poisoned=*/true, /*late=*/false);
     }
     throw FIX::IOException(std::string("message store ") + what +
                            ": reload failed (" + why + ")");
   }
-  if (o.present) Apply(o.state);
   poisoned_ = false;
   lastError_.clear();
   lock.unlock();
   LogEvent("Message store reloaded: poison lifted");
+}
+
+// load() through the bridge and apply it to the cache. A null result means
+// the row is gone (deleted behind the engine's back): as upstream's refresh()
+// does -- m_cache.reset(now), then populateCache() INSERTs a 1/1 row
+// (PostgreSQLStore.cpp:107-127) -- the session's numbering restarts at 1/1
+// with a new creation time, persisted through create() before the cache takes
+// it. A timed-out create() is an unsettled write like a timed-out setSeqNums.
+// On failure `failed` names the method that failed and nothing is applied.
+JsMessageStore::Factory::Outcome JsMessageStore::Reload(Factory::Method& failed) const {
+  Factory::Request req;
+  req.method = Factory::Method::kLoad;
+  req.id = id_;
+  Factory::Outcome o = factory_.Call(req);
+  if (o.status != Factory::Status::kOk) {
+    failed = Factory::Method::kLoad;
+    return o;
+  }
+  Factory::State state = o.state;
+  if (!o.present) {
+    Factory::Request create;
+    create.method = Factory::Method::kCreate;
+    create.id = id_;
+    create.state = Factory::State{};  // now, 1/1
+    Factory::Outcome c = factory_.Call(create);
+    if (c.status != Factory::Status::kOk) {
+      failed = Factory::Method::kCreate;
+      c.error = "recreating the missing row: " + c.error;
+      if (c.status == Factory::Status::kTimedOut) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        ++unsettled_;
+      }
+      return c;
+    }
+    state = create.state;
+    LogEvent("Message store: load() found no row; recreated it at 1/1");
+  }
+  std::lock_guard<std::mutex> lock(mtx_);
+  Apply(state);
+  return o;
 }
 
 JsMessageStore::Factory::Outcome JsMessageStore::Forward(Factory::Request req,
@@ -739,8 +791,19 @@ void JsMessageStore::get(FIX::SEQNUM b, FIX::SEQNUM e,
   out = Forward(r, /*fatal=*/false).strings;
 }
 
+// Throws while poisoned (so the timer tick's fill() fails into its handler
+// and disconnects), except inside one of QuickFIX's own catch handlers (see
+// InQuickFixHandler()): generateLogout() reads it there before sendRaw()'s
+// try. Returning the cache is safe there: nothing reaches the wire without
+// persist(), whose set()/incrNextSenderMsgSeqNum() still throw inside
+// sendRaw()'s try.
 FIX::SEQNUM JsMessageStore::getNextSenderMsgSeqNum() const EXCEPT(FIX::IOException) {
-  Gate("getNextSenderMsgSeqNum");
+  const bool inHandler = InQuickFixHandler();
+  try {
+    Gate("getNextSenderMsgSeqNum");
+  } catch (const FIX::IOException&) {
+    if (!inHandler) throw;
+  }
   std::lock_guard<std::mutex> lock(mtx_);
   return cache_.getNextSenderMsgSeqNum();
 }
@@ -764,8 +827,8 @@ FIX::SEQNUM JsMessageStore::getNextTargetMsgSeqNum() const EXCEPT(FIX::IOExcepti
 // exception with the session stuck "pending" for good and the acceptor has
 // no handler at all. While poisoned it still drives one reload attempt per
 // tick (that is what retries a dead adapter on an idle session); if that
-// fails the cached time is returned and the sequence-number getters, which
-// do throw, take the session down at its next send or inbound message.
+// fails the cached time is returned and the sender getter and the writes,
+// which do throw, take the session down at its next send or inbound message.
 FIX::UtcTimeStamp JsMessageStore::getCreationTime() const EXCEPT(FIX::IOException) {
   try {
     Gate("getCreationTime");
@@ -815,14 +878,25 @@ void JsMessageStore::incrNextSenderMsgSeqNum() EXCEPT(FIX::IOException) {
   setNextSenderMsgSeqNum(next);
 }
 
+// Throws on failure (the inbound path's handler disconnects), except inside
+// one of QuickFIX's own catch handlers (see InQuickFixHandler()): the
+// UnsupportedVersion handler increments with no guard. There the failure has
+// already been recorded (poison / 'storeError') and the cache keeps the old
+// number; the Logout that handler sent sets sentLogout(), so the logout
+// timeout disconnects the session.
 void JsMessageStore::incrNextTargetMsgSeqNum() EXCEPT(FIX::IOException) {
-  Gate("incrNextTargetMsgSeqNum");
-  FIX::SEQNUM next;
-  {
-    std::lock_guard<std::mutex> lock(mtx_);
-    next = cache_.getNextTargetMsgSeqNum() + 1;
+  const bool inHandler = InQuickFixHandler();
+  try {
+    Gate("incrNextTargetMsgSeqNum");
+    FIX::SEQNUM next;
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      next = cache_.getNextTargetMsgSeqNum() + 1;
+    }
+    setNextTargetMsgSeqNum(next);
+  } catch (const FIX::IOException&) {
+    if (!inHandler) throw;
   }
-  setNextTargetMsgSeqNum(next);
 }
 
 void JsMessageStore::reset(const FIX::UtcTimeStamp& now) EXCEPT(FIX::IOException) {
@@ -874,21 +948,17 @@ void JsMessageStore::refresh() EXCEPT(FIX::IOException) {
       if (reloadInFlight_) return;
       reloadInFlight_ = true;
     }
-    Factory::Request r;
-    r.method = Factory::Method::kLoad;
-    r.id = id_;
-    Factory::Outcome o = factory_.Call(r);
+    Factory::Method failed = Factory::Method::kLoad;
+    Factory::Outcome o = Reload(failed);
     {
       std::lock_guard<std::mutex> lock(mtx_);
       reloadInFlight_ = false;
     }
-    if (o.status == Factory::Status::kOk) {
-      std::lock_guard<std::mutex> lock(mtx_);
-      if (o.present) Apply(o.state);
+    if (o.status == Factory::Status::kOk || o.status == Factory::Status::kAborted) {
       return;
     }
-    if (o.status == Factory::Status::kAborted) return;
-    Poison(Factory::Method::kLoad, o.error, /*unsettled=*/false);
+    // Reload() already counted a timed-out create() as unsettled.
+    Poison(failed, o.error, /*unsettled=*/false);
   } catch (const FIX::IOException&) {
   }
 }

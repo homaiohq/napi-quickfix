@@ -26,7 +26,12 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   late settlements (and `load` failures) poison the session's store until it has been
   reloaded, which takes the session down and lets QuickFIX reconcile with the peer at
   the next logon. `reset()`/`refresh()` never throw into QuickFIX (its
-  `ResetOnDisconnect`/`RefreshOnLogon` paths have no handler; observed `std::terminate`).
+  `ResetOnDisconnect`/`RefreshOnLogon` paths have no handler; observed `std::terminate`),
+  nor do the seqnum reads and the inbound increment QuickFIX makes from inside its own
+  `RejectLogon`/`UnsupportedVersion` handlers. A reload that finds the session's row
+  gone recreates it at 1/1 through `create()`, as upstream's `refresh()` does.
+  `storeTimeoutMs` also bounds the calls `create()`/`stop()` await (preload,
+  constructor-time `reset()`, `close()`).
   `stop(true)` fails pending store calls first; a graceful `stop()` lets them complete
   and calls `close()` per session before settling. Sequence numbers above 2^53-1
   (`Number.MAX_SAFE_INTEGER`) are refused in both directions: a `load()` result above it

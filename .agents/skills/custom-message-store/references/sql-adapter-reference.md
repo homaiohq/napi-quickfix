@@ -7,8 +7,10 @@ be shipped separately; it is reproduced here, abridged (the body of
 `sqlSchema()` is elided: this skill links to schemas, it does not copy them,
 see `upstream-schemas.md` section 5), as the executable form of the
 contract in `contract.md`, because it passed `test/store-sql.test.ts` (the
-`contract()` function, reproduced as section 1 of `test-checklist.md`, and a
-loopback restart) against `node:sqlite` and PostgreSQL. A packaged version is
+`contract()` function, a subset of section 1 of `test-checklist.md`, which
+adds begin > end, gaps and numeric order, seqnums at 2^40; and a loopback
+restart) against `node:sqlite` and PostgreSQL. Run the full section 1 against
+anything you derive from it. A packaged version is
 planned as a follow-up: the doc comments below that mention the
 `@homaiohq/napi-quickfix/store/sql` subpath export and the package's `sql/`
 directory describe that packaged form, which this package does not ship yet.
@@ -265,9 +267,10 @@ const store = createSqlMessageStore({
   execute: async (sql, params) => (await pool.execute(sql, params))[0] as Record<string, unknown>[],
 });
 // node:sqlite (synchronous driver; the adapter still returns Promises, which is fine)
+const execute: SqlExecute = (sql, params) => db.prepare(sql).all(...(params as (string | number)[]));
 const store = createSqlMessageStore({
   dialect: 'sqlite',
-  execute: (sql, params) => db.prepare(sql).all(...params) as Record<string, unknown>[],
+  execute,
   transaction: async (fn) => {
     db.exec('BEGIN');
     try {

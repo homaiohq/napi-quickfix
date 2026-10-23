@@ -46,6 +46,10 @@
 //     a late write has landed) and the next call of any kind has reloaded
 //     the cache through load(); at most one reload is in flight, and a
 //     failed reload keeps the store poisoned for the next attempt.
+//   * A reload (refresh or poison) whose load() returns null finds the row
+//     gone: like upstream's refresh() (cache reset, then populateCache()
+//     INSERTs a 1/1 row), the numbering restarts at 1/1 with a new creation
+//     time, persisted through create() before the cache takes it.
 //   * A sequence number above 2^53-1 (Number.MAX_SAFE_INTEGER) is refused
 //     BEFORE it reaches the bridge: the dispatcher hands seqnums to JS as
 //     doubles, so a larger value would arrive rounded and the adapter would
@@ -66,10 +70,21 @@
 //     for good; Session::next(Message) reads getExpectedTargetNum() in
 //     nextQueued() after its handlers, on every inbound message. The two
 //     writes poison and report instead; the two getters still attempt the
-//     reload while poisoned, then return the cached value. (nextQueued()
-//     can also incrNextTargetMsgSeqNum() unguarded, for a queued Logon or
-//     ResendRequest at exactly the expected seqnum; that exposure is
-//     upstream's own, a FileStore write failure terminates there too.)
+//     reload while poisoned, then return the cached value.
+//   * Inside one of QuickFIX's own catch handlers (std::current_exception()
+//     is set), getNextSenderMsgSeqNum() and incrNextTargetMsgSeqNum() do not
+//     throw either: Session::next(Message)'s catch (RejectLogon&) and catch
+//     (UnsupportedVersion&) call generateLogout() -- whose fill() reads the
+//     sender seqnum before sendRaw()'s try -- and the latter also increments
+//     the target seqnum, all with no guard (std::terminate, observed: a
+//     fromAdmin rejecting a Logon on a poisoned store; a wrong BeginString
+//     from the peer). The failure is recorded (poison / 'storeError') and
+//     the cache returned or left as is; nothing reaches the wire, since
+//     persist()'s writes still throw inside sendRaw()'s try. (nextQueued()
+//     can also incrNextTargetMsgSeqNum() unguarded and outside any handler,
+//     for a queued Logon or ResendRequest at exactly the expected seqnum;
+//     that exposure is upstream's own, a FileStore write failure terminates
+//     there too.)
 //   * A per-call timeout (storeTimeoutMs, default 30 s, 0 = none) bounds how
 //     long a QuickFIX thread can be parked: a never-settling adapter would
 //     otherwise freeze every session of the engine and make a graceful
@@ -297,6 +312,9 @@ class JsMessageStore : public FIX::MessageStore {
   // cache (one reload at a time, through the bridge) and lifts the poison,
   // or throws if the reload failed. `what` names the caller for the message.
   void Gate(const char* what) const;
+  // load() and apply; a missing row is recreated at 1/1 through create().
+  // Not under C. On failure returns the outcome, `failed` names the method.
+  Factory::Outcome Reload(Factory::Method& failed) const;
   // Forward to the factory and translate: kOk returns; anything else throws
   // IOException. For `fatal` methods a rejection or timeout poisons first.
   Factory::Outcome Forward(Factory::Request req, bool fatal) const;

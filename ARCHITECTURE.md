@@ -238,7 +238,15 @@ sequenceDiagram
   acceptor has no handler there, `std::terminate`; the initiator swallows the exception with the session stuck
   "pending" for good), and `getNextTargetMsgSeqNum()` (`Session::next(Message)` reads it in `nextQueued()` after its
   handlers, on every inbound message). The writes poison and report; the getters attempt the reload, then return the
-  cache. `storeError` events originate in native (only it knows about timeouts, late settlements and poison), through
+  cache. Inside one of QuickFIX's own catch handlers (`std::current_exception()` set) `getNextSenderMsgSeqNum()` and
+  `incrNextTargetMsgSeqNum()` do not throw either: `Session::next(Message)`'s `catch (RejectLogon&)` and
+  `catch (UnsupportedVersion&)` call `generateLogout()` (whose `fill()` reads the sender seqnum before `sendRaw()`'s
+  `try`) and the latter increments the target seqnum, all unguarded (`std::terminate`, observed). No stale number
+  reaches the wire: `persist()`'s writes still throw inside `sendRaw()`'s `try`. A reload whose `load()` returns `null`
+  (the row is gone) recreates it at 1/1 through `create()`, as upstream's `refresh()` → `populateCache()` does; a
+  timed-out `create()` there is tracked as an unsettled write like `setSeqNums`/`reset`. The calls the TS layer makes
+  itself (preload, the constructor-time `reset()`, `close()`) are bounded by the same timeout in `src/store.ts`
+  (`withTimeout()`). `storeError` events originate in native (only it knows about timeouts, late settlements and poison), through
   a callback on the TS bridge object: called directly on the JS thread, or queued through the store TSFN from a
   waiting thread. The session-log event is written only from the waiting thread, which already holds
   `SessionState::m_mutex` (re-entrant for its owner); the JS thread must never take it.

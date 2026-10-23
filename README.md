@@ -657,10 +657,12 @@ pool thread. Two rules follow:
   it waits on the mutex the thread parked in your method holds. The timeout
   surfaces it as an `IOException` and poisons the store.
 
-**Timeout.** `storeTimeoutMs` (default 30 s) bounds how long an engine thread
-waits on one adapter call; on expiry the call fails with `IOException` and the
-engine proceeds as for a rejection, while the Promise is still observed (see
-"late" below). The trade-off: a longer timeout freezes heartbeats of *every*
+**Timeout.** `storeTimeoutMs` (default 30 s) bounds every adapter call: how
+long an engine thread waits on one, and how long `create()` and `stop()` wait
+on the ones they make themselves (`load()`/`create()` at preload, a
+constructor-time `reset()`, `close()`). On expiry the call fails with
+`IOException` and the engine proceeds as for a rejection, while the Promise is
+still observed (see "late" below). The trade-off: a longer timeout freezes heartbeats of *every*
 session of the engine (one network thread) for that long when the adapter
 stalls; a shorter one produces more late outcomes, each fatal for the session.
 `0` disables it, accepting that a stalled adapter stalls the engine, a
@@ -703,10 +705,25 @@ the session log.
   request, or redelivery with `PossDupFlag=Y`). An inbound message whose
   sequence-number write failed after `fromApp` ran is therefore delivered
   **again** with `PossDupFlag=Y` on reconnect: standard FIX dedupe, not a
-  sequence-number inconsistency.
+  sequence-number inconsistency. A timed-out `setSeqNums`/`reset` whose
+  Promise **never** settles keeps the session poisoned until the engine is
+  stopped (no reload, `refresh()` included, can lift it while that write may
+  still land): give your driver timeouts shorter than `storeTimeoutMs`, so it
+  rejects instead.
 - `reset()` and `refresh()` never raise into QuickFIX, which runs them on
   paths without a handler (`ResetOnDisconnect=Y` inside its own error handler,
   `RefreshOnLogon=Y` on the connect path); they poison and report instead.
+  Neither do the sequence-number reads and the inbound increment when QuickFIX
+  makes them from inside its own error handlers (a `fromAdmin` rejecting a
+  Logon with `'RejectLogon'`, a message with the wrong BeginString), which have
+  no guard either: the failure is recorded, nothing reaches the wire, and the
+  Logout those handlers send (unpersisted) lets QuickFIX's logout timeout drop
+  the session.
+- A reload (`refresh()`, `RefreshOnLogon=Y`, or lifting the poison) whose
+  `load()` returns `null` means the session's row is gone. As QuickFIX's own
+  SQL stores do in `refresh()`, the numbering restarts: the engine calls
+  `create()` with `1/1` and a new creation time, and the cache follows once it
+  resolved (a failing `create()` poisons the store).
 - Sequence numbers cross as JS `number`s, exact only up to **2^53-1**
   (`Number.MAX_SAFE_INTEGER`). A `load()` result above that is refused
   (`create()` rejects with `TypeError`, a reload fails with `IOException`),
@@ -722,10 +739,13 @@ adapter cannot hold it up. A graceful `stop()` lets in-flight writes complete
 (each bounded by the timeout, at most one per session) before the engine logs
 its sessions out; if the Logout itself cannot be persisted, QuickFIX's own 10 s
 logout grace applies on top. Once the sessions are destroyed the adapter's
-`close()` is called for each session, and `stop()` settles after it, so
+`close()` is called for each session (each bounded by the timeout; a failure
+is a `'storeError'`, never a rejection), and `stop()` settles after it, so
 `await engine.stop(); await Initiator.create({ store: sameAdapter })` never
-races `close()` against `load()`. An engine dropped without `stop()` is torn
-down at process exit without calling `close()`.
+races `close()` against `load()`. `close()` is also called when `create()`
+rejects after constructing the engine (a constructor-time `reset()` failed:
+the engine is stopped before the rejection). An engine dropped without
+`stop()` is torn down at process exit without calling `close()`.
 
 ### Handlers vs. events
 

@@ -13,6 +13,7 @@ import {
   SessionID,
   SessionSettings,
   createMessage,
+  fixReject,
   sendToTarget,
   FIELD,
   MsgType,
@@ -22,6 +23,7 @@ import { acceptorCfg, initiatorCfg } from '../helpers.js';
 import { ControlledStore, withSettings } from '../store-adapters.js';
 
 const INI_ID = new SessionID('FIX.4.4', 'CLIENT', 'SERVER');
+const ACC_ID = new SessionID('FIX.4.4', 'SERVER', 'CLIENT');
 const TIMEOUT_MS = 500;
 
 function freePort(): Promise<number> {
@@ -111,6 +113,84 @@ if (mode === 'graceful-stop-hang' || mode === 'graceful-stop-dead') {
   await ini.stop(true);
   await acc.stop(true);
   console.log(`result ${JSON.stringify({ parkedReset, errors })}`);
+} else if (mode === 'reject-logon-poisoned') {
+  // An acceptor whose database is down (ResetOnLogon=Y: the Logon's reset()
+  // poisons, every reload fails) and a fromAdmin that rejects the Logon.
+  // QuickFIX's catch (RejectLogon&) runs generateLogout(), whose fill()
+  // reads the sender seqnum outside any guard: an IOException there escaped
+  // the network thread (std::terminate, exit 134).
+  const port = await freePort();
+  const store = new ControlledStore();
+  let rejected = 0;
+  const acc = await Acceptor.create({
+    settings: SessionSettings.fromString(acceptorCfg(port)),
+    store,
+    storeTimeoutMs: TIMEOUT_MS,
+    log: 'none',
+    handlers: {
+      fromAdmin(msg) {
+        if (msg.getHeaderField(FIELD.MsgType) === MsgType.Logon) {
+          rejected++;
+          throw fixReject('RejectLogon', 'bad credentials');
+        }
+      },
+    },
+  });
+  const errors: string[] = [];
+  acc.on('storeError', (_id, method, _err, poisoned) => errors.push(`${method}:${poisoned}`));
+  const ini = await Initiator.create({ settings: SessionSettings.fromString(initiatorCfg(port)), store: 'memory', log: 'none' });
+  for (const m of ['load', 'reset', 'setSeqNums', 'setMessage'] as const) store.set(m, 'reject');
+  await acc.start();
+  await ini.start();
+  // ReconnectInterval=1: let the initiator be rejected twice.
+  for (let i = 0; i < 200 && rejected < 2; i++) await sleep(25);
+  await sleep(100);
+  const accLoggedOn = acc.getSession(ACC_ID)!.isLoggedOn();
+  await ini.stop(true);
+  await acc.stop(true);
+  console.log(`result ${JSON.stringify({ rejected, accLoggedOn, errors: [...new Set(errors)] })}`);
+} else if (mode === 'wrong-beginstring-poisoned') {
+  // The initiator's store is poisoned without a disconnect (a send whose
+  // setSeqNums rejects; load() rejects too, so no reload lifts it), then the
+  // peer sends a message with the wrong BeginString. QuickFIX's catch
+  // (UnsupportedVersion&) runs generateLogout() and incrNextTargetMsgSeqNum()
+  // outside any guard (std::terminate, exit 134, before the fix).
+  const port = await freePort();
+  let wrongBeginString = false;
+  const acc = await Acceptor.create({
+    settings: SessionSettings.fromString(acceptorCfg(port)),
+    store: 'memory',
+    log: 'none',
+    handlers: {
+      toApp(msg) {
+        if (wrongBeginString) msg.setHeaderField(FIELD.BeginString, 'FIX.4.2');
+      },
+    },
+  });
+  const store = new ControlledStore();
+  const ini = await Initiator.create({
+    settings: SessionSettings.fromString(withSettings(initiatorCfg(port), { HeartBtInt: '30', ReconnectInterval: '60' })),
+    store,
+    storeTimeoutMs: TIMEOUT_MS,
+    log: 'none',
+  });
+  const logon = new Promise<void>((r) => ini.once('logon', () => r()));
+  await acc.start();
+  await ini.start();
+  await logon;
+  store.set('setSeqNums', 'reject');
+  store.set('load', 'reject');
+  const sent = await sendToTarget(order('poison'), INI_ID);
+  const stillLoggedOn = ini.getSession(INI_ID)!.isLoggedOn();
+  wrongBeginString = true;
+  const logout = new Promise<void>((r) => ini.once('logout', () => r()));
+  await sendToTarget(order('wrong-begin'), ACC_ID);
+  // The handler's Logout could not be persisted, but it set sentLogout():
+  // QuickFIX's logout timeout (2 s) disconnects the session.
+  const disconnected = await Promise.race([logout.then(() => true), sleep(10_000).then(() => false)]);
+  await ini.stop(true);
+  await acc.stop(true);
+  console.log(`result ${JSON.stringify({ sent, stillLoggedOn, disconnected })}`);
 } else {
   throw new Error(`unknown mode ${mode}`);
 }

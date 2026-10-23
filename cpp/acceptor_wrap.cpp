@@ -198,10 +198,6 @@ void AcceptorWrap::DestroyEngine() {
     jsStore_->Release();
     jsStore_->DropBridge();
   }
-  if (jsStore_) {
-    jsStore_->Abort();  // idempotent after Teardown()
-    jsStore_->DropBridge();
-  }
 }
 
 // The stop() path: the gate was frozen by the stop worker; destroy and lift

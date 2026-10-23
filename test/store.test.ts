@@ -333,6 +333,52 @@ HeartBtInt=30
     assert.ok(failing.calls.includes('close'), 'teardown reached close()');
   });
 
+  test('storeTimeoutMs bounds the calls create() and stop() await: preload load()/create(), the constructor reset(), close()', { timeout: 30_000 }, async () => {
+    const port = await freePort();
+    const timedOut = (method: string) => (err: unknown) =>
+      isIOException(err) && (err as Error).message === `message store ${method}: timed out after 300 ms`;
+    for (const method of ['load', 'create'] as const) {
+      const store = new ControlledStore();
+      store.set(method, 'hang');
+      const t0 = Date.now();
+      await assert.rejects(
+        () => Initiator.create({ settings: SessionSettings.fromString(initiatorCfg(port)), store, storeTimeoutMs: 300, log: 'none' }),
+        timedOut(method),
+      );
+      assert.ok(Date.now() - t0 < 5_000, `${method}: bounded by the timeout`);
+      assert.equal(doesSessionExist(INI_ID), false, `${method}: no session was created`);
+    }
+
+    // The constructor-time reset() (a session constructed outside its
+    // session time) hanging: create() rejects and the engine is torn down.
+    const outside = { StartTime: utcClock(2), EndTime: utcClock(3) };
+    const hangReset = new ControlledStore();
+    hangReset.inner.create(ACC_ID, { creationTime: new Date(Date.now() - 86_400_000), nextSenderMsgSeqNum: 9, nextTargetMsgSeqNum: 9 });
+    hangReset.set('reset', 'hang');
+    await assert.rejects(
+      () =>
+        Acceptor.create({
+          settings: SessionSettings.fromString(withSettings(acceptorCfg(port), outside)),
+          store: hangReset,
+          storeTimeoutMs: 300,
+          log: 'none',
+        }),
+      timedOut('reset'),
+    );
+    assert.equal(doesSessionExist(ACC_ID), false, 'the engine was torn down');
+
+    // A hanging close(): stop() still settles, and reports it.
+    const hangClose = new ControlledStore();
+    hangClose.set('close', 'hang');
+    const ini = await Initiator.create({ settings: SessionSettings.fromString(initiatorCfg(port)), store: hangClose, storeTimeoutMs: 300, log: 'none' });
+    const errors: Array<{ method: string; message: string; poisoned: boolean }> = [];
+    ini.on('storeError', (_id, method, err, poisoned) => errors.push({ method, message: err.message, poisoned }));
+    const t0 = Date.now();
+    await ini.stop();
+    assert.ok(Date.now() - t0 < 5_000, 'stop() is bounded by the timeout');
+    assert.deepEqual(errors, [{ method: 'close', message: 'message store close: timed out after 300 ms', poisoned: false }]);
+  });
+
   test('await stop(); await create({ store: same }) sees close() before load()', async () => {
     const port = await freePort();
     const store = new ControlledStore(undefined, 5);
@@ -683,6 +729,70 @@ describe('MessageStoreAdapter: failure policy', () => {
       assert.ok(await waitUntil(() => ini.isLoggedOn(), T), 'logged on once the adapter recovered');
     } finally {
       await stopBoth(acc, ini);
+    }
+  });
+
+  test('a poisoned acceptor whose fromAdmin rejects the Logon (RejectLogon): the handler\'s Logout does not abort the process', { timeout: 40_000 }, async () => {
+    // Before the fix: generateLogout() -> fill() -> getNextSenderMsgSeqNum()
+    // threw outside any guard in QuickFIX's catch (RejectLogon&): exit 134.
+    const { result } = await runChild('reject-logon-poisoned', 30_000);
+    assert.ok((result.rejected as number) >= 2, 'the Logon was rejected (twice)');
+    assert.equal(result.accLoggedOn, false);
+    assert.ok((result.errors as string[]).includes('reset:true'), "the Logon's reset() poisoned the store");
+    assert.ok((result.errors as string[]).includes('load:true'), 'the reloads failed');
+  });
+
+  test('a poisoned initiator receiving a wrong BeginString (UnsupportedVersion): no abort, the logout timeout disconnects', { timeout: 40_000 }, async () => {
+    // Before the fix: QuickFIX's catch (UnsupportedVersion&) runs
+    // generateLogout() and incrNextTargetMsgSeqNum() unguarded: exit 134.
+    const { result } = await runChild('wrong-beginstring-poisoned', 30_000);
+    assert.equal(result.sent, false, 'the poisoning send failed');
+    assert.equal(result.stillLoggedOn, true, 'a failed send poisons without disconnecting');
+    assert.equal(result.disconnected, true);
+  });
+
+  test('refresh() / a reload after the row was deleted: like upstream, the row is recreated at 1/1 and the cache follows', { timeout: 30_000 }, async () => {
+    const port = await freePort();
+    const iniStore = new ControlledStore();
+    const quiet = { HeartBtInt: '60' };
+    const { acc, ini, storeErrors } = await makePair(port, { iniStore, ini: quiet });
+    const loadsAndCreates = (from: number) => iniStore.calls.slice(from).filter((c) => c === 'load' || c === 'create');
+    try {
+      await logonBoth(acc, ini);
+      const session = ini.getSession(INI_ID)!;
+      assert.ok(session.getExpectedSenderNum() > 1);
+      // Upstream's refresh(): m_cache.reset(now), then populateCache()
+      // INSERTs a 1/1 row when the SELECT finds none.
+      iniStore.inner.rows.delete(INI_ID.toString());
+      let marker = iniStore.calls.length;
+      await session.refresh();
+      assert.deepEqual(loadsAndCreates(marker), ['load', 'create']);
+      assert.equal(iniStore.row(INI_ID).state.nextSenderMsgSeqNum, 1);
+      assert.equal(iniStore.row(INI_ID).state.nextTargetMsgSeqNum, 1);
+      assert.equal(session.getExpectedSenderNum(), 1);
+      assert.equal(session.getExpectedTargetNum(), 1);
+      assert.equal(storeErrors.length, 0);
+
+      // The recreating create() failing: poisoned, refresh() rejects, the
+      // cache is not touched; the poison reload recreates the row later.
+      await session.setNextSenderMsgSeqNum(5);
+      iniStore.inner.rows.delete(INI_ID.toString());
+      iniStore.set('create', 'reject');
+      await assert.rejects(() => session.refresh(), isIOException);
+      // The report crosses the bridge on its own, after or before the rejection.
+      assert.ok(
+        await waitUntil(() => storeErrors.some((e) => e.method === 'create' && e.poisoned && /recreating the missing row/.test(e.message)), T),
+      );
+      assert.throws(() => session.getExpectedSenderNum(), isIOException);
+      iniStore.mode = () => 'ok';
+      marker = iniStore.calls.length;
+      await session.setNextTargetMsgSeqNum(3); // Gate(): reload -> no row -> create(), then the write
+      assert.deepEqual(loadsAndCreates(marker), ['load', 'create']);
+      assert.equal(session.getExpectedSenderNum(), 1);
+      assert.equal(session.getExpectedTargetNum(), 3);
+      assert.equal(iniStore.row(INI_ID).state.nextTargetMsgSeqNum, 3);
+    } finally {
+      await stopBoth(acc, ini, true);
     }
   });
 

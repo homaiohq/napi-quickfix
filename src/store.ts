@@ -157,6 +157,30 @@ function ioError(method: string, message: string): QuickFixError {
   return err;
 }
 
+/**
+ * `p`, failed with an `IOException` if it has not settled after `timeoutMs`
+ * (`0`: no bound). The JS-side counterpart of the native per-call deadline,
+ * for the adapter calls made outside an engine thread: the preload, the
+ * constructor's `reset()` and `close()`. A settlement after the deadline is
+ * observed and ignored.
+ */
+export function withTimeout<T>(p: Promise<T>, timeoutMs: number, method: string): Promise<T> {
+  if (timeoutMs <= 0) return p;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(ioError(method, `timed out after ${timeoutMs} ms`)), timeoutMs);
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 function validState(what: string, s: MessageStoreState | null | undefined): MessageStoreState {
   if (s === null || typeof s !== 'object') {
     throw new TypeError(`${what} must return a MessageStoreState`);
@@ -223,14 +247,24 @@ export class StoreBinding {
   /**
    * Preload the state of every session in `ids` through the adapter: the
    * engine constructor needs it synchronously. A missing row is created.
+   * Each call is bounded by `timeoutMs` (see {@link withTimeout}).
    */
-  static async preload(adapter: MessageStoreAdapter, ids: SessionID[]): Promise<NativeStoreState[]> {
+  static async preload(adapter: MessageStoreAdapter, ids: SessionID[], timeoutMs: number): Promise<NativeStoreState[]> {
     const states: NativeStoreState[] = [];
     for (const id of ids) {
-      let state = await settle(() => adapter.load(id));
+      let state = await withTimeout(
+        settle(() => adapter.load(id)),
+        timeoutMs,
+        'load',
+      );
       if (state === null || state === undefined) {
-        state = { creationTime: new Date(), nextSenderMsgSeqNum: 1, nextTargetMsgSeqNum: 1 };
-        await settle(() => adapter.create(id, state as MessageStoreState));
+        const created: MessageStoreState = { creationTime: new Date(), nextSenderMsgSeqNum: 1, nextTargetMsgSeqNum: 1 };
+        await withTimeout(
+          settle(() => adapter.create(id, created)),
+          timeoutMs,
+          'create',
+        );
+        state = created;
       }
       const s = validState(`${adapter.constructor?.name ?? 'adapter'}.load(${id.toString()})`, state);
       states.push({
@@ -243,13 +277,25 @@ export class StoreBinding {
     return states;
   }
 
-  /** Call the adapter's optional `close()` for each id; failures become `'storeError'`s. */
+  /**
+   * Call the adapter's optional `close()` for each id, each bounded by the
+   * store timeout; failures (a timeout included) become `'storeError'`s.
+   */
   async closeAll(ids: SessionID[]): Promise<void> {
     if (!this.adapter.close) return;
     await Promise.all(
       ids.map((id) =>
-        settle(() => this.adapter.close!(id)).catch((err: unknown) => {
-          this.emit?.('close', id, ioError('close', err instanceof Error ? err.message : String(err)), false);
+        withTimeout(
+          settle(() => this.adapter.close!(id)),
+          this.timeoutMs,
+          'close',
+        ).catch((err: unknown) => {
+          // withTimeout's own error is already the IOException to report.
+          const error =
+            err instanceof Error && (err as QuickFixError).fixErrorName === 'IOException'
+              ? (err as QuickFixError)
+              : ioError('close', err instanceof Error ? err.message : String(err));
+          this.emit?.('close', id, error, false);
         }),
       ),
     );
