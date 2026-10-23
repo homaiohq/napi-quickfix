@@ -628,8 +628,9 @@ describe('MessageStoreAdapter: failure policy', () => {
         (ok) => `resolved:${ok}`,
         (e: QuickFixError) => `rejected:${e.fixErrorName}`,
       );
-      await sleep(100);
-      assert.equal(iniStore.inflight, 1, 'the store call is parked');
+      // Until the adapter has been called (a worker must pick the send up
+      // first); a 'hang' call stays counted after it was released.
+      assert.ok(await waitUntil(() => iniStore.inflight === 1, 2000), 'the store call is parked');
       const t0 = Date.now();
       await ini.stop(true);
       assert.ok(Date.now() - t0 < 5000, 'stop(true) did not wait for the timeout');

@@ -63,6 +63,15 @@ async function loggedOnPair(iniSettings: Record<string, string> = {}) {
   return { acc, ini, store };
 }
 
+// Wait (up to 2 s) until the adapter has been called: a send reaches the
+// store after a libuv worker picks it up, which a fixed sleep cannot bound on
+// a loaded or sanitized run. A 'hang' call stays counted in `inflight` after
+// its timeout released the thread, so this cannot miss it.
+async function parked(store: ControlledStore): Promise<number> {
+  for (let i = 0; i < 100 && store.inflight === 0; i++) await sleep(20);
+  return store.inflight;
+}
+
 const mode = process.argv[2];
 const t0 = Date.now();
 
@@ -75,13 +84,12 @@ if (mode === 'graceful-stop-hang' || mode === 'graceful-stop-dead') {
   let hung = 0;
   store.set('setMessage', 'hang', () => mode === 'graceful-stop-dead' || hung++ === 0);
   void sendToTarget(order('park'), INI_ID).catch(() => {});
-  await sleep(100);
-  const parked = store.inflight;
+  const parkedCalls = await parked(store);
   const stopStart = Date.now();
   await ini.stop();
   const stopMs = Date.now() - stopStart;
   await acc.stop();
-  console.log(`result ${JSON.stringify({ parked, stopMs })}`);
+  console.log(`result ${JSON.stringify({ parked: parkedCalls, stopMs })}`);
 } else if (mode === 'gc-no-stop-parked') {
   // Engines dropped without stop() (unref'd) while a store call is parked:
   // the timeout releases the parked worker, the loop drains, the environment
@@ -91,8 +99,7 @@ if (mode === 'graceful-stop-hang' || mode === 'graceful-stop-dead') {
   ini.unref();
   store.set('setMessage', 'hang');
   void sendToTarget(order('park'), INI_ID).catch(() => {});
-  await sleep(100);
-  console.log(`result ${JSON.stringify({ parked: store.inflight })}`);
+  console.log(`result ${JSON.stringify({ parked: await parked(store) })}`);
   // Fall off the end: no stop(), no process.exit().
 } else if (mode === 'force-stop-reset') {
   // ResetOnDisconnect=Y: disconnect() runs the store's reset() inside
@@ -108,8 +115,7 @@ if (mode === 'graceful-stop-hang' || mode === 'graceful-stop-dead') {
   const loggedOut = new Promise<void>((r) => ini.once('logout', () => r()));
   void ini.getSession(INI_ID)!.logout('bye');
   await loggedOut;
-  for (let i = 0; i < 100 && store.inflight === 0; i++) await sleep(20);
-  const parkedReset = store.inflight;
+  const parkedReset = await parked(store);
   await ini.stop(true);
   await acc.stop(true);
   console.log(`result ${JSON.stringify({ parkedReset, errors })}`);
