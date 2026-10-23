@@ -202,7 +202,7 @@ sequenceDiagram
   JS->>AD: bridge.setMessage(sid, seq, msg)  (always a Promise)
   AD-->>JS: promise.then(onFulfilled.bind(id), onRejected.bind(id))
   JS-->>ST: continuation looks the channel up by id, fulfils it
-  ST->>QF: return / throw IOException; cache updated after the ack
+  ST->>QF: return / throw IOException, cache updated after the ack
 ```
 
 - **Dispatch rule.** On the JS thread (the engine constructor's `reset()` for a session built outside its session
