@@ -642,9 +642,11 @@ void JsMessageStore::CheckSafeSeq(FIX::SEQNUM n, Factory::Method method,
 // Session::persist() stores the message under the MsgSeqNum fill() stamped,
 // which is the next sender seqnum unless the cache moved in between: on a
 // poisoned store the stamp came from the cache and this call's Gate() then
-// reloaded it (a late write that landed) or retried a pending reset. Stored
-// and sent, the message would carry a number the store no longer agrees
-// with. Refused like a non-fatal adapter failure: IOException inside
+// reloaded it (a late write that landed) or retried a pending reset; or a
+// Session.setNextSenderMsgSeqNum() worker took SessionState::m_mutex while
+// sendRaw() ran toApp/toAdmin (sendRaw holds Session::m_mutex, which the
+// setter does not take, see session_wrap.cpp). Stored and sent, the message
+// would carry a number the store no longer agrees with. Refused like a non-fatal adapter failure: IOException inside
 // sendRaw()'s try (nothing is sent) and a non-poisoning 'storeError'.
 void JsMessageStore::CheckStamp(FIX::SEQNUM seq) const {
   FIX::SEQNUM next;
@@ -656,7 +658,8 @@ void JsMessageStore::CheckStamp(FIX::SEQNUM seq) const {
   const std::string why =
       "set(" + std::to_string(seq) + "): the message was stamped MsgSeqNum=" +
       std::to_string(seq) + " but the next sender seqnum is now " +
-      std::to_string(next) + " (the cache was reloaded after the stamp); refused, not sent";
+      std::to_string(next) +
+      " (a reload or a sequence-number setter moved it after the stamp); refused, not sent";
   factory_.ReportError(id_, Factory::Method::kSetMessage, why, /*poisoned=*/false,
                        /*late=*/false);
   Throw(Factory::Method::kSetMessage, why);

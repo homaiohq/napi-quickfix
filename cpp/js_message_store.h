@@ -56,7 +56,9 @@
 //     sender seqnum, is refused (set(): its MsgSeqNum is no longer the next
 //     sender seqnum; incrNextSenderMsgSeqNum() with PersistMessages=N: the
 //     store was poisoned on entry): IOException + non-poisoning 'storeError',
-//     nothing sent.
+//     nothing sent. set() refuses the same way a message whose sender
+//     seqnum a Session.setNextSenderMsgSeqNum() worker moved between fill()
+//     and persist() (see session_wrap.cpp).
 //   * A reload (refresh or poison) whose load() returns null finds the row
 //     gone: like upstream's refresh() (cache reset, then populateCache()
 //     INSERTs a 1/1 row), the numbering restarts at 1/1 with a new creation

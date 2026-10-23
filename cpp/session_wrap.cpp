@@ -247,7 +247,10 @@ Napi::Value SessionWrap::TimeCheck(const Napi::CallbackInfo& info,
 // incrNextTargetMsgSeqNum. A setter landing inside that window -- from a
 // handler, or while a sendToTarget() / heartbeat is in flight on this
 // session -- is overwritten by the increment that follows, and the wire is
-// left one off from the peer. The setters are meant for a quiescent session
+// left one off from the peer. With a JS message store and PersistMessages=Y,
+// a sender number set after fill() stamped the header but before persist()
+// wrote the message makes that send fail instead (JsMessageStore::CheckStamp
+// refuses it: nothing is sent, and the new number stands). The setters are meant for a quiescent session
 // (before start(), from a 'logout' event, or when the caller knows nothing is
 // in flight); documented on the JS API, not fixable here (m_mutex is
 // private).

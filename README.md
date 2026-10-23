@@ -562,7 +562,10 @@ message the engine is sending or receiving on that session at the same
 moment: QuickFIX reads the number, runs your handler, then increments from the
 store under a lock the setters do not take, so a value set in that window —
 from a handler, or while a `sendToTarget()` or a heartbeat is in flight — is
-overwritten and the session ends up one off from its counterparty. Renumber a
+overwritten and the session ends up one off from its counterparty (with a
+`MessageStoreAdapter`, a sender number set after the header was stamped but
+before the message was written fails that send instead: it resolves `false`
+with a non-poisoning `'storeError'`). Renumber a
 **quiet** session: before `start()`, from a `'logout'` event, or when you know
 nothing is in flight. QuickFIX's `Session::disconnect()` and `reset()` are
 deliberately **not** exposed: they drop the transport through the engine's
