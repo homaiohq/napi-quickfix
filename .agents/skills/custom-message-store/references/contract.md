@@ -329,7 +329,11 @@ fences were added unasked; derived.) The FIFO only orders what your Promises rep
 must settle when the backend is done with the statement: a client-side
 timeout (`pg` `query_timeout`, `mysql2` `timeout`) rejects while the statement may still
 commit on the server; prefer a server-side limit (`statement_timeout`) that
-aborts the statement before the Promise rejects. The same reasoning covers a
+aborts the statement before the Promise rejects. Where the backend has no such
+limit (HTTP APIs such as DynamoDB, which may still apply a request the client
+aborted), a client-side abort leaves the outcome unknown and the window open:
+set the abort well above the backend's normal latency so it stays rare, and
+document the residual window instead of claiming late writes are impossible. The same reasoning covers a
 late `setMessage` landing after a `reset()` of that session (it would leave a
 stale old-epoch row): the FIFO runs it before the reset's DELETE, and a
 `setSeqNums` whose Promise rejected while its statement kept running (I2).
