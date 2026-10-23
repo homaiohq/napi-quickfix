@@ -11,6 +11,7 @@ Every rule below is sourced. The sources, and the versions they were read at:
 | `[store.test]` | `test/store.test.ts`, same revision; cited by test title |
 | `[store-sql.test]` | the SQL adapter test, `test/store-sql.test.ts` at the same revision (identical at `6b8caa0`, the commit that introduced the SQL adapter): `contract()`, reproduced as section 1 of `test-checklist.md`, and `loopback()`. Not part of every checkout that carries this skill |
 | `[QF <file>:<line>]` | QuickFIX C++ **v1.16.0** (the tag pinned by `CMakeLists.txt` `GIT_TAG v1.16.0`; FetchContent checkout `2ce8a60667d95a55cdc57a210f165e19cb757126`), path under `src/C++/` |
+| `[probe]` | a loopback probe run on 2026-10-23 through the binding at `4dc1231` (branch `feat/message-store-adapter`): a real `Acceptor` + `Initiator` over 127.0.0.1, the initiator on a test-double adapter. Each probe is reproduced as a scenario in `test-checklist.md` (the rule names it), so you can rerun it against your adapter |
 
 Where a rule is *derived* (a consequence of sourced facts rather than a
 sentence in a source) it says so.
@@ -78,7 +79,11 @@ stored as the raw FIX wire string with SOH (`0x01`) delimiters.** Sources:
 `[QF Field.h:183]` `encodeTo()` terminates each field with `'\001'`;
 `[QF Session.cpp:420]` `generateRetransmits()` locates the message type in a
 stored string by searching for `"\00135="`. Store the string byte-exact: never
-replace SOH with `|`, never trim, never re-serialise, never parse.
+replace SOH with `|`, never trim, never re-serialise, never parse (A8 says what
+a changed byte costs). Inbound messages never reach the store: one that
+arrives ahead of the expected number is queued in memory
+(`SessionState::queue()`, `[QF Session.cpp:1130]`) and is lost on a restart,
+when the peer is simply asked to resend it.
 
 **A6. Message strings may contain single quotes, double quotes, backslashes and
 any UTF-8**, and cross the bridge as JS strings. Sources: `[QF
@@ -99,6 +104,24 @@ single-byte code-page column (SQL Server `TEXT`) or a size-capped one (MySQL
 touches another session's rows; two sessions differing only by qualifier are
 distinct. Source: `[store-sql.test]` `contract()` ("Another session's rows are
 independent (the key includes the qualifier)", "reset is per session").
+
+**A8. One changed byte in one stored message breaks the resend of the whole
+range, and the session stays stuck.** On a ResendRequest the engine re-parses
+every returned string with BodyLength and CheckSum validation
+(`m_validateLengthAndChecksum`, on by default; `[QF Session.cpp:436,452]`) and
+nothing inside the loop catches the `InvalidMessage`, so the first damaged
+entry aborts `generateRetransmits()`: the messages after it and the closing
+gap-fill are never sent (`[QF Session.cpp:402-506]`). The exception is caught
+higher up and only logged (`[QF Session.cpp:1289-1290]`), before the
+ResendRequest's own sequence number was consumed (`[QF Session.cpp:397-399]`),
+so the peer asks again and hits the same row on every attempt. `[probe]`
+(`test-checklist.md` 2.9): three orders stored, the middle one changed by one
+byte (`11=o2` → `11=oX`, same length); a resend from the first delivered only
+the first, and the acceptor stayed at "expecting 3". This is what a lossy
+encoding does to a non-ASCII character (SQL Server `TEXT`, a Latin-1 column, a
+`Buffer` decoded with the wrong charset) and what CRLF translation, trimming or
+re-serialising do. It is why A5/A6 say byte-exact, and why I6 prefers a
+rejected write to a damaged one.
 
 ---
 
@@ -188,6 +211,22 @@ equal. Source: `[js_message_store.h]` file comment ("updated only AFTER the
 adapter acknowledged a write (DB-first; upstream's incr* bump the cache
 first)").
 
+**C6. No monotonic guard: the numbers can go DOWN, and the last write wins.**
+The engine owns the numbers; the adapter records them. `reset()` brings both
+back to 1, and `session.setNextSenderMsgSeqNum()` /
+`setNextTargetMsgSeqNum()` set any value, lower included (`[QF
+Session.h:79-80]`, forwarded as `setSeqNums`). An inbound `SequenceReset` only
+ever raises the target number (`[QF Session.cpp:356-359]`), which is where the
+"it only increases" intuition comes from. So never write
+`SET n = GREATEST(n, $1)`, a `WHERE outgoing_seqnum < $1` condition, an
+optimistic "only if newer" check, or a reject on a decrease: each one silently
+keeps the old number, and the engine's cache (C5) and the store disagree.
+`[probe]` (`test-checklist.md` 1.15): two orders, then
+`setNextSenderMsgSeqNum(2)`: the adapter saw `[3,2]`, `[4,2]`, then `[2,2]`.
+Upstream writes the value unconditionally (`UPDATE sessions SET
+outgoing_seqnum=<value>`, `[QF PostgreSQLStore.cpp:238-252]`; `FileStore`
+rewrites its seqnums file in place, `[QF FileStore.cpp:335-344]`).
+
 ---
 
 ## D. `setMessage()`
@@ -210,7 +249,14 @@ throws, `sendRaw()` catches the `IOException` and returns `false`
 number. Sources: `[store.test]` "setMessage rejection: send reports false,
 seqnum unchanged, session survives, retry reuses the seqnum" and "setMessage
 timeout: not fatal; the late settlement is discarded" ("the upsert replaced the
-late row").
+late row"). The same number also comes back (derived from the same code):
+after a crash between `setMessage(n)` and `setSeqNums(n+1)` (two separate
+calls, `[QF Session.cpp:661-667]`), the restarted engine still has `n` as its
+next number and writes it again; after `session.setNextSenderMsgSeqNum()`
+lowered the number (C6), every number from there up is rewritten. Upstream's
+own stores all overwrite: SQL `INSERT` with an `UPDATE` fallback (above), and
+`FileStore` appends and lets the LAST index entry for a number win
+(`[QF FileStore.cpp:183-189,260-264]`).
 
 **D3. Store the string exactly** (A5, A6). Do not validate it, parse it, or
 normalise it.
@@ -225,9 +271,9 @@ message on the wire whose row is not durable cannot be resent after a crash.
 
 **D5. `setMessage` is NEVER fatal.** A failure is reported (`'storeError'` with
 `poisoned: false`), the send resolves `false`, the session stays up. A
-settlement after the timeout is discarded by the engine (not reported) and
-simply lands as an upsert, so plain last-writer-wins semantics suffice; no
-versioning is needed. Sources: `[README]` "Failure policy"; `[js_message_store.cpp]`
+settlement after the timeout is discarded by the engine (not reported), but
+the write itself still lands in your backend, possibly AFTER the retry's
+write: see D7. Sources: `[README]` "Failure policy"; `[js_message_store.cpp]`
 `set()` → `Forward(r, /*fatal=*/false)`, `OnSettled()` returns early for any
 method other than `kSetSeqNums`/`kReset`; `[store.test]` "setMessage timeout:
 not fatal; the late settlement is discarded" (`storeErrors.length == 1`, "a
@@ -236,6 +282,80 @@ late setMessage is not reported").
 **D6. With `PersistMessages=N` the engine never calls `setMessage()`** and answers
 resend requests with `SequenceReset-GapFill` (`[QF Session.cpp:384-391]`).
 Implement it anyway; it is the default.
+
+**D7. For one session, writes must take effect in the order the engine issued
+them, including a write the engine already gave up on.** The engine serialises
+its calls per session (H1), but a timed-out call is not counted for
+`setMessage` (only `setSeqNums`/`reset` hold back recovery, I2), so the next
+call can start while the late one is still running. On a connection POOL the
+two run on different connections and the older one can commit last. Then the
+row for `n` no longer holds what went out as `n`: a resend of `n` (say the
+connection dropped right after B was written, and the peer asks for `n` on
+reconnect) delivers A, a message your application saw fail, with
+`PossDupFlag=Y`, and B is never redelivered. (Not to be confused with the
+documented case where a send that resolved `false` is still delivered later:
+a `setSeqNums` that landed after its timeout, `[store.test]` "setSeqNums
+timeout then late resolve ...". There the number belongs to that one message
+and the store stays consistent with the wire; here two messages share a
+number and the store keeps the wrong one.) `[probe]` (`test-checklist.md` 3.6):
+`setMessage(2, A)` parked past `storeTimeoutMs: 300` → `send(A)` resolved
+`false`; `send(B)` succeeded and B went out as 2; A's write then landed; a
+resend from 2 delivered **A** (`PossDupFlag=Y`) to the acceptor's `fromApp`.
+Upsert semantics alone do not prevent this; ordering does (`[README]`
+"Failure policy", corrected after this probe: "Keep one session's writes in
+call order"; revisions up to `4dc1231` called a late `setMessage` "simply a
+late upsert"). Any one of these does:
+
+- a per-session FIFO in the adapter: each call for a session starts after the
+  previous call for that session has settled (a Promise chain keyed by
+  `sessionID.toString()`; the SKILL.md "Wiring" section has the 15-line
+  wrapper). `[probe]`: with the wrapper, `send(B)` while A was parked also
+  failed (it queued behind A and timed out), A then B landed in order, the
+  next send `C` succeeded and the row held C: the row always ends as the newest
+  write, and a message whose send reported `false` is either overwritten or
+  sits at a number `>= nextSender`, which the engine does not serve (E6)
+  unless the application jumps the sender number over it (D8);
+- one dedicated connection (or one single-connection client such as one
+  `ioredis` instance, which runs commands in order) per session.
+
+A version column cannot replace either: `setMessage` receives no generation
+to compare. Ordering is also all you need: do not add a fencing token, a
+writer id, a wall-clock or counter condition on top of the FIFO. They guard
+against two engines owning one session, which G3 already rules out
+operationally, and each adds failure modes of its own: a clock behind the
+previous writer's refuses every legitimate write (poison), a conditional
+`load()` becomes a write. (Observed in this skill's own evaluation runs, where
+fences were added unasked; derived.) The FIFO only orders what your Promises report, so the Promise
+must settle when the backend is done with the statement: a client-side
+timeout (`pg` `query_timeout`, `mysql2` `timeout`) rejects while the statement may still
+commit on the server; prefer a server-side limit (`statement_timeout`) that
+aborts the statement before the Promise rejects. The same reasoning covers a
+late `setMessage` landing after a `reset()` of that session (it would leave a
+stale old-epoch row): the FIFO runs it before the reset's DELETE, and a
+`setSeqNums` whose Promise rejected while its statement kept running (I2).
+(Derived from `[js_message_store.cpp]` `OnSettled()` and the probe.)
+
+**D8. Store every message you are given, exactly under the number you are
+given, and filter nothing.** The engine trusts the `MsgSeqNum` (tag 34) INSIDE
+each stored string, not your key: `generateRetransmits()` reads it from the
+parsed message (`[QF Session.cpp:463]`) to decide what to gap-fill. So never
+re-key, renumber, compact or shift messages. Admin messages (Logon,
+Heartbeat, Logout, ResendRequest, TestRequest, ...) are stored too
+(`persist()` runs for both branches of `sendRaw()`, `[QF
+Session.cpp:572-574,590-592]`); the engine itself gap-fills them on a resend
+(`[QF Session.cpp:470-473]`), so do not drop them to save space. A stored
+message has not necessarily been sent: an application message sent while the
+session is logged out is persisted and NOT written to the socket
+(`[QF Session.cpp:590-596]`; unless the next logon will reset the numbers,
+in which case the send is refused outright, `[QF Session.cpp:581-584]`); it
+reaches the peer through the resend that follows the next logon. Rows with
+numbers `>= nextSenderMsgSeqNum` are normal (a lowered sender number, C6; a
+crash between the two writes, D2; a failed send, D7): do not reject them, delete them from `setSeqNums`, or treat them
+as corruption. The engine never asks for them (E6) and overwrites each one
+when it reaches that number; upstream keeps them the same way. (The one way
+such a row gets served is the application jumping the sender number forward
+over it with `session.setNextSenderMsgSeqNum()`; that is the application's
+call, upstream behaves identically.)
 
 ---
 
@@ -251,7 +371,14 @@ msgseqnum` on a `NUMERIC` / `BIGINT UNSIGNED` column (`[QF
 PostgreSQLStore.cpp:221]`, `[QF MySQLStore.cpp:219]`); `MapMessageStore` sorts
 `(a, b) => a - b` `[store.ts]`. A lexical order (`"10" < "9"`) is wrong: when
 your backend sorts keys as strings (Redis members, Mongo/DynamoDB string sort
-keys), use a numeric type or zero-pad to a fixed width.
+keys), use a numeric type or zero-pad to a fixed width. The order is
+load-bearing, not cosmetic: `generateRetransmits()` walks the list keeping a
+`current` cursor and gap-fills from `current` to each entry's own MsgSeqNum
+whenever they differ (`[QF Session.cpp:466-489]`), so an entry that comes
+"back in time" makes the engine gap-fill over messages it has not sent yet.
+`[probe]` (`test-checklist.md` 2.8): `getMessages(2, 5)` returning `[5, 4, 3,
+2]` made the engine send `SequenceReset-GapFill 2→5` first: the three orders
+2..4 were never redelivered, silently.
 
 **E3. Missing sequence numbers are OMITTED, never padded** with `null`, `''` or a
 placeholder: the engine parses each returned string and gap-fills what is not
@@ -261,7 +388,10 @@ there. Sources: `[store.ts]` JSDoc ("missing seqnums omitted (never padded)");
 (`"getMessages() entries must be strings"`), which fails the call.
 
 **E4. Return `[]` when nothing matches**, including when `begin > end`; never
-`null`/`undefined`. Sources: `[QF test/MessageStoreTestCase.h]`
+`null`/`undefined`. Do not throw on an odd range either: `begin` comes from
+the peer's ResendRequest unvalidated, so `0` is possible (upstream
+`FileStore::get()` simply skips 0, `[QF FileStore.cpp:281]`; the SQL stores'
+range predicate returns from 1). Sources: `[QF test/MessageStoreTestCase.h]`
 `CHECK_MESSAGE_STORE_SET_GET` (`get(4, 6)` → `0` messages; `get(2, 6)` with
 1..3 stored → 2 messages); `[store-sql.test]` `contract()`
 (`getMessages(4, 6) == []`, `getMessages(2, 6) == [quotes, 'm3']`);
@@ -291,6 +421,19 @@ timeout is discarded. Sources: `[README]` "Failure policy";
 as UTF-8 (the removed SQL adapter did `Buffer.from(m).toString('utf8')`, see
 `sql-adapter-reference.md`).
 
+**E10. Exactly one entry per sequence number: the last one written.** A
+backend that keeps history (an append-only log, an event stream, a table
+without a unique key on `(session, seqNum)`, versioned items) must collapse to
+the latest write per number before returning, as upstream's `FileStore` does:
+it appends every write and keeps only the last index entry per number
+(`[QF FileStore.cpp:183-189,260-264]`). Every entry is processed (E2): a
+duplicate is resent twice or produces a `SequenceReset` whose `NewSeqNo` is
+lower than its own `MsgSeqNum`. `[probe]` (`test-checklist.md` 2.8):
+`getMessages(2, 5)` returning each message twice produced
+`SequenceReset-GapFill` messages `3→2`, `4→3` and `6→5`, which QuickFIX
+tolerated but a stricter counterparty may reject or log out on. Returning an
+OLDER write instead of the latest is the D7 failure.
+
 ---
 
 ## F. `reset()`
@@ -301,7 +444,15 @@ persists `state`**, which the engine fills with the new `creationTime` and
 `[js_message_store.cpp]` `reset()` builds `r.state = { now, 1, 1 }`; upstream
 `reset()` is `DELETE FROM messages WHERE <key>` then `UPDATE sessions SET
 creation_time=..., incoming_seqnum=1, outgoing_seqnum=1 WHERE <key>`
-(`[QF PostgreSQLStore.cpp:282-318]`).
+(`[QF PostgreSQLStore.cpp:282-318]`). "Every message" means every number,
+with no range predicate: including rows at or above the old
+`nextSenderMsgSeqNum` (D8); upstream's `DELETE` has only the key in its
+`WHERE`, and `FileStore::reset()` unlinks all four files
+(`[QF FileStore.cpp:121-126,314-323]`). A range-limited delete
+(`msgseqnum < nextSender`) leaves old-numbering rows behind; the first time
+the sender number passes one of them without rewriting it (a
+`session.setNextSenderMsgSeqNum()` jump), a resend serves a message from
+before the reset.
 
 **F2. Atomic where the backend allows (one transaction).** Where it does not,
 keep upstream's order: delete the messages FIRST, then write the state.
@@ -376,6 +527,22 @@ numbers the peer has already seen. Sources: `[README]` "The store is
 write-through"; `[js_message_store.h]` file comment; upstream `FileStore::set()`
 `fflush`es both files before returning (`[QF FileStore.cpp:269-275]`).
 
+What "durable" means, concretely. Upstream's floor is "survives the crash of
+the PROCESS": `FileStore` calls `fflush` (into the OS page cache), never
+`fsync` (`[QF FileStore.cpp:269-275,341-343,352-354]`), and the SQL stores
+return after the server acknowledged an autocommit statement. Surviving a crash
+of the HOST or the database server depends on the server's own settings, and
+an "autocommit" ack is only as good as them: PostgreSQL `synchronous_commit`
+(`off` acknowledges before the WAL flush), MySQL/InnoDB
+`innodb_flush_log_at_trx_commit` (`0`/`2` flush about once a second), Redis
+`appendfsync` (`everysec`/`no`), MongoDB write concern `j`/`w`. A weaker
+setting is a deliberate trade: on a host crash it can lose the last
+acknowledged writes, i.e. reuse sequence numbers the peer already saw (the
+counterparty then rejects them as too low, and the session needs a manual
+sequence reset). Pick it knowingly; never get the same effect by
+acknowledging before the write was even sent (write-behind). (Derived; the
+server settings are those products' documented knobs, not reproduced here.)
+
 **G2. You need no read cache.** The engine already caches the three state values
 and reads them from its cache; your `load()` is only called at preload, on
 `refresh()`, and on recovery (B3). A cache in the adapter that can disagree
@@ -396,6 +563,17 @@ sync return settles within the event-loop turn that served the call. Sources:
 Map adapter on both sides: reset() on logon, seqnums and messages persist,
 close() on stop".
 
+**G5. What the store does NOT give you: exactly-once inbound processing.** For
+an inbound application message the engine calls your `fromApp` handler first
+(`fromCallback()` at the end of `verify()`, `[QF Session.cpp:1032]`) and only
+then advances the target number (`[QF Session.cpp:1246-1249]`), which is the
+`setSeqNums` write. A crash between the two means the restarted engine still
+expects that number and the peer resends the message: inbound processing is
+at-least-once. Do not try to fix that inside the adapter (by writing the
+number early, for instance); deduplicate in the application, keyed by the
+session, the `MsgSeqNum` and the session's `creationTime` (numbers restart
+after every reset). (Derived from the cited lines.)
+
 ---
 
 ## H. Concurrency and threads
@@ -411,8 +589,9 @@ adapter both sides: 20 messages in order, acceptor store calls never overlap"
 
 **H2. The one overlap: a late settlement.** A call that timed out may still be
 executing when the next call for the same session arrives. For `setMessage`
-that is an upsert race the newer write wins (D5); for `setSeqNums`/`reset` the
-engine stays poisoned until the late write has settled, then reloads (I4).
+nothing in the engine stops the newer call, and on a pool the OLDER write can
+land last (D7: serialise per session); for `setSeqNums`/`reset` the engine
+stays poisoned until the late write has settled, then reloads (I4).
 Source: `[store.test]` "setSeqNums timeout then late resolve: poison,
 disconnect, reload after settlement, reconnect reconciles with PossDupFlag=Y".
 
@@ -462,7 +641,17 @@ be reloaded, hence cannot recover, until that Promise settles. Sources:
 then late resolve ..." (`'no reload before the late write settled'`).
 Recommendation (derived): give your driver statement/connect/acquire timeouts
 SHORTER than `storeTimeoutMs`, so you reject instead of timing out: a rejection
-is settled, and the poison can lift on the very next call.
+is settled, and the poison can lift on the very next call. Prefer limits the
+SERVER enforces (PostgreSQL `statement_timeout`, `lock_timeout`) to a
+client-side one (`pg` `query_timeout`, `mysql2` `timeout`): a client-side
+timeout rejects your Promise while the statement may still run and commit on
+the server. The engine's protection against late writes (no reload while a
+timed-out `setSeqNums`/`reset` is unsettled, I4) trusts your Promise: once it
+has rejected, the engine reloads and moves on, and a statement still running
+on the server can then commit AFTER newer writes: an old `nextSender` written
+over a newer one (sequence numbers reused after the next restart), or the
+D7 failure for `setMessage`. Settle only when the backend is done with the
+statement, and keep per-session writes in call order (D7).
 
 **I3. Severity by method**
 
@@ -472,7 +661,7 @@ is settled, and the poison can lift on the very next call.
 | `create` (preload) | same | n/a |
 | `load` (refresh / reload) | store poisoned (or stays poisoned), `'storeError'` | discarded |
 | `setSeqNums` | **poison** | **poison**, reported as "late" |
-| `setMessage` | not fatal: send resolves `false`, `'storeError'` | discarded (lands as an upsert) |
+| `setMessage` | not fatal: send resolves `false`, `'storeError'` | discarded by the engine, but the write still lands in your backend: keep it ordered (D7) |
 | `getMessages` | not fatal: engine disconnects, peer re-requests | discarded |
 | `reset` | **poison**; never thrown into QuickFIX; constructor-time: `create()` rejects | **poison**, "late" |
 | `close` | `'storeError'` only; `stop()` still resolves | n/a |
@@ -506,7 +695,9 @@ the adapter stalls"). (Derived recommendation.)
 
 **I6. Never swallow a failed write.** Returning normally after a write that did
 not land is the one unrecoverable error: the engine's cache advances (C5) and
-the peer sees sequence numbers your store does not hold.
+the peer sees sequence numbers your store does not hold. The same goes for a
+write that landed DIFFERENTLY (truncated, re-encoded, normalised): reject it
+rather than return normally (A8).
 
 **I7. Teardown.** `stop(true)` fails every pending store call at once;
 a graceful `stop()` lets in-flight writes complete (bounded by the timeout).

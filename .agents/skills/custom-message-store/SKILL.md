@@ -1,6 +1,6 @@
 ---
 name: custom-message-store
-description: Implement a custom MessageStoreAdapter for the napi-quickfix binding (@homaiohq/napi-quickfix) so FIX session state (next sequence numbers, creation time, sent messages for resends) is persisted in the user's own backend. Use whenever the user wants to "implement a message store", "write a MessageStoreAdapter", "persist FIX session state / sequence numbers in Postgres / MySQL / MariaDB / SQL Server / SQLite / MongoDB / Redis / DynamoDB / any database", "reuse / migrate from a QuickFIX C++ database" (the tables of its PostgreSQLStore, MySQLStore or OdbcStore), share those tables with a C++ engine during a cutover or as a standby, or asks what load / create / setSeqNums / setMessage / getMessages / reset / close must do, or how upserts, gaps, timeouts, poison or close() behave. Self-contained: the store contract as sourced rules, the upstream column mapping (DDL linked, not copied), per-backend guidance checked against upstream's own stores, a worked SQL adapter, and a test checklist.
+description: Implement a custom MessageStoreAdapter for the napi-quickfix binding (@homaiohq/napi-quickfix) so FIX session state (next sequence numbers, creation time, sent messages for resends) is persisted in the user's own backend. Use whenever the user wants to "implement a message store", "write a MessageStoreAdapter", "persist FIX session state / sequence numbers in Postgres / MySQL / MariaDB / SQL Server / SQLite / MongoDB / Redis / DynamoDB / any database", "reuse / migrate from a QuickFIX C++ database" (the tables of its PostgreSQLStore, MySQLStore or OdbcStore), share those tables with a C++ engine during a cutover or as a standby, or asks what load / create / setSeqNums / setMessage / getMessages / reset / close must do, or how upserts, gaps, write ordering, late or timed-out writes on a connection pool, poison or close() behave; also when reviewing an existing adapter, or debugging resends that deliver the wrong message, lose messages or reuse sequence numbers. Self-contained: the store contract as sourced rules, the upstream column mapping (DDL linked, not copied), per-backend guidance checked against upstream's own stores, a worked SQL adapter, and a test checklist.
 ---
 
 # Custom message store for napi-quickfix
@@ -62,8 +62,8 @@ Reference files next to this one:
    `'storeError'`, and apply the operational rules (section "Wiring").
 6. **Verify** with `references/test-checklist.md`: the differential script
    against `MapMessageStore`, then the loopback scenarios, then failure
-   injection. Do not skip 1.6 (gap and ordering), 1.11 (time zone) or 3.3
-   (bounded hang).
+   injection. Do not skip 1.6 (gap and ordering), 1.11 (time zone), 1.15-1.18
+   (the logic checks), 3.3 (bounded hang) or 3.6 (late write ordering).
 7. **Review** against the pitfalls list at the end of this file.
 
 ## The interface (from `src/store.ts`)
@@ -145,38 +145,60 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   two **next** (not last-used) sequence numbers, positive safe integers, `1/1`
   for a new session. Messages = outbound only, the raw FIX string with SOH
   (`\x01`) delimiters, stored byte-exact; may contain quotes, backslashes,
-  any UTF-8. Sessions are independent.
+  any UTF-8. Byte-exact is load-bearing: the engine re-checks BodyLength and
+  CheckSum on every resend, and one changed byte aborts the resend of the
+  whole range and wedges the session (A8). Sessions are independent.
 - **`load` / `create` (B).** `load` returns `null` for an unknown session and
   never creates; it is also the refresh and the recovery read. `create` inserts.
   A malformed state is a `TypeError` at startup, an `IOException` later.
 - **`setSeqNums` (C).** Both numbers, every call, one write by primary key;
-  fatal on failure (poison). Resolve after commit.
+  fatal on failure (poison). Resolve after commit. **No monotonic guard**: the
+  numbers go down too (`reset`, `session.setNext*()`); last write wins (C6).
 - **`setMessage` (D).** An upsert: the same seqnum is rewritten after a failed
-  or timed-out send. Never fatal; a late settlement just lands as an upsert.
-  Called before the message hits the wire, so no batching or deferral.
+  or timed-out send, after a crash between the two writes, after a lowered
+  sender number. Never fatal. Called before the message hits the wire, so no
+  batching or deferral. **Per-session writes must land in call order, even
+  one the engine already timed out**: on a pool, a late `setMessage(n, A)` can
+  commit after the retry's `setMessage(n, B)`, and a resend then delivers A,
+  a message the application saw fail (D7; fix: the FIFO wrapper in "Wiring").
+  Store every message (admin ones too, unsent ones too) under exactly the
+  number given; the engine trusts tag 34 inside the string (D8).
 - **`getMessages` (E).** Inclusive `[begin, end]`, ascending **numerically**,
-  gaps omitted, `[]` when none (also when `begin > end`), strings only. Do not
-  copy upstream `MemoryStore::get()` (returns nothing when `begin` is absent).
-  Never fatal (the engine disconnects and the peer re-requests).
-- **`reset` (F).** Delete the session's messages and write the given state
-  (upsert the session row); one transaction where possible, else DELETE first.
-  Persist the `creationTime` you are given. Fatal on failure, but never thrown
-  into QuickFIX.
+  gaps omitted, **exactly one entry per seqnum (the last written)**, `[]` when
+  none (also when `begin > end` or `begin` is 0), strings only. Order and
+  uniqueness are load-bearing: the engine gap-fills between consecutive
+  entries, so a reversed list silently drops every message in the range and a
+  duplicate produces backwards `SequenceReset`s (E2, E10). An append-only or
+  versioned backend must collapse to the latest write. Do not copy upstream
+  `MemoryStore::get()` (returns nothing when `begin` is absent). Never fatal
+  (the engine disconnects and the peer re-requests).
+- **`reset` (F).** Delete ALL the session's messages (no seqnum range: rows
+  above the old next number too) and write the given state (upsert the session
+  row); one transaction where possible, else DELETE first. Persist the
+  `creationTime` you are given. Fatal on failure, but never thrown into
+  QuickFIX.
 - **Durability (G).** Return only once durable: no write-behind, no cache
   standing in for the database; the engine advances its cached numbers after
-  your ack and sends after that. Sync methods are allowed. One engine per
-  session row.
-- **Threads (H).** Per-session calls are serialised; your method runs on the
-  event loop while an engine thread waits. The hot path must not need a libuv
-  threadpool slot (`fs.promises`, `dns.lookup`, `zlib`, async `crypto`), or
-  raise `UV_THREADPOOL_SIZE`. Never await an engine operation on the same
-  session from inside a store method.
+  your ack and sends after that. Upstream's floor is "survives a process
+  crash" (`fflush`, no `fsync`); surviving a host crash depends on the
+  server's flush settings (`synchronous_commit`, `innodb_flush_log_at_trx_commit`,
+  `appendfsync`), a deliberate trade. Sync methods are allowed. One engine per
+  session row. Inbound processing stays at-least-once whatever you do
+  (`fromApp` runs before the number is written): dedupe in the app (G5).
+- **Threads (H).** Per-session calls are serialised by the engine, except a
+  call that timed out (D7); your method runs on the event loop while an engine
+  thread waits. The hot path must not need a libuv threadpool slot
+  (`fs.promises`, `dns.lookup`, `zlib`, async `crypto`), or raise
+  `UV_THREADPOOL_SIZE`. Never await an engine operation on the same session
+  from inside a store method.
 - **Errors (I).** Throw or reject; never hang. `storeTimeoutMs` (default 30 s)
   bounds every call; a timed-out `setSeqNums`/`reset` blocks recovery until it
-  settles, so give the driver shorter timeouts than `storeTimeoutMs`. Poison =
-  the session's writes fail, the engine disconnects it, and the next call after
-  all late writes settled reloads through `load()`; QuickFIX reconciles with the
-  peer at the next logon.
+  settles, so give the driver shorter timeouts than `storeTimeoutMs`, enforced
+  by the server (`statement_timeout`) rather than the client: a Promise that
+  rejects while the statement still commits defeats the engine's ordering.
+  Poison = the session's writes fail, the engine disconnects it, and the next
+  call after all late writes settled reloads through `load()`; QuickFIX
+  reconciles with the peer at the next logon.
 - **`close` (J).** Optional, per session, after `stop()`; not a durability
   hook; do not close a pool shared with other engines from it.
 
@@ -226,7 +248,11 @@ from a shipped implementation; validate with the checklist):
   digits covers 64 bits) or use a numeric field with an index. `setMessage` =
   put/upsert on that key. `getMessages` = one range query
   (`ZRANGEBYSCORE`, `BETWEEN`, `$gte/$lte` + `sort({seq: 1})`), map to the
-  strings, drop nothing but genuinely missing keys.
+  strings, drop nothing but genuinely missing keys. One entry per `seqNum`:
+  if the backend keeps history (an append-only log or stream, versioned
+  items, a table without a unique `(session, seqNum)` key), collapse to the
+  latest write before returning (contract E10), as upstream's `FileStore`
+  does with its append-only body file.
 - *Reset*: a transaction when the store has one (Mongo on a replica set, Redis
   `MULTI/EXEC`, DynamoDB `TransactWriteItems` within its item limit); otherwise
   delete the messages first, then write the state. For stores where "delete all
@@ -241,7 +267,9 @@ from a shipped implementation; validate with the checklist):
   product's own documentation, which this skill does not reproduce). An
   in-memory-only store silently violates rule G1.
 
-Redis sketch (ioredis-style, sync-free, no threadpool use):
+Redis sketch (ioredis-style, sync-free, no threadpool use; one connection runs
+commands in order, which already satisfies contract D7; over a pool or a
+cluster client, wrap it in `serialisePerSession()`):
 
 ```ts
 const k = (id: SessionID) => `fix:${id.toString()}`;
@@ -304,6 +332,45 @@ engine.on('storeError', (sessionID, method, error, poisoned) => {
 - `await engine.stop()` before `Initiator.create({ store: sameAdapter })`
   again; `close()` runs before `stop()` resolves, so the order is guaranteed.
 - Let the application own the pool's lifetime; `close()` is per session.
+- Unless every session has its own connection, wrap the adapter in a
+  per-session FIFO (contract D7). The engine stops overlapping calls for a
+  session only until one times out; after that, a pool can commit an older
+  write after a newer one. The wrapper below fixes the order whatever the
+  backend; it costs nothing while calls are fast, and while one call is stalled
+  the session's later calls queue behind it (and time out), which is the
+  correct outcome for a session whose store is stuck. The queue is the whole
+  fix: do not add fencing tokens, writer ids or clock-based conditions on top
+  (one engine per session row, G3, is an operational rule, and fences add
+  failure modes of their own):
+
+```ts
+import type { MessageStoreAdapter, SessionID } from '@homaiohq/napi-quickfix';
+
+/** Each session's calls run one after another in call order, even past a timeout (contract D7). */
+export function serialisePerSession(inner: MessageStoreAdapter): MessageStoreAdapter {
+  const tails = new Map<string, Promise<unknown>>();
+  function run<T>(id: SessionID, fn: () => T | Promise<T>): Promise<T> {
+    const key = id.toString();
+    const next = (tails.get(key) ?? Promise.resolve()).then(fn, fn); // after the previous call settled, either way
+    tails.set(key, next.catch(() => {}));
+    return next;
+  }
+  return {
+    load: (id) => run(id, () => inner.load(id)),
+    create: (id, state) => run(id, () => inner.create(id, state)),
+    setSeqNums: (id, sender, target) => run(id, () => inner.setSeqNums(id, sender, target)),
+    setMessage: (id, seq, msg) => run(id, () => inner.setMessage(id, seq, msg)),
+    getMessages: (id, begin, end) => run(id, () => inner.getMessages(id, begin, end)),
+    reset: (id, state) => run(id, () => inner.reset(id, state)),
+    ...(inner.close && { close: (id: SessionID) => run(id, () => inner.close!(id)) }),
+  };
+}
+```
+
+  The order it enforces is the order your Promises report: settle only when
+  the backend is done with the statement (server-side `statement_timeout`,
+  not a client-side query timeout that rejects while the server still
+  commits).
 
 ## Pitfalls checklist
 
@@ -342,3 +409,17 @@ Before declaring the adapter done, confirm each of these explicitly:
 16. If a C++ engine shares the tables: its known defects are designed around
     (`upstream-schemas.md` section 8) and only one engine runs a session at a
     time.
+17. Nothing guards the numbers' direction: `setSeqNums(50, 60)` then
+    `setSeqNums(3, 4)` loads `3/4` (no `GREATEST`, no "only if higher"
+    condition, no reject on a decrease: test 1.15).
+18. A late write cannot overtake a newer one for the same session: one
+    connection per session, or the `serialisePerSession` wrapper, with
+    server-side statement timeouts (test 3.6).
+19. `getMessages` returns one entry per seqnum, the last written, even after
+    many rewrites; `begin = 0` works (test 1.16).
+20. `reset` deletes every message of the session, including numbers above the
+    old next sender number (test 1.17).
+21. Nothing filters, re-keys or renumbers messages: admin messages and
+    not-yet-sent ones are stored under exactly the seqnum given.
+22. A real message (non-ASCII text, CR/LF inside a field) still passes its own
+    BodyLength/CheckSum after the round trip (test 1.18).

@@ -115,6 +115,58 @@ Additional adapter-level checks worth a line each:
   `setSeqNums` calls for 5 different sessions concurrently; afterwards each
   session's `load()` and `getMessages()` must match what the oracle holds (H1).
 
+The logic checks below catch designs that pass 1.1-1.10 by accident
+(monotonic guards, append-only logs, range-limited deletes, lossy encodings).
+Append them to `contract()`; the oracle passes all of them.
+
+```ts
+  // 1.15 setSeqNums goes DOWN too: last write wins, no monotonic guard (C6)
+  await store.setSeqNums(FRESH, 50, 60);
+  await store.setSeqNums(FRESH, 3, 4);
+  const down = (await store.load(FRESH))!;
+  assert.deepEqual([down.nextSenderMsgSeqNum, down.nextTargetMsgSeqNum], [3, 4]);
+
+  // 1.16 one entry per seqnum, the LAST write, after many rewrites (E10, D1);
+  //      begin = 0 is answered, not thrown on (E4)
+  for (const v of ['a', 'b', 'c']) await store.setMessage(FRESH, 7, `m7-${v}`);
+  await store.setMessage(FRESH, 8, 'm8');
+  assert.deepEqual(await store.getMessages(FRESH, 0, 9), ['m7-c', 'm8']);
+
+  // 1.17 reset deletes EVERY message, including numbers >= nextSender (F1, D8)
+  await store.setSeqNums(FRESH, 3, 4);
+  await store.setMessage(FRESH, 1000, 'above-next-sender');
+  await store.reset(FRESH, { creationTime: t1, nextSenderMsgSeqNum: 1, nextTargetMsgSeqNum: 1 });
+  assert.deepEqual(await store.getMessages(FRESH, 0, 2 ** 53 - 1), []);
+
+  // 1.18 a real message survives byte for byte: BodyLength and CheckSum still
+  //      verify after the round trip (A5, A6, A8). Non-ASCII on purpose.
+  const wire = fixMessage('8=FIX.4.4', `35=D\x0134=2\x0149=A\x0156=B\x0158=déjà vu ✓ 'q' "dq" \\ \r\n end\x01`);
+  await store.setMessage(FRESH, 2, wire);
+  const [back] = await store.getMessages(FRESH, 2, 2);
+  assert.ok(Buffer.from(back, 'utf8').equals(Buffer.from(wire, 'utf8')), 'byte-identical');
+  assert.ok(checksumOk(back), 'CheckSum still verifies (the engine re-validates on resend)');
+```
+
+with these helpers next to `contract()` (the FIX checksum is the byte sum mod
+256 of everything before `10=`, BodyLength the byte count after `9=...<SOH>`
+up to `10=`; both over UTF-8 bytes):
+
+```ts
+function fixMessage(begin: string, body: string): string {
+  const head = `${begin}\x019=${Buffer.byteLength(body, 'utf8')}\x01`;
+  const sum = [...Buffer.from(head + body, 'utf8')].reduce((a, b) => a + b, 0) % 256;
+  return `${head}${body}10=${String(sum).padStart(3, '0')}\x01`;
+}
+function checksumOk(m: string): boolean {
+  const b = Buffer.from(m, 'utf8');
+  const at = b.lastIndexOf('\x0110=') + 1;
+  const sum = [...b.subarray(0, at)].reduce((a, x) => a + x, 0) % 256;
+  return Number(b.subarray(at + 3, b.length - 1).toString()) === sum;
+}
+```
+
+Scenario → rule: 1.15 C6; 1.16 D1/E4/E10; 1.17 F1/D8; 1.18 A5/A6/A8.
+
 ## 2. Engine-level (loopback)
 
 These need a real engine pair on `127.0.0.1`: an `Acceptor` and an `Initiator`
@@ -161,6 +213,28 @@ revision, see the sources table in `contract.md`) is the minimal version of 2.1-
   and `doesSessionExist(id)` is `false` (test "a session constructed outside its
   session time resets through the adapter on the JS thread; create() awaits
   it").
+- **2.7 Forcing a resend without touching the backend.** Log on with
+  `ResetOnLogon=N` on both sides, send a few orders from the initiator, then
+  rewind the acceptor: `acc.getSession(ACC_ID).setNextTargetMsgSeqNum(n)` with
+  `n` the first order's seqnum, and send one more order. The acceptor sees a
+  number above the one it expects and sends `ResendRequest(n, 0)`; the
+  initiator answers from its adapter's `getMessages(n, next - 1)`. This is how
+  2.8, 2.9 and 3.6 trigger a resend.
+- **2.8 A resend delivers each stored application message once, in order (E2,
+  E10).** With 2.7 over the candidate after three orders `o1..o3` (each
+  written several times if your design keeps history), the acceptor's
+  `fromApp` must see `o1`, `o2`, `o3` with `PossDupFlag=Y` and their original
+  seqnums, then the trigger order, and no `SequenceReset` whose `NewSeqNo` is
+  below its own `MsgSeqNum`. For contrast, the `[probe]` behind E2/E10 wrapped
+  `MapMessageStore.getMessages` to reverse its result: the acceptor got only
+  the trigger order (`SequenceReset-GapFill 2→5` first, `o1..o3` lost); to
+  duplicate every entry: three `SequenceReset`s going backwards.
+- **2.9 A damaged row wedges the session (A8), to see why 1.18 matters.**
+  With `MapMessageStore`, three orders, then change one byte of the middle
+  stored message without changing its length (`11=o2` → `11=oX`), then 2.7:
+  only `o1` is resent, and the acceptor's `getExpectedTargetNum()` stays at
+  the damaged number. Your adapter must never be the thing that changes that
+  byte.
 
 ## 3. Failure injection (wrap the candidate, do not modify it)
 
@@ -191,6 +265,20 @@ it wraps any inner adapter).
 - **3.5 Driver timeouts beat the engine timeout.** Point the adapter at a
   black-holed address (e.g. a firewall-dropped port) and confirm each method
   rejects before `storeTimeoutMs` elapses (I2).
+- **3.6 A late `setMessage` must not overwrite a newer one (D7).** The stall
+  has to sit BELOW the candidate's own ordering, in its driver: wrapping the
+  candidate in `ControlledStore` would park the call before the candidate's
+  FIFO ever sees it. Wrap the candidate's backend call (its `execute`, its pool
+  client, ...) so the first write whose parameters contain `11=A` waits on a
+  Promise you release by hand; `storeTimeoutMs: 300`. Then:
+  `send(A)` resolves `false` (timeout); `send(B)` (any result); release A;
+  `send(C)` resolves `true`; afterwards the row for A's seqnum must hold the
+  last message whose send resolved `true` there (C, or B if B succeeded),
+  never A, and a 2.7 resend from that number must not deliver A. The
+  `[probe]` behind D7 ran this with a pool-like double (no ordering): the row
+  held A and the acceptor's `fromApp` received A with `PossDupFlag=Y`. With a
+  per-session FIFO, `send(B)` failed (queued behind A), A then B landed in
+  order, `send(C)` succeeded, and the row held C.
 
 ## 4. Interop (only when targeting QuickFIX C++ tables)
 
