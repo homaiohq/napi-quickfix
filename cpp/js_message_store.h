@@ -39,13 +39,16 @@
 //     poisons the store; refresh (load): a rejection or timeout does too. A
 //     poisoned store fails every write at once with IOException (inside
 //     sendRaw()'s try, so nothing stamped from its cache reaches the wire:
-//     the session's sends fail), and every inbound message ends in an
+//     the session's sends fail). Poison lifts once every timed-out write
+//     has settled (so a late write has landed) and the next call of any
+//     kind has reloaded the cache through load(); at most one reload is in
+//     flight, and a failed reload keeps the store poisoned for the next
+//     attempt. After a plain rejection that next call (the network thread's
+//     next tick at the latest) usually lifts it with the session still up.
+//     While it cannot lift, every inbound message ends in an
 //     incrNextTargetMsgSeqNum() that throws, so QuickFIX disconnects the
-//     session at its next inbound message (a heartbeat at the latest).
-//     Poison lifts once every timed-out write has settled (so a late write
-//     has landed) and the next call of any kind has reloaded the cache
-//     through load(); at most one reload is in flight, and a failed reload
-//     keeps the store poisoned for the next attempt.
+//     session at its next inbound message (a heartbeat at the latest); a
+//     failure of that inbound write itself disconnects at once.
 //   * A failed reset() is not undone by that reload, which would restore the
 //     numbers QuickFIX meant to discard (a ResetOnLogon=Y Logon would leave
 //     with the old MsgSeqNum and no ResetSeqNumFlag). It stays pending, and

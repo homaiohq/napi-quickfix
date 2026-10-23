@@ -24,8 +24,9 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   `IOException` and are reported through the new `'storeError'` event: `setMessage`/
   `getMessages` failures are never fatal; `setSeqNums`/`reset` rejections, timeouts and
   late settlements (and `load` failures) poison the session's store until it has been
-  reloaded, which takes the session down and lets QuickFIX reconcile with the peer at
-  the next logon; a failed `reset` is retried rather than undone by that reload, so
+  reloaded: a reload that succeeds at the next store call lifts it with the session
+  still up, otherwise the session is taken down at its next inbound message and
+  QuickFIX reconciles with the peer at the next logon; a failed `reset` is retried rather than undone by that reload, so
   the session never goes on with the numbers it meant to discard. `reset()`/`refresh()`
   and the seqnum reads never throw into QuickFIX (its `ResetOnDisconnect`/`RefreshOnLogon`
   paths, a connect after the session period ended, and its `RejectLogon`/

@@ -86,9 +86,14 @@ export interface EngineEvents {
    * a malformed value, or timed out (`storeTimeoutMs`), or a timed-out call
    * settled afterwards. `poisoned` is `true` when the failure made the
    * session's store refuse every call until it has been reloaded from the
-   * adapter (README: "Message store"); the engine disconnects that session
-   * on its next tick or inbound message, and reconciles sequence numbers
-   * with the peer at the next logon. Observe-only, like every event.
+   * adapter (README: "Message store"). The next store call attempts that
+   * reload once every timed-out write has settled; if it succeeds the poison
+   * lifts and the session stays up (a rejected write on a send: that send
+   * resolved `false`). While it cannot lift (a timed-out write still
+   * unsettled, the adapter still failing), the engine disconnects the
+   * session at its next inbound message, and reconciles sequence numbers
+   * with the peer at the next logon; a failed inbound sequence-number write
+   * disconnects it at once. Observe-only, like every event.
    */
   storeError: [sessionID: SessionID, method: MessageStoreMethod, error: QuickFixError, poisoned: boolean];
 }

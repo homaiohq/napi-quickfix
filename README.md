@@ -695,12 +695,18 @@ the session log.
   or late write was committed: a late increment leaves the cache one behind the
   database, a late reset leaves it with the old numbers while the database says
   `1/1` with the messages gone. A poisoned store fails every write at once, so
-  every send fails before it reaches the wire (no stale number is ever sent),
-  and every inbound message ends in a sequence-number write, so the engine
+  every send fails before it reaches the wire (no stale number is ever sent).
+  How long that lasts depends on the reload below: after a plain rejection
+  (nothing left unsettled) the next store call reloads, the network thread's
+  next tick at the latest, and if the reload succeeds the poison lifts with
+  the session still up (the send whose write was rejected resolved `false`;
+  the next send takes the number the reload found). While the poison cannot
+  lift (a timed-out write still unsettled, or the reload failing too), every
+  inbound message ends in a sequence-number write that fails, so the engine
   disconnects the session at its next inbound message (a heartbeat at the
-  latest). A poisoned initiator's Logon cannot be persisted either; QuickFIX has
-  already counted it as sent, so that connection attempt ends at
-  `LogonTimeout`. `'storeError'` fires with `poisoned: true`, and the
+  latest); a failed inbound sequence-number write disconnects it at once. A
+  poisoned initiator's Logon cannot be persisted either; QuickFIX has already
+  counted it as sent, so that connection attempt ends at `LogonTimeout`. `'storeError'` fires with `poisoned: true`, and the
   `getExpected*()` getters throw `IOException` until it lifts. **Poison lifts in
   two steps**, whatever `RefreshOnLogon` says: once every timed-out write has
   settled (so a late write has landed), the next store call of any kind first

@@ -906,7 +906,9 @@ describe('MessageStoreAdapter: failure policy', () => {
       const poison = storeErrors.find((e) => e.method === 'setSeqNums');
       assert.ok(poison?.poisoned, 'storeError carries poisoned: true');
       assert.throws(() => session.getExpectedSenderNum(), isIOException);
-      // Down on the network thread's next tick or inbound message.
+      // Down at its next inbound message (the peer's heartbeat at the
+      // latest): the unsettled write keeps the poison, so the target write
+      // that ends every inbound message fails.
       await logout;
       assert.equal(session.isLoggedOn(), false);
       // A send now fails on the poisoned store (persist() cannot write).
@@ -934,6 +936,67 @@ describe('MessageStoreAdapter: failure policy', () => {
       assert.equal(received[0].possDup, 'Y');
       assert.equal(received[0].clOrdID, 'late');
       assert.doesNotThrow(() => session.getExpectedSenderNum());
+    } finally {
+      await stopBoth(acc, ini);
+    }
+  });
+
+  test('a send whose setSeqNums rejects once: poisoned, healed by the next call\'s reload, no disconnect, the seqnum is reused', { timeout: 30_000 }, async () => {
+    const port = await freePort();
+    // Reject exactly the incr of the order tagged 'fail' (its setMessage
+    // arms it): an inbound increment writes the sender number unchanged, so
+    // a heartbeat arriving meanwhile cannot take the rejection.
+    let armed = 0;
+    let rejected = false;
+    class ArmedStore extends ControlledStore {
+      override setMessage(id: SessionID, seq: number, msg: string): Promise<void> {
+        if (msg.includes('\x0111=fail\x01')) armed = seq;
+        return super.setMessage(id, seq, msg);
+      }
+    }
+    const iniStore = new ArmedStore();
+    iniStore.set('setSeqNums', 'reject', (args) => {
+      if (rejected || armed === 0 || args[1] !== armed + 1) return false;
+      rejected = true;
+      return true;
+    });
+    const { acc, ini, received, storeErrors } = await makePair(port, { iniStore });
+    let logouts = 0;
+    ini.on('logout', () => logouts++);
+    acc.on('logout', () => logouts++);
+    try {
+      await logonBoth(acc, ini);
+      const session = ini.getSession(INI_ID)!;
+      const seq = session.getExpectedSenderNum();
+      const loadsBefore = iniStore.count('load'); // the preload
+      assert.equal(await sendToTarget(newOrder('fail'), INI_ID), false, 'the incr rejected: the send failed');
+      assert.ok(rejected, 'the rejection hit the order\'s incr');
+      assert.ok(await waitUntil(() => storeErrors.some((e) => e.method === 'setSeqNums'), T));
+      assert.deepEqual(
+        storeErrors.map((e) => [e.method, e.poisoned]),
+        [['setSeqNums', true]],
+      );
+      // Nothing is unsettled (a rejection, not a timeout), so the next store
+      // call -- the network thread's next tick at the latest -- reloads, the
+      // reload succeeds, and the poison lifts with no disconnect.
+      const lifted = () => {
+        try {
+          session.getExpectedSenderNum();
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      assert.ok(await waitUntil(lifted, T), 'the poison lifted');
+      assert.ok(iniStore.count('load') > loadsBefore, 'lifted by a reload through load()');
+      assert.equal(session.getExpectedSenderNum(), seq, 'the reload kept the number the failed send did not consume');
+      assert.equal(await sendToTarget(newOrder('ok'), INI_ID), true);
+      assert.ok(await waitUntil(() => received.length === 1, T));
+      assert.equal(received[0].clOrdID, 'ok');
+      assert.equal(received[0].seq, seq, 'the next send reused the seqnum');
+      assert.equal(iniStore.row(INI_ID).state.nextSenderMsgSeqNum, seq + 1);
+      assert.equal(logouts, 0, 'neither side disconnected');
+      assert.equal(session.isLoggedOn(), true);
     } finally {
       await stopBoth(acc, ini);
     }
