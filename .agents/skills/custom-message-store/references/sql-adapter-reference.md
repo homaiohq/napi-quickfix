@@ -1,13 +1,18 @@
 # Worked example: the generic SQL adapter (abridged: DDL elided)
 
-This is `src/store/sql.ts` as it existed on `@homaiohq/napi-quickfix` branch
-`feat/js-message-store` @ `f802818` (PR #31; introduced by commit `6b8caa0`
-"feat: generic SQL message-store adapter"; not in the checkout that carries
-this skill, it ships with PR #33). It was removed from that pull request to
-be shipped separately; it is reproduced here, abridged (the body of
-`sqlSchema()` is elided: this skill links to schemas, it does not copy them,
-see `upstream-schemas.md` section 5), as the executable form of the
-contract in `contract.md`, because it passed `test/store-sql.test.ts` (the
+This is `src/store/sql.ts` of `@homaiohq/napi-quickfix` at commit `f802818`
+(PR #31; introduced by commit `6b8caa0` "feat: generic SQL message-store
+adapter"; in no release yet, it ships with PR #33). Permalinks, readable
+without a checkout:
+
+- the adapter: https://github.com/homaiohq/napi-quickfix/blob/f802818ad6d0fc92be3ab61bb81b1b99521d4a49/src/store/sql.ts
+- its test: https://github.com/homaiohq/napi-quickfix/blob/f802818ad6d0fc92be3ab61bb81b1b99521d4a49/test/store-sql.test.ts
+- its DDL: https://github.com/homaiohq/napi-quickfix/tree/f802818ad6d0fc92be3ab61bb81b1b99521d4a49/sql
+
+It was removed from PR #31 to be shipped separately; it is reproduced here,
+abridged (the body of `sqlSchema()` is elided: this skill links to schemas, it
+does not copy them, see `upstream-schemas.md` section 5), as the executable
+form of the contract in `contract.md`, because it passed `test/store-sql.test.ts` (the
 `contract()` function, a subset of section 1 of `test-checklist.md`, which
 adds begin > end, gaps and numeric order, seqnums at 2^40; and a loopback
 restart) against `node:sqlite` and PostgreSQL. Run the full section 1 against

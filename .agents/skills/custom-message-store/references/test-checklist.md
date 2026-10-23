@@ -7,8 +7,11 @@ candidate and compare the outputs. The examples these scenarios are lifted
 from: the SQL adapter test of the source revision (`contract()`, which
 section 1 below extends with begin > end, gaps and numeric order, seqnums at
 2^40 and the safe-integer check, and `loopback()`; see the sources table in `contract.md`),
-and, in the repository, `test/store.test.ts` and the test doubles in `test/store-adapters.ts`
-(`ControlledStore`: per-method `'ok' | 'reject' | 'hang' | 'defer'`).
+and, in the repository (not in the npm package; see `contract.md` for where to
+open them), `test/store.test.ts` and the test doubles in
+`test/store-adapters.ts`. Everything a scenario needs from those files is
+spelled out below, so none of them is required: section 3 carries a
+self-contained version of the fault-injecting wrapper.
 
 All scenarios use `SessionID` values; build them with
 `new SessionID('FIX.4.4', 'A', 'B')` and `new SessionID('FIX.4.2', 'A', 'B', 'q1')`.
@@ -173,11 +176,14 @@ Scenario → rule: 1.15 C6; 1.16 D1/E4/E10; 1.17 F1/D8; 1.18 A5/A6/A8.
 These need a real engine pair on `127.0.0.1`: an `Acceptor` and an `Initiator`
 with mirrored session ids (`FIX.4.4:CLIENT->SERVER` on the initiator,
 `FIX.4.4:SERVER->CLIENT` on the acceptor), `UseDataDictionary=N`,
-`StartTime=00:00:00`, `EndTime=00:00:00`, `HeartBtInt=30`, `log: 'none'`. In the
-repository, `test/helpers.ts` (`acceptorCfg(port)`, `initiatorCfg(port)`,
-`freePort()`, `waitForEvent()`, `waitUntil()`) and `test/store-adapters.ts`
-(`withSettings()`) build exactly that; the SQL adapter test's `loopback()` (source
-revision, see the sources table in `contract.md`) is the minimal version of 2.1-2.2.
+`StartTime=00:00:00`, `EndTime=00:00:00`, `HeartBtInt=30`, `log: 'none'`, a
+free port (listen on port 0 with `node:net`, read the port, close, use it),
+and `SocketConnectHost=127.0.0.1` / `SocketConnectPort` on the initiator,
+`SocketAcceptPort` on the acceptor. Wait for state with a small poll
+(`until(() => engine.isLoggedOn(id))`) or `once(engine, 'logon')`, never with a
+fixed sleep. (The repository's `test/helpers.ts` and `test/store-adapters.ts`
+build exactly that; the SQL adapter test's `loopback()`, see the sources table
+in `contract.md`, is the minimal version of 2.1-2.2.)
 
 - **2.1 Numbering continues across a restart (`ResetOnLogon=N`).** Start both
   with the candidate adapter, log on, send two application messages, stop both
@@ -239,11 +245,59 @@ revision, see the sources table in `contract.md`) is the minimal version of 2.1-
 
 ## 3. Failure injection (wrap the candidate, do not modify it)
 
-Wrap the candidate in an object that forwards every method but can be told to
-reject / hang per method (copy `ControlledStore` from `test/store-adapters.ts`;
-it is typed to wrap a `MapMessageStore`: retype its `inner` field and
-constructor parameter as `MessageStoreAdapter`, and drop its `row()` helper,
-which reads `MapMessageStore.rows`, to wrap yours).
+Wrap the candidate in an object that forwards every method but can be told,
+per method, to reject, hang, or park the call until the test settles it. A
+self-contained version (the repository's `ControlledStore` in
+`test/store-adapters.ts` does the same over a `MapMessageStore`):
+
+```ts
+import type { MessageStoreAdapter, MessageStoreMethod } from '@homaiohq/napi-quickfix';
+
+/**
+ * 'ok'     forward to the candidate.
+ * 'reject' reject at once; the candidate is NOT called.
+ * 'hang'   never settle; the candidate is NOT called.
+ * 'defer'  park the call in `parked`; `resolve()` THEN forwards it to the
+ *          candidate and settles with the candidate's outcome, `reject()`
+ *          rejects without calling the candidate. Use it to release a timed-out
+ *          call late, after the engine gave up on it.
+ */
+type Mode = 'ok' | 'reject' | 'hang' | 'defer';
+interface Parked { method: MessageStoreMethod; args: unknown[]; resolve(): void; reject(err?: Error): void }
+
+export function faulty(inner: MessageStoreAdapter) {
+  const modes = new Map<MessageStoreMethod, Mode>();
+  const parked: Parked[] = [];
+  const calls: MessageStoreMethod[] = [];
+  const wrap = (method: MessageStoreMethod) => (...args: unknown[]) => {
+    calls.push(method);
+    const call = () => (inner[method] as (...a: unknown[]) => unknown).apply(inner, args);
+    switch (modes.get(method) ?? 'ok') {
+      case 'reject': return Promise.reject(new Error(`injected ${method} rejection`));
+      case 'hang': return new Promise(() => {});
+      case 'defer':
+        return new Promise((resolve, reject) => parked.push({
+          method, args,
+          resolve: () => { Promise.resolve().then(call).then(resolve, reject); },
+          reject: (err = new Error(`injected ${method} rejection`)) => reject(err),
+        }));
+      default: return call();
+    }
+  };
+  const store = {
+    load: wrap('load'), create: wrap('create'), setSeqNums: wrap('setSeqNums'),
+    setMessage: wrap('setMessage'), getMessages: wrap('getMessages'), reset: wrap('reset'),
+    ...(inner.close && { close: wrap('close') }),
+  } as MessageStoreAdapter;
+  return { store, modes, parked, calls };
+}
+```
+
+`'storeError'` is delivered through the event loop, independently of the
+`sendToTarget()` Promise: it can arrive AFTER that Promise settled. In every
+scenario below, wait for the event (`once(engine, 'storeError')`, or a poll on
+an array your listener fills) instead of asserting on it right after
+`await sendToTarget(...)`; tests written the other way are flaky.
 
 - **3.1 `setMessage` rejects.** `sendToTarget()` resolves `false`,
   `getExpectedSenderNum()` is unchanged, the session is still logged on,
@@ -266,8 +320,12 @@ which reads `MapMessageStore.rows`, to wrap yours).
   until the parked Promise is settled (test "setSeqNums timeout then late
   resolve ...").
 - **3.4 Nothing hangs the process.** With a hung `setMessage` and no `stop()`,
-  the process still exits once the timeout released the engine thread (the
-  repository runs this in a child process: `test/fixtures/store-child.ts`).
+  the process still exits once the timeout released the engine thread. Run it
+  in a child process (`node:child_process` `fork()` of a small script that
+  builds the pair, parks a send and returns; the parent asserts the child's
+  exit within the timeout plus a margin, and kills it otherwise). Then the same
+  with an explicit `process.exit(1)` while the send is parked: it must exit at
+  once.
 - **3.5 Driver timeouts beat the engine timeout.** Point the adapter at a
   black-holed address (e.g. a firewall-dropped port) and confirm each method
   rejects before `storeTimeoutMs` elapses (I2).

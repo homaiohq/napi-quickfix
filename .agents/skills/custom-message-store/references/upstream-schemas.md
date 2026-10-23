@@ -9,17 +9,15 @@ the tables with a C++ engine during a cutover or as a standby.
 ## Provenance
 
 - QuickFIX C++ **v1.16.0**, the tag pinned by this binding's `CMakeLists.txt`
-  (`FetchContent_Declare(quickfix ... GIT_TAG v1.16.0)`). Files were read from
-  the FetchContent checkout (`build/_deps/quickfix-src`, commit
-  `2ce8a60667d95a55cdc57a210f165e19cb757126`, `project(... VERSION 1.16.0)`).
-  Upstream paths are relative to the QuickFIX repository root. Line numbers are
-  those of v1.16.0.
+  (`FetchContent_Declare(quickfix ... GIT_TAG v1.16.0)`), commit
+  `2ce8a60667d95a55cdc57a210f165e19cb757126`:
+  https://github.com/quickfix/quickfix/tree/v1.16.0. Upstream paths are
+  relative to the QuickFIX repository root. Line numbers are those of v1.16.0.
 - No DDL is reproduced in this skill, neither upstream's (section 5 links to
   it) nor the binding's own: that one is `sqlSchema()` in `src/store/sql.ts`
-  and `sql/*.sql` on the branch that ships the SQL adapter
-  (`@homaiohq/napi-quickfix` branch `feat/js-message-store` @ `f802818`,
-  PR #31, identical at `6b8caa0`, the commit that added it; not in the
-  checkout that carries this skill, it ships with PR #33), elided from the
+  and `sql/*.sql` of the generic SQL adapter, in no release yet (PR #33), at
+  commit `f802818` of https://github.com/homaiohq/napi-quickfix (PR #31,
+  identical at `6b8caa0`, the commit that added it), elided from the
   reproduction in `sql-adapter-reference.md`; it was tested against
   `node:sqlite` and PostgreSQL by that revision's SQL adapter test.
 - **Verification** (2026-10-23). Statements marked "observed" were run, not
@@ -182,15 +180,14 @@ upstream deployment means an empty prefix.
 QuickFIX ships its table definitions in the repository under `src/sql/`, one
 subdirectory per dialect:
 
-**https://github.com/quickfix/quickfix/tree/master/src/sql**
+**https://github.com/quickfix/quickfix/tree/v1.16.0/src/sql**
 
-This skill does not reproduce them. When you need the exact DDL (column types,
-primary keys, the log tables), fetch the files from that link, or ask the user
-to paste them. For exact parity with the engine this binding pins, open the
-`v1.16.0` tag rather than `master`:
-https://github.com/quickfix/quickfix/tree/v1.16.0/src/sql (the same files are
-in the local FetchContent checkout, `build/_deps/quickfix-src/src/sql/`). In
-v1.16.0 the files are:
+That is the tag this binding pins; `master` had no change there as of
+2026-10-23 (https://github.com/quickfix/quickfix/tree/master/src/sql). This
+skill does not reproduce the files, and the npm package does not ship them.
+When you need the exact DDL (column types, primary keys, the log tables),
+fetch them from that link, or ask the user to paste them. In v1.16.0 the files
+are:
 
 | Dialect | Directory | Store tables (what an adapter reads/writes) | Log tables (upstream's SQL *log*, never touched by a store) | Driver scripts |
 | --- | --- | --- | --- | --- |
@@ -215,7 +212,7 @@ key collation), and per backend in section 7.
 upstream files; it carries its own idempotent (`IF NOT EXISTS`) table statements of the same
 layout (`DATETIME(3)` for MySQL so the binding's millisecond `creation_time`
 survives, a plain-typed SQLite variant) in `sqlSchema(dialect)` of
-`src/store/sql.ts` and as `sql/*.sql`, on the branch that ships the adapter;
+`src/store/sql.ts` and as `sql/*.sql`, at the commit cited in "Provenance";
 the reproduction in `sql-adapter-reference.md` elides them (the same rule as
 for upstream: link, do not copy); those statements were tested against
 `node:sqlite` and PostgreSQL. Interop with an upstream deployment means using

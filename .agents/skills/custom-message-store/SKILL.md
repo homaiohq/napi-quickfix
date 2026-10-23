@@ -16,22 +16,36 @@ ascending range with gaps omitted" means, when a write must already be durable,
 which failures the engine tolerates and which poison the session, and what the
 upstream tables' columns really mean. This skill is that knowledge, sourced.
 
-**Sources and versions.** The binding as it is in the checkout that carries this
-skill (`@homaiohq/napi-quickfix`, unreleased after 0.3.1: CHANGELOG
-`[Unreleased]`; branch `feat/message-store-adapter`, PR #32): `src/store.ts`,
-`cpp/js_message_store.{h,cpp}`, `README.md` "Message store", `ARCHITECTURE.md`
-§4b/§5, `test/store.test.ts`, `test/store-adapters.ts`. The generic SQL adapter
-is not in this checkout: its source, its test (whose `contract()` section 1 of
-`references/test-checklist.md` extends: begin > end, gaps, numeric order,
-seqnums at 2^40) and its README section are cited at branch
-`feat/js-message-store` @ `f802818` (PR #31), and ship with PR #33. And
-QuickFIX C++
-**v1.16.0**
-(the tag `CMakeLists.txt` pins). Every rule in the references cites one of them;
-when the skill and a newer repository disagree, the repository wins: re-read the
-cited file. The interop guidance was also checked by running upstream's own
-`PostgreSQLStore`/`MySQLStore`/`OdbcStore` against PostgreSQL 16, MySQL 8.4 and
-SQL Server 2022 (`upstream-schemas.md` "Verification").
+**Sources and versions.** The binding at the revision that carries this skill
+(`@homaiohq/napi-quickfix`, unreleased after 0.3.1: CHANGELOG `[Unreleased]`,
+PR #32), and QuickFIX C++ **v1.16.0** (the tag the binding's `CMakeLists.txt`
+pins). Where to read each cited file:
+
+- **In the installed package** (`node_modules/@homaiohq/napi-quickfix/`):
+  `README.md` ("Message store"), the typings and compiled code under `dist/`
+  (`dist/esm/store.d.ts` and `store.js`: the interface and `MapMessageStore`),
+  and the native bridge `cpp/js_message_store.{h,cpp}`.
+- **In the repository only** (public:
+  https://github.com/homaiohq/napi-quickfix): `src/store.ts` (the TypeScript
+  source of `dist/esm/store.js`), `ARCHITECTURE.md` §4b/§5,
+  `test/store.test.ts`, `test/store-adapters.ts`. Open them at the tag of the
+  version you installed (`/blob/v<version>/<path>`); until the store ships in a
+  release, at `main` once PR #32 is merged, else on branch
+  `feat/message-store-adapter`.
+- **The generic SQL adapter** (its source, its test, whose `contract()` section 1
+  of `references/test-checklist.md` extends, and its README section) is in no
+  release yet (PR #33); it is cited at commit `f802818`, permalinks in
+  `references/sql-adapter-reference.md`.
+- **QuickFIX C++**: https://github.com/quickfix/quickfix/tree/v1.16.0, paths
+  under `src/C++/`.
+
+Every rule in the references cites one of them; when the skill and a newer
+revision disagree, the newer file wins: re-read it. The interop guidance was
+also checked by running upstream's own `PostgreSQLStore`/`MySQLStore`/
+`OdbcStore` against PostgreSQL 16, MySQL 8.4 and SQL Server 2022
+(`upstream-schemas.md` "Verification"), and the adapter guidance by a
+PostgreSQL adapter written from this skill alone and run against a live
+counterparty and injected faults (issue #35 on the repository).
 
 Reference files next to this one:
 
@@ -122,8 +136,9 @@ export interface MessageStoreAdapter {
 reference implementation: a `Map` keyed by `sessionID.toString()`, each row
 `{ state, messages: Map<number, string> }`; its `getMessages` sorts numerically
 and filters the inclusive range; its `reset` clears the messages and replaces
-the state, creating the row when missing. Read it (`src/store.ts`) when a rule
-is unclear: it is the oracle the test checklist compares against.
+the state, creating the row when missing. Read it (`dist/esm/store.js` in the
+installed package, `src/store.ts` in the repository) when a rule is unclear: it
+is the oracle the test checklist compares against.
 
 ## Lifecycle: who calls what, when, on which thread
 

@@ -1,18 +1,25 @@
 # The MessageStoreAdapter contract, as rules
 
-Every rule below is sourced. The sources, and the versions they were read at:
+Every rule below is sourced. `REPO` is the binding's public repository,
+https://github.com/homaiohq/napi-quickfix; "same revision" means the revision
+that carries this skill (unreleased after 0.3.1, CHANGELOG `[Unreleased]`,
+PR #32): open repository-only files at the tag of the version you installed
+(`REPO/blob/v<version>/<path>`), or on `main` / branch
+`feat/message-store-adapter` until the store is released. The sources, and the
+versions they were read at:
 
 | Tag | Meaning |
 | --- | --- |
-| `[store.ts]` | `src/store.ts` of `@homaiohq/napi-quickfix` as it is in the checkout that carries this skill (unreleased after 0.3.1, CHANGELOG `[Unreleased]`; branch `feat/message-store-adapter`, PR #32) (the TS interface, its JSDoc, `MapMessageStore`, `StoreBinding.preload()`/`closeAll()`, `validState()`) |
-| `[js_message_store.h]` / `[js_message_store.cpp]` | `cpp/js_message_store.{h,cpp}`, same revision (the native `FIX::MessageStore` over the adapter: dispatch, cache, timeout, poison, `ParseResult`) |
-| `[README]` | `README.md` section "Message store", same revision |
-| `[README@f802818]` | `README.md` section "Generic SQL adapter" at branch `feat/js-message-store` @ `f802818` (PR #31); not in this checkout, it ships with the SQL adapter (PR #33) |
-| `[ARCH]` | `ARCHITECTURE.md` §4b "The message-store bridge" and §5 "Lock order", same revision |
-| `[store.test]` | `test/store.test.ts`, same revision; cited by test title |
-| `[store-sql.test]` | the SQL adapter test, `test/store-sql.test.ts` at branch `feat/js-message-store` @ `f802818` (PR #31; `contract()` identical at `6b8caa0`, the commit that introduced the SQL adapter, and on `feat/sql-message-store`, PR #33): `contract()`, reproduced as section 1 of `test-checklist.md`, and `loopback()`. Not in this checkout |
-| `[QF <file>:<line>]` | QuickFIX C++ **v1.16.0** (the tag pinned by `CMakeLists.txt` `GIT_TAG v1.16.0`; FetchContent checkout `2ce8a60667d95a55cdc57a210f165e19cb757126`), path under `src/C++/` |
-| `[probe]` | a loopback probe run on 2026-10-23 through the binding at `4dc1231` (branch `feat/message-store-adapter`, an ancestor of this checkout; later commits changed the poison, reset-retry and reload paths, none of which the probes exercise: the seqnum writes of a healthy store, `setMessage` ordering, `getMessages` parsing): a real `Acceptor` + `Initiator` over 127.0.0.1, the initiator on a test-double adapter. Each probe is reproduced as a scenario in `test-checklist.md` (the rule names it), so you can rerun it against your adapter |
+| `[store.ts]` | `src/store.ts` of `@homaiohq/napi-quickfix`, same revision (the TS interface, its JSDoc, `MapMessageStore`, `StoreBinding.preload()`/`closeAll()`, `validState()`). Repository only; the installed package has it compiled as `dist/esm/store.js` + `store.d.ts` |
+| `[js_message_store.h]` / `[js_message_store.cpp]` | `cpp/js_message_store.{h,cpp}`, same revision (the native `FIX::MessageStore` over the adapter: dispatch, cache, timeout, poison, `ParseResult`). Shipped in the package (`cpp/`) |
+| `[README]` | `README.md` section "Message store", same revision. Shipped in the package |
+| `[README@f802818]` | `README.md` section "Generic SQL adapter" at commit `f802818` (`REPO/blob/f802818ad6d0fc92be3ab61bb81b1b99521d4a49/README.md`, PR #31); in no release yet, it ships with the SQL adapter (PR #33) |
+| `[ARCH]` | `ARCHITECTURE.md` §4b "The message-store bridge" and §5 "Lock order", same revision. Repository only |
+| `[store.test]` | `test/store.test.ts`, same revision; cited by test title. Repository only |
+| `[store-sql.test]` | the SQL adapter test at commit `f802818` (`REPO/blob/f802818ad6d0fc92be3ab61bb81b1b99521d4a49/test/store-sql.test.ts`, PR #31; `contract()` identical at `6b8caa0`, the commit that introduced the SQL adapter, and in PR #33): `contract()`, reproduced as section 1 of `test-checklist.md`, and `loopback()`. In no release yet |
+| `[QF <file>:<line>]` | QuickFIX C++ **v1.16.0** (the tag pinned by `CMakeLists.txt` `GIT_TAG v1.16.0`, commit `2ce8a60667d95a55cdc57a210f165e19cb757126`), path under `src/C++/`: https://github.com/quickfix/quickfix/tree/v1.16.0/src/C++ |
+| `[probe]` | a loopback probe run on 2026-10-23 through the binding at `4dc1231` (PR #32, an ancestor of this revision; later commits changed the poison, reset-retry and reload paths, none of which the probes exercise: the seqnum writes of a healthy store, `setMessage` ordering, `getMessages` parsing): a real `Acceptor` + `Initiator` over 127.0.0.1, the initiator on a test-double adapter. Each probe is reproduced as a scenario in `test-checklist.md` (the rule names it), so you can rerun it against your adapter |
+| `[trial]` | issue #35 (`REPO/issues/35`): a PostgreSQL adapter written from this skill alone (`pg` 8.23.1, PostgreSQL 16.15, Node 22) and run against a live counterparty's FIX UAT and through local fault injection (frozen, stopped and restarted server, `pg_terminate_backend`, a TCP proxy holding one connection's bytes, `kill -9`) |
 
 Where a rule is *derived* (a consequence of sourced facts rather than a
 sentence in a source) it says so.
