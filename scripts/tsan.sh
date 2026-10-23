@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Build the addon (and QuickFIX) with ThreadSanitizer into build-tsan/, run the
-# test suite against it, and fail if any TSan report has a frame in this
-# addon's store or bridge code.
+# test suite against it, and fail if a TSan report races in this addon's code
+# or is a QuickFIX race not known to be upstream's.
 #
 #   scripts/tsan.sh [test files...]      (default: the whole suite)
 #
 # Node itself is not instrumented, so the run is expected to produce reports in
-# node / V8 / libstdc++ frames; those are noise. The gate is on reports whose
-# stacks mention napi_quickfix:: or cpp/ frames of ours. QuickFIX's own frames
-# are listed in the summary but do not fail the run (the baseline before the
-# store work had none).
+# node / V8 / libstdc++ frames; those are noise. QuickFIX v1.16.0 has races of
+# its own (FIX::Mutex's recursion bookkeeping, SessionState's enabled flag and
+# heartbeat timestamps), reached from any thread that calls into a session;
+# they are listed but do not fail the run. scripts/tsan-gate.py classifies
+# each report by its two racing accesses and holds that list.
 #
-# Linux only. Requires gcc with libtsan (gcc -print-file-name=libtsan.so).
+# Linux only. Requires gcc with libtsan (gcc -print-file-name=libtsan.so),
+# binutils (nm, addr2line) and python3.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -33,12 +35,36 @@ if [ -n "$QF_SRC" ]; then
   extra+=("--CDFETCHCONTENT_SOURCE_DIR_QUICKFIX=$QF_SRC")
 fi
 
-npx cmake-js compile --out "$OUT" \
+# The sanitizer flags go through the per-config variables: cmake-js passes its
+# own -DCMAKE_CXX_FLAGS=-DBUILDING_NODE_EXTENSION AFTER the --CD defines on
+# Linux, so a --CDCMAKE_CXX_FLAGS (or CXXFLAGS) is silently replaced and only
+# the linker flag gets through. QuickFIX writes its archive to
+# QUICKFIX_LIB_OUTPUT_DIR (default: <repo>/lib, shared with the regular build):
+# keep the instrumented one apart so it is never linked into build/.
+# configure, then build: `cmake-js compile`/`build` skip the configure step
+# for an already-configured $OUT, so changed --CD values would never reach
+# its cache.
+san="-fsanitize=thread -fno-omit-frame-pointer"
+npx cmake-js configure --out "$OUT" \
   --CDCMAKE_BUILD_TYPE=RelWithDebInfo \
   --CDCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-  "--CDCMAKE_CXX_FLAGS=-DBUILDING_NODE_EXTENSION -fsanitize=thread -fno-omit-frame-pointer" \
+  "--CDCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -g -DNDEBUG $san" \
+  "--CDCMAKE_C_FLAGS_RELWITHDEBINFO=-O2 -g -DNDEBUG $san" \
   "--CDCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread" \
+  "--CDQUICKFIX_LIB_OUTPUT_DIR=$PWD/$OUT/lib" \
   "${extra[@]}"
+npx cmake-js build --out "$OUT"
+
+# An uninstrumented build runs the suite fine and reports nothing in our
+# frames, so the gate would pass vacuously: refuse it.
+for bin in "$OUT/Release/napi_quickfix.node" "$OUT/lib/libquickfix.a"; do
+  # grep -c, not -q: an early grep exit would SIGPIPE nm and, with pipefail,
+  # fail the pipeline for an instrumented binary.
+  if [ "$(nm "$bin" 2>/dev/null | grep -c ' U __tsan_' || true)" -eq 0 ]; then
+    echo "$bin is not instrumented with ThreadSanitizer (no __tsan_ symbols)" >&2
+    exit 2
+  fi
+done
 
 # The loader resolves build/Release/napi_quickfix.node: swap the TSan binary
 # in for the run and restore the regular one afterwards.
@@ -62,20 +88,15 @@ TSAN_OPTIONS="log_path=$LOGS/tsan exitcode=0 halt_on_error=0 report_signal_unsaf
   node --test --import tsx "${files[@]}" || status=$?
 
 echo
-echo "== ThreadSanitizer summary =="
-reports=$(cat "$LOGS"/tsan.* 2>/dev/null | grep -c '^WARNING: ThreadSanitizer' || true)
-echo "reports: $reports (logs in $LOGS)"
-cat "$LOGS"/tsan.* 2>/dev/null | grep '^SUMMARY' | sort | uniq -c | sort -rn || true
-
-ours=$(cat "$LOGS"/tsan.* 2>/dev/null | grep -E -c 'napi_quickfix::|/cpp/[a-z_]+\.(cpp|h):' || true)
-echo "frames in this addon's code: $ours"
-if [ "$ours" -gt 0 ]; then
-  echo "TSan reports touch napi_quickfix frames:" >&2
-  cat "$LOGS"/tsan.* | grep -E -B12 -A3 'napi_quickfix::|/cpp/[a-z_]+\.(cpp|h):' >&2 || true
+echo "== ThreadSanitizer summary (logs in $LOGS) =="
+gate=0
+python3 scripts/tsan-gate.py "$OUT/Release/napi_quickfix.node" "$LOGS" || gate=$?
+if [ "$gate" -ne 0 ]; then
+  echo "TSan: reports with a racing access in this addon or an unknown QuickFIX race (above)" >&2
   exit 1
 fi
 if [ "$status" -ne 0 ]; then
   echo "tests failed under TSan (exit $status)" >&2
   exit "$status"
 fi
-echo "TSan: clean on napi_quickfix frames"
+echo "TSan: no race in this addon's code, no unknown QuickFIX race"
