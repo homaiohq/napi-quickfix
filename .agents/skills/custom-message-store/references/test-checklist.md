@@ -100,8 +100,10 @@ Additional adapter-level checks worth a line each:
 
 - **1.11 Time zone.** Run 1.2 with `TZ=Asia/Kolkata` and `TZ=America/New_York`
   in the environment (and, for a SQL backend, with a non-UTC session time
-  zone): the loaded `creationTime` must still equal `t0` within a second. This
-  catches drivers that parse a naive timestamp as local time (B7; see
+  zone, and for PostgreSQL a non-ISO `DateStyle` such as `'SQL, DMY'` and
+  `'Postgres, MDY'`): the loaded `creationTime` must still equal `t0` within a
+  second. This catches drivers that parse a naive timestamp as local time and
+  text casts that follow the server's date style (B7; see
   `upstream-schemas.md` "Timestamps").
 - **1.12 Two adapters, one database.** Create two adapter instances over the
   same backend; what one writes the other loads. (The engine reads only through
@@ -203,3 +205,63 @@ it wraps any inner adapter).
 - **4.3 Messages are byte-identical in the `message` column**: `SELECT` the raw
   column and compare with the string you wrote (SOH present, nothing escaped
   twice).
+- **4.4 Date style and precision.** PostgreSQL: with `ALTER DATABASE <db> SET
+  datestyle = 'SQL, DMY'` (new connections), `load()` still returns the exact
+  instant. All backends: after `create()`/`reset()` the raw `creation_time` has
+  no fractional part (SQL Server: `CONVERT(VARCHAR(23), creation_time, 121)`
+  ends in `.000`), because upstream's `OdbcStore` misreads a fraction and MySQL
+  rounds one.
+- **4.5 Message size at the column limit.** Store and read back a message one
+  byte over the column's limit (MySQL `BLOB`: 65,536 bytes; PostgreSQL and SQL
+  Server have no practical limit, use ~200 KB): either it round-trips
+  byte-identical, or `setMessage` rejects. It must never resolve with a
+  truncated or missing row. Run it under the pool's real `sql_mode`.
+- **4.6 Keys that differ only by case.** `create()` two sessions whose
+  `TargetCompID`s are `ACME` and `acme`: both rows exist, `setSeqNums` on one
+  leaves the other untouched, `reset` of one keeps the other's messages. On the
+  stock MySQL/SQL Server collations this FAILS (duplicate key): either change
+  the key collation (`upstream-schemas.md` section 7) or document that CompIDs
+  must not differ by case alone.
+- **4.7 Non-ASCII bytes, compared raw.** Store a message containing
+  `58=みずほ証券 é`; read the raw column bytes with the database's own tool
+  (PostgreSQL `encode(convert_to(message, 'UTF8'), 'hex')`, MySQL
+  `HEX(message)`, SQL Server `CAST(CAST(message AS VARCHAR(MAX)) AS
+  VARBINARY(MAX))`) and compare with `Buffer.from(msg, 'utf8')`. Then insert
+  a row holding those exact bytes outside the adapter (as the C++ store would)
+  and check `getMessages()` returns the original string.
+- **4.8 Rows written by upstream's store, read by yours, and back.** If you
+  can build the harness of section 5, run it: let upstream create the session
+  (`populateCache()` inserts it), `set` a message with SOH, quotes and
+  non-ASCII, `seqnums 10 20`; your `load()`/`getMessages()` must see exactly
+  that. Then write with your adapter and `dump` with upstream: same numbers,
+  same creation second, byte-identical messages.
+
+## 5. Optional: upstream's own stores as an oracle
+
+The strongest interop check runs QuickFIX's real `PostgreSQLStore`,
+`MySQLStore` and `OdbcStore` against your database. Not shipped with this
+skill (it needs Docker and a C++ toolchain); it takes about 3 minutes to build:
+
+- **Image**: `debian:bookworm` with `build-essential cmake libpq-dev
+  default-libmysqlclient-dev unixodbc-dev`, plus Microsoft's `msodbcsql18`
+  from `packages.microsoft.com` for SQL Server.
+- **QuickFIX**: the source of the tag this binding pins (`v1.16.0`), built
+  with upstream's CMake: `-DHAVE_POSTGRESQL=ON -DHAVE_MYSQL=ON -DHAVE_ODBC=ON
+  -DHAVE_SSL=OFF -DHAVE_PYTHON3=OFF -DQUICKFIX_TESTS=OFF
+  -DQUICKFIX_EXAMPLES=OFF -DQUICKFIX_SHARED_LIBS=OFF`, target `quickfix`. A
+  second tree with `-DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"` exposes
+  the memory errors (gotcha 14 of `upstream-schemas.md`).
+- **CLI** (~200 lines of your own C++, compiled with `-std=c++17 -DHAVE_ODBC
+  -I<quickfix>/src/C++ -I/usr/include/mysql -I/usr/include/postgresql`, since
+  the ODBC headers are guarded by `HAVE_ODBC`, and linked with
+  `libquickfix.a -lpq -lmysqlclient -lodbc -lpthread`): construct `FIX::PostgreSQLStore(now, sessionID,
+  database, user, password, host, port)` (or the MySQL / `FIX::OdbcStore(now,
+  sessionID, user, password, connectionString)` equivalents) and expose
+  `dump` (`getCreationTime()`, both `getNext*MsgSeqNum()`, `get(1, N)` printed
+  with byte lengths and hex), `set <seq> <file>` (raw bytes), `seqnums <s>
+  <t>` and `reset`. Note that constructing the store INSERTs a missing session
+  row, as upstream does.
+- **Ports**: upstream keeps the port in a `short`; for a server on a port
+  above 32,767 pass port 0 and set `PGPORT` / `MYSQL_TCP_PORT` instead.
+- Run the container with `--network host`, one operation per invocation, and
+  only against a scratch database.

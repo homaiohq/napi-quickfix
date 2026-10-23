@@ -15,10 +15,11 @@ directory describe that packaged form, which this package does not ship yet.
 
 What to copy from it, in order of importance:
 
-1. `load` reads the timestamp **as text** (`creation_time::text` /
-   `CAST(creation_time AS CHAR)`) and parses it as UTC (`fromSqlTime`); it
-   returns `null` for zero rows; it converts `NUMERIC`/`BIGINT` results with
-   `toSeq()` and validates them.
+1. `load` reads the timestamp **as text** and parses it as UTC; it returns
+   `null` for zero rows; it converts `NUMERIC`/`BIGINT` results with `toSeq()`
+   and validates them. Do NOT copy its PostgreSQL expression
+   (`creation_time::text`) or `fromSqlTime()`'s `new Date(v)` fallback: see
+   "Known defects" at the end of this file.
 2. `setSeqNums` is ONE `UPDATE` of both columns; note the parameter order
    (`outgoing_seqnum = $sender, incoming_seqnum = $target`).
 3. `setMessage` is a native upsert (`ON CONFLICT ... DO UPDATE` /
@@ -296,3 +297,35 @@ Two things the adapter did NOT do, which a production copy should consider:
 - It did not set statement timeouts (contract I2); do that on the pool
   (`statement_timeout` for PostgreSQL, `MAX_EXECUTION_TIME` / connect timeouts
   for MySQL), shorter than `storeTimeoutMs`.
+
+## Known defects (found by running it against upstream's stores, 2026-10-23)
+
+The code above is kept as it was at `f802818`. Challenged against QuickFIX
+v1.16.0's own `PostgreSQLStore`/`MySQLStore`/`OdbcStore` and real servers
+(see "Verification" in `upstream-schemas.md`), it has these defects; fix them
+in any copy:
+
+1. **`creation_time::text` depends on `DateStyle`.** Under `'SQL, DMY'` the
+   text is `22/10/2026 10:11:12.345`: the regex misses, `new Date(v)` is
+   `Invalid Date`, `load()` throws, `Initiator.create()` rejects. Under
+   `'Postgres'` style `new Date(v)` parses `Thu Oct 22 10:11:12.345 2026` as
+   LOCAL time: a silent shift. Use
+   `to_char(creation_time, 'YYYY-MM-DD HH24:MI:SS.MS')`, and make
+   `fromSqlTime()` strict (no `new Date(v)` fallback for strings: reject what
+   the regex does not match).
+2. **`toSqlTime()` writes milliseconds.** MySQL `DATETIME` rounds them (`.999`
+   becomes the next second) and upstream's `OdbcStore` misreads any fraction
+   (`upstream-schemas.md` section 3). On upstream's tables write whole seconds:
+   `d.toISOString().slice(0, 19).replace('T', ' ')`.
+3. **The MySQL upsert uses `VALUES(col)`**, deprecated since MySQL 8.0.20
+   (warning 1287 on 8.4). On MySQL use the row alias (`... VALUES (...) AS new
+   ON DUPLICATE KEY UPDATE message = new.message`); keep `VALUES()` for MariaDB.
+4. **No SQL Server dialect**, although SQL Server is upstream's third backend
+   (via `OdbcStore`). `upstream-schemas.md` section 7.3 has the statements,
+   the parameter types and the byte-preserving message encoding.
+5. **Nothing guards the stock column limits.** On upstream's MySQL table a
+   message over 65,535 bytes is rejected (strict mode) or truncated (non-strict)
+   by the server; the adapter neither checks the size nor pins `sql_mode`
+   (`upstream-schemas.md` section 7.2).
+6. (Listed above, after the wiring examples) no zero-row check on
+   `setSeqNums`, no driver timeouts.

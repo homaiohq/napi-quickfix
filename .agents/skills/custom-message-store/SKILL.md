@@ -1,6 +1,6 @@
 ---
 name: custom-message-store
-description: Implement a custom MessageStoreAdapter for the napi-quickfix binding (@homaiohq/napi-quickfix) so FIX session state (next sequence numbers, creation time, sent messages for resends) is persisted in the user's own backend. Use whenever the user wants to "implement a message store", "write a MessageStoreAdapter", "persist FIX session state / sequence numbers in Postgres / MySQL / SQLite / SQL Server / MongoDB / Redis / DynamoDB / any database", "a custom store for napi-quickfix", "reuse / migrate from a QuickFIX C++ database" (its sessions/messages tables), or asks what load / create / setSeqNums / setMessage / getMessages / reset / close must do, how upserts, gaps, timeouts, poison or close() behave. Self-contained, with the full store contract as numbered rules with sources, the verified column mapping onto the upstream QuickFIX SQL tables (their DDL linked, not copied), a worked SQL adapter, and a test checklist; no web access needed.
+description: Implement a custom MessageStoreAdapter for the napi-quickfix binding (@homaiohq/napi-quickfix) so FIX session state (next sequence numbers, creation time, sent messages for resends) is persisted in the user's own backend. Use whenever the user wants to "implement a message store", "write a MessageStoreAdapter", "persist FIX session state / sequence numbers in Postgres / MySQL / MariaDB / SQL Server / SQLite / MongoDB / Redis / DynamoDB / any database", "reuse / migrate from a QuickFIX C++ database" (the tables of its PostgreSQLStore, MySQLStore or OdbcStore), share those tables with a C++ engine during a cutover or as a standby, or asks what load / create / setSeqNums / setMessage / getMessages / reset / close must do, or how upserts, gaps, timeouts, poison or close() behave. Self-contained: the store contract as sourced rules, the upstream column mapping (DDL linked, not copied), per-backend guidance checked against upstream's own stores, a worked SQL adapter, and a test checklist.
 ---
 
 # Custom message store for napi-quickfix
@@ -23,15 +23,17 @@ is reproduced as section 1 of `references/test-checklist.md`), and QuickFIX C++
 **v1.16.0**
 (the tag `CMakeLists.txt` pins). Every rule in the references cites one of them;
 when the skill and a newer repository disagree, the repository wins: re-read the
-cited file.
+cited file. The interop guidance was also checked by running upstream's own
+`PostgreSQLStore`/`MySQLStore`/`OdbcStore` against PostgreSQL 16, MySQL 8.4 and
+SQL Server 2022 (`upstream-schemas.md` "Verification").
 
 Reference files next to this one:
 
 | File | Read it when |
 | --- | --- |
 | `references/contract.md` | always: the rules (A-K), each with its source |
-| `references/upstream-schemas.md` | the backend is SQL, or the data must interoperate with a QuickFIX C++ deployment: the column mapping, the statements upstream issues, timestamps, the table-prefix convention, gotchas, and where to fetch the upstream DDL (linked, not reproduced) |
-| `references/sql-adapter-reference.md` | you want a worked, tested SQL implementation to adapt (a reference SQL adapter, reproduced abridged: its `sqlSchema()` DDL is elided; a packaged version is planned as a follow-up) |
+| `references/upstream-schemas.md` | the backend is SQL, or the data must interoperate with a QuickFIX C++ deployment: the column mapping, the statements upstream issues, timestamps, gotchas, **section 7: per backend (PostgreSQL, MySQL/MariaDB, SQL Server) statements, column limits, collations, encodings and upstream's own defects**, section 8: sharing tables with a C++ engine, and where to fetch the upstream DDL (linked, not reproduced) |
+| `references/sql-adapter-reference.md` | you want a worked, tested SQL implementation to adapt (a reference SQL adapter, reproduced abridged: its `sqlSchema()` DDL is elided; a packaged version is planned as a follow-up). Read its "Known defects" before copying: its PostgreSQL timestamp read is DateStyle-dependent and it has no SQL Server dialect |
 | `references/test-checklist.md` | always, before declaring the adapter done: differential tests against `MapMessageStore`, engine-level scenarios, failure injection |
 
 ## Workflow
@@ -41,9 +43,14 @@ Reference files next to this one:
    deployment (then the layout, column names and timestamp format are fixed,
    see `upstream-schemas.md`); whether the driver is synchronous (embedded
    SQLite) or socket-based; whether one adapter serves several engines or
-   processes; expected message rate.
+   processes; expected message rate. For an existing SQL deployment also
+   find out, or check yourself: the server version, the key columns'
+   collation (can CompIDs differ only by case?), the largest message, whether
+   messages carry non-ASCII text, PostgreSQL's `DateStyle`, and whether a C++
+   engine keeps using the tables (cutover, standby). Each of these changes the
+   adapter or the schema (`upstream-schemas.md` section 7).
 2. **Read `references/contract.md`** in full. Then the schema file if SQL or
-   interop is involved.
+   interop is involved, including the section 7 subsection for your backend.
 3. **Design the data model**: one record per session for the state, one record
    per `(session, seqNum)` for the messages, keyed by the four session-id fields
    (section "Data model" below).
@@ -189,16 +196,21 @@ worked example in `sql-adapter-reference.md` has all three dialects):
 
 | Method | Statement |
 | --- | --- |
-| `load` | `SELECT creation_time::text AS creation_time, incoming_seqnum, outgoing_seqnum FROM sessions WHERE beginstring=$1 AND sendercompid=$2 AND targetcompid=$3 AND session_qualifier=$4` → `null` for no row; `nextTargetMsgSeqNum = incoming_seqnum`, `nextSenderMsgSeqNum = outgoing_seqnum` |
-| `create` | `INSERT INTO sessions (beginstring, sendercompid, targetcompid, session_qualifier, creation_time, incoming_seqnum, outgoing_seqnum) VALUES ($1,$2,$3,$4,$5,$6,$7)` with `$5 = 'YYYY-MM-DD HH:MM:SS.mmm'` in UTC, `$6 = nextTarget`, `$7 = nextSender` |
+| `load` | `SELECT to_char(creation_time, 'YYYY-MM-DD HH24:MI:SS.MS') AS creation_time, incoming_seqnum, outgoing_seqnum FROM sessions WHERE beginstring=$1 AND sendercompid=$2 AND targetcompid=$3 AND session_qualifier=$4` → `null` for no row; `nextTargetMsgSeqNum = incoming_seqnum`, `nextSenderMsgSeqNum = outgoing_seqnum` |
+| `create` | `INSERT INTO sessions (beginstring, sendercompid, targetcompid, session_qualifier, creation_time, incoming_seqnum, outgoing_seqnum) VALUES ($1,$2,$3,$4,$5,$6,$7)` with `$5 = 'YYYY-MM-DD HH:MM:SS'` in UTC, whole seconds, `$6 = nextTarget`, `$7 = nextSender` |
 | `setSeqNums` | `UPDATE sessions SET outgoing_seqnum=$1, incoming_seqnum=$2 WHERE <key>` (`$1 = nextSender`, `$2 = nextTarget`) |
 | `setMessage` | `INSERT INTO messages (<key cols>, msgseqnum, message) VALUES (...) ON CONFLICT (<key cols>, msgseqnum) DO UPDATE SET message = EXCLUDED.message` |
 | `getMessages` | `SELECT message FROM messages WHERE <key> AND msgseqnum >= $5 AND msgseqnum <= $6 ORDER BY msgseqnum ASC` |
 | `reset` | in one transaction: `DELETE FROM messages WHERE <key>`; then `INSERT INTO sessions (...) VALUES (...) ON CONFLICT (<key cols>) DO UPDATE SET creation_time=EXCLUDED.creation_time, incoming_seqnum=EXCLUDED.incoming_seqnum, outgoing_seqnum=EXCLUDED.outgoing_seqnum` |
 
-Read `creation_time` as text and parse it as UTC; `pg` otherwise builds a
-local-time `Date` from a `TIMESTAMP` column. Convert `NUMERIC`/`BIGINT` results
-back to `number` and validate.
+Read `creation_time` through a fixed format and parse it strictly as UTC: `pg`
+otherwise builds a local-time `Date` from a `TIMESTAMP` column, and
+`creation_time::text` follows the server's `DateStyle` (under `'SQL, DMY'` it
+is `22/10/2026 ...`). Write whole seconds as UTC text, never a JS `Date`.
+Convert `NUMERIC`/`BIGINT` results back to `number` and validate. MySQL/MariaDB
+and SQL Server need different statements, column-size and collation checks,
+and (SQL Server) a byte-preserving message encoding: `upstream-schemas.md`
+sections 7.2 and 7.3.
 
 **Document / key-value stores** (design guidance derived from the contract, not
 from a shipped implementation; validate with the checklist):
@@ -309,8 +321,9 @@ Before declaring the adapter done, confirm each of these explicitly:
    backslashes intact, nothing escaped twice.
 6. `reset()` deletes only that session's messages, upserts its row with the
    given `creationTime`, and is atomic or DELETE-first.
-7. `creationTime` round-trips to the same instant under a non-UTC `TZ` and a
-   non-UTC database session time zone.
+7. `creationTime` round-trips to the same instant under a non-UTC `TZ`, a
+   non-UTC database session time zone and (PostgreSQL) a non-ISO `DateStyle`;
+   on upstream's tables it is written in whole seconds.
 8. Nothing on the hot path touches `fs.promises`, `dns.lookup`, `zlib`, async
    `crypto`, or a pool-using native addon.
 9. No store method awaits `session.*()`, `sendToTarget()` on that session, or
@@ -319,3 +332,13 @@ Before declaring the adapter done, confirm each of these explicitly:
     none hangs past `storeTimeoutMs`.
 11. Seqnums returned from the backend are converted to safe-integer `number`s.
 12. `close()` does not tear down a pool another engine or session still uses.
+13. Two sessions whose CompIDs differ only by case get two rows (MySQL and
+    SQL Server default collations merge them: test 4.6).
+14. The largest message you send fits the column, or `setMessage` rejects it;
+    nothing is truncated or dropped silently (MySQL `BLOB` = 65,535 bytes:
+    test 4.5).
+15. Non-ASCII messages come back byte-identical, checked on the raw column
+    (SQL Server `TEXT` is a single-byte code page: test 4.7).
+16. If a C++ engine shares the tables: its known defects are designed around
+    (`upstream-schemas.md` section 8) and only one engine runs a session at a
+    time.

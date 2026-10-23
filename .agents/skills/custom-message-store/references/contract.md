@@ -31,7 +31,11 @@ C++ session id. Sources: `[store.ts]` every method takes `sessionID: SessionID`;
 has exactly those four identity fields (plus an `isFIXT` flag and the frozen
 string); the upstream tables' primary key is
 `(beginstring, sendercompid, targetcompid, session_qualifier)` (see
-`upstream-schemas.md`).
+`upstream-schemas.md`). The fields compare EXACTLY: QuickFIX orders and
+equates session ids by their string form (`[QF SessionID.h:113-119]`), so
+`ACME` and `acme` are two sessions. A backend whose key comparison folds case
+or accents (MySQL's and SQL Server's default collations) merges them; see
+`upstream-schemas.md` gotcha 13 for the fix.
 
 **A2. The canonical string form is `BEGIN:SENDER->TARGET` plus `:QUALIFIER` when
 set** (`FIX.4.4:CLIENT->BROKER`, `FIX.4.4:CLIENT->BROKER:Q1`). Sources:
@@ -84,7 +88,12 @@ test/MessageStoreTestCase.h]` `CHECK_MESSAGE_STORE_SET_GET_WITH_QUOTE`;
 and reads it back equal; `[store.test]` "ResetOnLogon=N: a restart continues
 seqnums from the adapter; a gap is served from getMessages (quotes intact)";
 `[js_message_store.cpp]` `Invoke()` passes `Napi::String::New(env, req.msg)`.
-Use parameter binding or a binary-safe encoding; never interpolate.
+Use parameter binding or a binary-safe encoding; never interpolate. The
+storage must hold every byte of the UTF-8 encoding and the full length: a
+single-byte code-page column (SQL Server `TEXT`) or a size-capped one (MySQL
+`BLOB`, 65,535 bytes) does not, unless you encode around it
+(`upstream-schemas.md` section 7). Reject rather than store a damaged message
+(I6).
 
 **A7. Sessions are independent.** A write, read or reset for one session never
 touches another session's rows; two sessions differing only by qualifier are
