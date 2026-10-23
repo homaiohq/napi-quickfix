@@ -58,11 +58,24 @@ Napi::Value QuickfixParseMsgType(const Napi::CallbackInfo& info) {
   }
 }
 
+// prepareExit(): called by the TS layer from process.on('exit') (src/native.ts).
+// Releases every libuv pool thread an engine of this environment may have
+// parked on a JS round trip, so the threadpool join that process.exit() and a
+// fatal exception run next can complete (ExitParticipant, addon_data.h).
+// Idempotent.
+Napi::Value PrepareExit(const Napi::CallbackInfo& info) {
+  for (ExitParticipant* engine : AddonData::Get(info.Env()).engines) {
+    engine->PrepareExit();
+  }
+  return info.Env().Undefined();
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   AddonData::Install(env);
   exports.Set("version", Napi::Function::New(env, Version, "version"));
   exports.Set("quickfixParseMsgType",
               Napi::Function::New(env, QuickfixParseMsgType, "quickfixParseMsgType"));
+  exports.Set("prepareExit", Napi::Function::New(env, PrepareExit, "prepareExit"));
 
   MessageWrap::Init(env, exports);
   GroupWrap::Init(env, exports);

@@ -11,6 +11,7 @@
 #include "quickfix/SessionID.h"
 #include "quickfix/SocketInitiator.h"
 
+#include "addon_data.h"
 #include "application_bridge.h"
 #include "engine_common.h"
 #include "engine_workers.h"
@@ -28,11 +29,15 @@ namespace napi_quickfix {
 //
 // Methods: start / stop(force?) / isLoggedOn(sessionID?) / getSessions /
 // getSession(sessionID) / ref / unref.
-class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap> {
+class InitiatorWrap : public Napi::ObjectWrap<InitiatorWrap>,
+                      public ExitParticipant {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
   explicit InitiatorWrap(const Napi::CallbackInfo& info);
   ~InitiatorWrap() override;
+
+  // process.on('exit'): see ExitParticipant (addon_data.h).
+  void PrepareExit() override;
 
  private:
 

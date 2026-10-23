@@ -394,6 +394,16 @@ the engine owning it has been stopped. A constructor that fails on a later
 (so the ids are not locked out by the failed attempt) and the engine-level log
 QuickFIX had already opened for it.
 
+**Process exit.** `process.exit()`, an uncaught exception or an unhandled
+rejection end the process even while an engine is busy: a `sendToTarget()` in
+a handler round trip or a store call, a `stop()` in flight. From the `'exit'`
+event on, no handler runs and nothing the handlers have not seen is acted on:
+an outbound message (`toAdmin`/`toApp`) is neither stored nor sent, and an
+inbound one (`fromAdmin`/`fromApp`) is not consumed (the peer resends it after
+the next logon). A graceful `stop()` in flight therefore sends no Logout, and
+the exit waits for QuickFIX's `LogoutTimeout` (2 s by default) before the
+session drops. Pending promises never settle, and no adapter `close()` is called.
+
 ### TLS (stunnel-style) for initiators
 
 QuickFIX's own `SSLSocketInitiator` needs OpenSSL compiled into the engine, and
@@ -669,7 +679,8 @@ still observed (see "late" below). The trade-off: a longer timeout freezes heart
 session of the engine (one network thread) for that long when the adapter
 stalls; a shorter one produces more late outcomes, each fatal for the session.
 `0` disables it, accepting that a stalled adapter stalls the engine, a
-graceful `stop()` and process exit with it.
+graceful `stop()` and a natural process exit with it (`process.exit()` is not
+held up, see "Process exit").
 
 **Failure policy.** A rejection, a synchronous throw, a malformed return value
 or a timeout reach the engine as an `IOException`; every one is reported
@@ -765,7 +776,8 @@ is a `'storeError'`, never a rejection), and `stop()` settles after it, so
 races `close()` against `load()`. `close()` is also called when `create()`
 rejects after constructing the engine (a constructor-time `reset()` failed:
 the engine is stopped before the rejection). An engine dropped without
-`stop()` is torn down at process exit without calling `close()`.
+`stop()` is torn down at process exit without calling `close()` (see
+"Process exit").
 
 ### Handlers vs. events
 

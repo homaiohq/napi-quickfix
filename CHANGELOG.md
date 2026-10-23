@@ -102,6 +102,17 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   `NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS` for the interrupted-handler case, which is
   told apart from a handler that threw so the interruption is not reported to QuickFIX
   as a throw.
+- A process that called `process.exit()`, or died of an uncaught exception or an
+  unhandled rejection, never exited (only `SIGKILL` ended it) when a `sendToTarget()`
+  or a `stop()` was in flight at that instant. Both paths join the libuv threadpool
+  without running the environment cleanup hooks that tear the engines down, so a pool
+  thread parked on a JS round trip (a send in its `toApp` round trip or in a store
+  call, a `stop()` joining a network thread parked in `toAdmin`) was never woken. Any
+  in-flight send could trigger it, with any store; a stalled `MessageStoreAdapter` made
+  it near-certain. The module now releases those threads from `process.on('exit')`.
+  From then on the exiting engines run no handler and act on nothing a handler has not
+  seen: an outbound message is neither stored nor sent, an inbound one is not consumed
+  (see "Process exit" in the README).
 
 ### Known QuickFIX limitations
 
