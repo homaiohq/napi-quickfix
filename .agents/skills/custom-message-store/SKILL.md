@@ -226,7 +226,8 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   margin, and bound the sends below it: with the default 4 slots, 6 sends in
   flight across a database restart never recovered (H4). Never await an
   engine operation on the same session from inside a store method.
-- **Errors (I).** Throw or reject; never hang. `storeTimeoutMs` (default 30 s)
+- **Errors (I).** Throw or reject as soon as the outcome is known; never
+  settle an unknown one (below). `storeTimeoutMs` (default 30 s)
   bounds every call (`0` disables it); a timed-out `setSeqNums`/`reset` blocks
   recovery until it settles (never settles: poisoned until `stop()`), so give
   the driver shorter timeouts than `storeTimeoutMs`, enforced by the server

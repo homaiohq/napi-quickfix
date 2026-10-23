@@ -115,7 +115,8 @@ Additional adapter-level checks worth a line each:
 - **1.13 Rejection shape (nothing sent).** Point the adapter at a backend that
   refuses connections (a closed port) or rejects the password: every method
   must reject (or throw) within your connect/checkout timeout, which must be
-  shorter than `storeTimeoutMs` (I2). None may hang, none may resolve. If your
+  shorter than `storeTimeoutMs` (I2): nothing was sent, so the outcome is
+  known. None may stay pending, none may resolve. If your
   adapter connects when it is constructed, construct it against a healthy
   backend first and stop the backend afterwards; it must still reject per
   call, and recover once the backend is back. (A backend that accepts the

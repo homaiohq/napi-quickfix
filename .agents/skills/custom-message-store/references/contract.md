@@ -187,8 +187,10 @@ does the same. So:
   stays poisoned and the session goes down instead of renumbering, until an
   operator restores the row or deliberately recreates it. The first `load()`
   of a session in the instance (the preload) must still return `null` for a
-  never-seen session (B1), and checklist test 1.1 and the engine's own
-  "row deleted" path then differ from `MapMessageStore` by design.
+  never-seen session (B1, test 1.1 is unchanged); what then differs from
+  `MapMessageStore`, by design, is the reload after a deleted row (the
+  repository's `[store.test]` "refresh() / a reload after the row was
+  deleted ..." expects the `1/1` restart).
   (Derived; `[trial]`.)
 
 **B4. The returned object must satisfy A3** (a valid `Date`, two positive safe
@@ -631,7 +633,8 @@ client, since session-level advisory locks belong to the connection),
 re-take it before the next `load()` succeeds (a reload), and reject when
 someone else got it. It only guards Node processes using the same adapter;
 a QuickFIX C++ engine on the same tables takes no lock (section 8 of
-`upstream-schemas.md`). (Derived; suggested by the `[trial]`.)
+`upstream-schemas.md`), and two engines in the SAME process sharing the
+adapter are not caught either (the lock is per connection, and reentrant). (Derived; suggested by the `[trial]`.)
 
 **G4. Synchronous methods are allowed**, and are the simplest correct choice for
 embedded stores (`node:sqlite`, `better-sqlite3`, an in-memory test double): a
@@ -739,7 +742,10 @@ queue behind them. Source: `[README]` "Bound your sends"; `[store.test]`
 rejection reason's `.message` becomes the `'storeError'` message. Sources:
 `[store.ts]` `settle()`, `ioError()`; `[js_message_store.cpp]` `ErrorMessage()`.
 
-**I2. Never hang.** A call that has not settled after `storeTimeoutMs` (default
+**I2. Settle a known outcome promptly; never settle an unknown one.** Your
+Promise settles as soon as the outcome is final (nothing sent, or the server
+answered), and stays pending while it is not (below); `storeTimeoutMs`, not
+your driver, is what bounds a pending call. A call that has not settled after `storeTimeoutMs` (default
 `30000`; `0` disables) is failed with `"timed out after N ms"`: on an engine
 thread (`Call()`), and in the calls the TS layer awaits itself (`load()`/
 `create()` at preload, a constructor-time `reset()`, `close()`;
@@ -862,7 +868,9 @@ Sources: `[README]` "Failure policy"; `[js_message_store.cpp]` `Gate()`,
 `RetryReset()`, `CheckStamp()`; `[store.test]` "ResetOnDisconnect=Y +
 rejecting reset() ...", "ResetOnLogon=Y + a reset() that rejects once ..." and
 "poisoned store with a dead adapter: calls fail immediately, one reload attempt
-per timeout". For the adapter this means: during an outage, reject fast; on
+per timeout". For the adapter this means: during an outage, reject fast
+every call that reached nothing (a refused connection, a failed checkout) and
+keep pending the ones whose outcome is unknown (I2); on
 recovery, make `load()` and `reset()` work first; `reset()` must be idempotent
 (F3: an upsert), since a timed-out reset that landed late is retried.
 
@@ -880,8 +888,9 @@ store call that triggered it, and while a session stays poisoned every store
 call of that session tries it again. So a slow failure costs the WHOLE engine:
 `[trial]`, a `load()` that failed after 800 ms (a connect timeout) on one
 session kept a healthy session of the same engine from processing its inbound
-TestRequest until the database came back, and a 2 s `load()` delayed a
-bystander's inbound messages by 8 s. The stall is roughly `load()` latency ×
+TestRequest until the database came back (measured before the binding's
+no-responder Logon guard, `6eccbb6`, removed one extra tick per disconnect;
+the per-call cost is unchanged). The stall is roughly `load()` latency ×
 store calls per tick × poisoned sessions. Keep the connect timeout of the
 reload path (and the checkout timeout) far below `HeartBtInt`, and make
 `load()` fail fast when the server refuses connections. A fast failure has the

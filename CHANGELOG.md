@@ -48,10 +48,11 @@ Bundles **QuickFIX v1.16.0** (statically linked, with one upstream fix carried: 
   latency contract (bound in-flight sends; an adapter must not depend on the libuv
   threadpool; keep one session's writes in call order, since a timed-out `setMessage`
   can still commit after the retry's write on a connection pool).
-- `.agents/skills/custom-message-store`: an agent skill for writing a custom
-  `MessageStoreAdapter` (the contract as sourced rules, the column mapping onto
-  QuickFIX v1.16.0's `sessions`/`messages` tables for interop with links to the
-  upstream DDL, a test checklist).
+- `.agents/skills/custom-message-store` (in the repository, not the npm package): an
+  agent skill for writing a custom `MessageStoreAdapter` (the contract as sourced rules,
+  the column mapping onto QuickFIX v1.16.0's `sessions`/`messages` tables for interop
+  with links to the upstream DDL, driver guidance from a PostgreSQL adapter trial
+  (issue #35), a test checklist).
 - `SessionSettings.getSessions(connectionType?)`: only the sessions an engine of that
   type would create.
 - `scripts/tsan.sh` and a ThreadSanitizer CI job over the suite, failing on a race in
