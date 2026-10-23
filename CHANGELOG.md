@@ -123,6 +123,9 @@ Bundles **QuickFIX v1.16.0** (statically linked, with one upstream fix carried: 
   tick also retried `load()` several times on the engine's single network thread,
   stalling every other session of the engine for as long. The build now carries the
   one-line upstream fix (no Logon without a connection).
+- The npm package shipped every `CMakeLists.txt` of a local build tree
+  (`build/_deps/quickfix-*/**`, `build-tsan/_deps/...`) when packed from a working
+  tree: the `files` entry matched at any depth. It now names the root file only.
 
 ### Known QuickFIX limitations
 
