@@ -83,7 +83,9 @@ Reference files next to this one:
 6. **Verify** with `references/test-checklist.md`: the differential script
    against `MapMessageStore`, then the loopback scenarios, then failure
    injection. Do not skip 1.6 (gap and ordering), 1.11 (time zone), 1.15-1.18
-   (the logic checks), 3.3 (bounded hang) or 3.6 (late write ordering).
+   (the logic checks), 3.3 (bounded hang), 3.6-3.7 (late write ordering, late
+   commits) or, for a socket driver, 3.8-3.10 (connections ended by the
+   server, threadpool, shutdown).
 7. **Review** against the pitfalls list at the end of this file.
 
 ## The interface (from `src/store.ts`)
@@ -212,9 +214,13 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
 - **Threads (H).** Per-session calls are serialised by the engine, except a
   call that timed out (D7); your method runs on the event loop while an engine
   thread waits. The hot path must not need a libuv threadpool slot
-  (`fs.promises`, `dns.lookup`, `zlib`, async `crypto`), or raise
-  `UV_THREADPOOL_SIZE`. Never await an engine operation on the same session
-  from inside a store method.
+  (`fs.promises`, `dns.lookup`, `zlib`, async `crypto`), and a reconnect
+  does: `dns.lookup`, and `pg`'s SCRAM-SHA-256 authentication (WebCrypto)
+  takes several slots per connection while every parked send holds one. Size
+  `UV_THREADPOOL_SIZE` above your maximum in-flight sends plus a reconnect
+  margin, and bound the sends below it: with the default 4 slots, 6 sends in
+  flight across a database restart never recovered (H4). Never await an
+  engine operation on the same session from inside a store method.
 - **Errors (I).** Throw or reject; never hang. `storeTimeoutMs` (default 30 s)
   bounds every call (`0` disables it); a timed-out `setSeqNums`/`reset` blocks
   recovery until it settles (never settles: poisoned until `stop()`), so give
@@ -381,11 +387,29 @@ engine.on('storeError', (sessionID, method, error, poisoned) => {
   contract I2 (PostgreSQL: `pg_terminate_backend(client.processID)` from
   another connection, poll `pg_stat_activity` until the pid is gone, then
   reject).
-- Warm the connection pool before `Initiator.create()` and keep a minimum pool
-  size: a reconnect inside a store call needs `dns.lookup`, which needs a libuv
-  threadpool slot that may be parked in another store write.
-- Bound in-flight `sendToTarget()` calls (await them, or a small semaphore);
-  each may be parked in a store write on a pool thread.
+- **Threadpool**: set `UV_THREADPOOL_SIZE` above the maximum number of
+  in-flight sends plus a margin for reconnects (in the environment, or as the
+  first statement of the entry module), and bound in-flight `sendToTarget()`
+  calls below it (await them, or a small semaphore): each may be parked in a
+  store write on a pool thread, and a reconnect needs pool slots of its own
+  (`dns.lookup`; `pg`'s SCRAM authentication), contract H4.
+- **Connections**: give the store its own pool, not the application's: the
+  short `statement_timeout`/`lock_timeout` the store needs (seconds) would
+  cut the application's long queries, and the application's load would delay
+  the store's checkouts. Warm it before `Initiator.create()` (check out N
+  clients and release them) and keep the connections open (`pg-pool`:
+  `idleTimeoutMillis: 0`; its default closes idle clients after 10 s, so a
+  quiet session reconnects inside a store call, and its `min` opens nothing
+  by itself). Servers still drop connections (restart, failover,
+  `idle_session_timeout`, PgBouncer): replenish from the event loop, outside
+  store calls.
+- **Error events**: `pool.on('error', ...)`, AND `client.on('error', ...)` on
+  every client you hold checked out (a transaction, a warm-up, a replenish, a
+  dedicated connection): `pg-pool` removes its own listener from a client
+  while it is checked out, and an unhandled `'error'` is an uncaught exception
+  that kills every FIX session of the process (contract I9).
+- **Shutdown**: `pg`'s `pool.end()` waits without limit for a frozen server;
+  bound it with a grace period and `process.exit()` (contract I7).
 - `await engine.stop()` before `Initiator.create({ store: sameAdapter })`
   again; `close()` runs before `stop()` resolves, so the order is guaranteed.
 - Let the application own the pool's lifetime; `close()` is per session.
@@ -449,7 +473,10 @@ Before declaring the adapter done, confirm each of these explicitly:
    non-UTC database session time zone and (PostgreSQL) a non-ISO `DateStyle`;
    on upstream's tables it is written in whole seconds.
 8. Nothing on the hot path touches `fs.promises`, `dns.lookup`, `zlib`, async
-   `crypto`, or a pool-using native addon.
+   `crypto`, or a pool-using native addon; reconnects (which do, through DNS
+   and `pg`'s SCRAM) happen outside store calls where possible, and
+   `UV_THREADPOOL_SIZE` exceeds the bound on in-flight sends plus a reconnect
+   margin (test 3.9).
 9. No store method awaits `session.*()`, `sendToTarget()` on that session, or
    `engine.stop()`.
 10. Every method rejects at once when the backend refuses connections or
@@ -484,3 +511,9 @@ Before declaring the adapter done, confirm each of these explicitly:
     not-yet-sent ones are stored under exactly the seqnum given.
 22. A real message (non-ASCII text, CR/LF inside a field) still passes its own
     BodyLength/CheckSum after the round trip (test 1.18).
+23. The pool AND every client held checked out have an `'error'` listener; a
+    server ending a connection at any moment never crashes the process
+    (test 3.8).
+24. The store has its own pool, with idle connections kept open, warmed before
+    `create()`, replenished from the event loop; `pool.end()` cannot hold the
+    process forever (test 3.10).

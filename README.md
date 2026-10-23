@@ -663,7 +663,11 @@ pool thread. Two rules follow:
   (`fs.promises`, `dns.lookup`, `zlib`, async `crypto`, …), or the pool must be
   sized for it (`UV_THREADPOOL_SIZE`, default 4): with every slot parked in a
   store write, an adapter that needs a slot to finish the write deadlocks through
-  the pool. Socket-based database drivers (`pg`, `mysql2`, …) do not use it.
+  the pool. Socket-based database drivers (`pg`, `mysql2`, …) run their
+  queries without it, but (re)connecting uses it: `dns.lookup`, and `pg`'s
+  SCRAM-SHA-256 authentication (WebCrypto) takes several slots per
+  connection. Size `UV_THREADPOOL_SIZE` above your in-flight sends plus a
+  margin for reconnects.
 - **Bound your sends** (await them, or cap them with a semaphore): each
   in-flight `sendToTarget()` may be parked in a store write, and the session
   control calls queue behind them on the same pool.

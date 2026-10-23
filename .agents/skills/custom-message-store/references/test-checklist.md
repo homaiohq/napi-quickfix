@@ -374,6 +374,27 @@ an array your listener fills) instead of asserting on it right after
   `PossDupFlag=Y`; the row moved from `12/4` back to `5/3`, then "expecting 12
   but received 8"). Ending the backend and confirming it gone before
   rejecting (contract I2) passed both.
+- **3.8 The server ends a connection at any moment (I9).** Run
+  `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE
+  usename = '<store role>' AND pid <> pg_backend_pid()` (or your server's
+  equivalent) (a) with the pool idle, (b) during the adapter's warm-up or
+  replenish (loop it every few ms while `Initiator.create()` runs), (c) between
+  two statements of a `reset()` transaction, (d) with sends in flight. The
+  process must survive every case (no uncaught `'error'`), the in-flight calls
+  reject or settle late, and the sessions come back. `[trial]`: an adapter
+  listening on the pool only crashed in 11 of 13 runs of (b).
+- **3.9 Reconnects with every threadpool slot taken (H4).** With
+  `UV_THREADPOOL_SIZE` at its value in production and the maximum number of
+  in-flight sends your application allows, restart the server
+  (`docker restart`) while those sends are parked: the sessions must recover
+  within a few seconds of the server's return. Then once more with one send
+  more than `UV_THREADPOOL_SIZE` to see the failure your bound prevents.
+  `[trial]`: with 4 slots, 6 sends in flight never recovered; with 8 slots,
+  0.4-0.7 s.
+- **3.10 Shutdown against a frozen server (I7).** Freeze the server
+  (`docker pause`), then run your shutdown path (`await engine.stop()`, then
+  the pool's `end()`): the process must exit within your grace period.
+  `[trial]`: `pg`'s `pool.end()` waited for the thaw, 3/3.
 
 ## 4. Interop (only when targeting QuickFIX C++ tables)
 

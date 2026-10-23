@@ -255,12 +255,26 @@ with the old numbers still in the row (contract F2, SKILL.md "reset (F)": one
 transaction).
 
 ```ts
-// pg
+// pg (`import pg from 'pg'`): the store's own pool (contract H4, I2, I9)
+const pool = new pg.Pool({
+  // ...connection settings
+  options: '-c statement_timeout=3000 -c lock_timeout=2000',
+  connectionTimeoutMillis: 2000,
+  idleTimeoutMillis: 0, // keep warm connections; reconnect outside store calls
+});
+pool.on('error', (err) => console.warn('idle store connection lost', err)); // idle clients only
 const store = createSqlMessageStore({
   dialect: 'postgres',
   execute: async (sql, params) => (await pool.query(sql, params)).rows,
   transaction: async (fn) => {
     const client = await pool.connect();
+    // pg-pool removes its 'error' listener while a client is checked out: an
+    // error between two statements would otherwise be an uncaught exception.
+    let lost: Error | undefined;
+    const onError = (err: Error) => {
+      lost = err;
+    };
+    client.on('error', onError);
     // A client whose ROLLBACK failed is in an unknown state: release(err)
     // destroys it instead of returning it to the pool.
     let broken: Error | undefined;
@@ -275,7 +289,8 @@ const store = createSqlMessageStore({
       });
       throw err;
     } finally {
-      client.release(broken);
+      client.off('error', onError);
+      client.release(broken ?? lost);
     }
   },
 });
@@ -334,9 +349,19 @@ const store = createSqlMessageStore({
 
 (The pg and node:sqlite `transaction` wrappers are adapted from those of
 `test/store-sql.test.ts` `postgresBackend()` / `sqliteBackend()`, which let a
-failing ROLLBACK replace the original error and returned a pg client to the
-pool whatever its state. The mysql2 and Prisma wirings in the README of that
-revision passed no `transaction`.)
+failing ROLLBACK replace the original error, returned a pg client to the
+pool whatever its state, and attached no `'error'` listener to the checked-out
+client. The pool settings and listeners of the pg wiring come from the
+`[trial]` of `contract.md`. The mysql2 and Prisma wirings in the README of that
+revision passed no `transaction`; give their pools and held connections the
+same error listeners.)
+
+What these wirings still do NOT do: settle only a final outcome (contract I2).
+A connection dropped after a statement was sent rejects `pool.query()` with
+"Connection terminated" while the statement may still commit; a production
+`execute` notes `client.processID`, and on such a rejection ends that backend
+from another connection and waits until `pg_stat_activity` no longer lists it
+before rethrowing (stays pending while the server is unreachable).
 
 Two things the adapter did NOT do, which a production copy should consider:
 

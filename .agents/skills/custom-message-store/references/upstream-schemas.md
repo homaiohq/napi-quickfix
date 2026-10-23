@@ -325,6 +325,10 @@ driver takes; `<key>` is the four key columns compared to four parameters.
 | Text | the database encoding (normally `UTF8`) holds any message except a NUL byte; observed byte-identical round trips both ways with SOH, quotes, backslash, `みずほ証券`, `é` |
 | Keys | compared exactly; nothing to change |
 | Timeouts | `statement_timeout` / `lock_timeout` on the store's own pool (`options: '-c statement_timeout=... -c lock_timeout=...'`) and `connectionTimeoutMillis`; checkout + connect + statement together shorter than `storeTimeoutMs`. No `query_timeout`: a statement sent without an answer is ended with `pg_terminate_backend(client.processID)` from another connection and confirmed gone in `pg_stat_activity` before the call rejects (contract I2) |
+| Pool | the store's own `pg.Pool` (its short `statement_timeout` must not reach the application's queries), `idleTimeoutMillis: 0`, warmed before `create()`, replenished from the event loop (contract H4) |
+| Threadpool | `pg` 8.x authenticates SCRAM-SHA-256 (the server default since PostgreSQL 14) through WebCrypto, on the libuv threadpool: every reconnect needs pool slots while each parked send holds one. `UV_THREADPOOL_SIZE` above the in-flight sends plus a margin (contract H4; observed: 6 sends in flight on the default 4 slots never recovered from a server restart) |
+| Error events | `pool.on('error')` for idle clients, and `client.on('error')` on every client you hold checked out: `pg-pool` removes its listener during checkout (contract I9) |
+| Shutdown | `pool.end()` waits without limit for a frozen server: bound it (contract I7) |
 | Upstream defects | non-ISO `DateStyle` breaks its `creation_time` read (section 3); the `set()` fallback fails on a message containing `'` (section 2) |
 
 ### 7.2 MySQL (`MySQLStore`, driver `mysql2`; MariaDB noted)

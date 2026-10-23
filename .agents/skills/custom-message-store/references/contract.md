@@ -637,12 +637,41 @@ latency"; `[ARCH]` §4b "Dispatch rule".
 `dns.lookup`, `zlib`, async `crypto.*`, or a native addon that queues work on
 the pool), or `UV_THREADPOOL_SIZE` must be raised: with every pool slot parked
 in a store write, an adapter that needs a slot to finish that write deadlocks
-through the pool. Socket drivers (`pg`, `mysql2`) do not use the pool. Sources:
-`[README]` "An adapter must not depend on the libuv threadpool on its hot
-path"; `[ARCH]` §5 ("an adapter's hot path → never POOL"). Derived corollary:
-a connection (re)established INSIDE a store call resolves its host through
-`dns.lookup` (pool); warm the pool before `Initiator.create()`, keep a minimum
-pool size, or connect by IP.
+through the pool. Sources: `[README]` "An adapter must not depend on the libuv
+threadpool on its hot path"; `[ARCH]` §5 ("an adapter's hot path → never
+POOL").
+
+Socket drivers run their queries without the pool, but **(re)connecting uses
+it**: the host name goes through `dns.lookup`, and `pg` (8.x) authenticates
+SCRAM-SHA-256, PostgreSQL's default since 14, through WebCrypto
+(`subtle.importKey`/`sign`/`deriveBits`/`digest`), which Node runs on the
+pool: several pool round trips per connection. Each `sendToTarget()` parked in
+a store write holds a pool slot meanwhile. `[trial]`, `docker stop`/`start` of
+the server with the adapter reconnecting from the event loop, default
+`UV_THREADPOOL_SIZE=4`: 3 sends in flight recovered in 0.4-4 s, 5 in 6 s, **6
+never recovered** (3/3 runs, > 60 s: every SCRAM handshake hit
+`connectionTimeoutMillis` before it got its slots, and every other pool user of
+the process starved with it); with `UV_THREADPOOL_SIZE=8`, 0.4-0.7 s. With
+`UV_THREADPOOL_SIZE=1` and the pool's connections terminated, every following
+send resolved `false`. So, for any driver that connects through the pool:
+
+- size `UV_THREADPOOL_SIZE` above your maximum in-flight sends plus a margin
+  for reconnects (it is a liveness requirement, not a tuning knob; set it in
+  the environment before Node starts, or as the first statement of the entry
+  module, before anything uses the pool), and bound in-flight sends below it
+  (H6);
+- warming the pool before `Initiator.create()` is necessary but not
+  sufficient: servers drop connections (restart, failover,
+  `idle_session_timeout`, PgBouncer), so reconnects happen during operation.
+  Keep idle connections open (`pg-pool`: `idleTimeoutMillis: 0`; its default
+  10 s closes them, and its `min`, where your version has it, opens nothing by
+  itself), warm explicitly (check out N clients and release them), and
+  replenish from the event loop (on a client's `'error'`/`'end'`, outside any
+  store call) rather than inside a store call;
+- connect by IP, or resolve once at startup, to keep `dns.lookup` off the
+  path.
+
+(`[trial]`; the WebCrypto calls are in `pg`'s `lib/crypto/` at 8.23.1.)
 
 **H5. Never await an engine operation on the same session from inside a store
 method** (`session.logout()`, `session.setNext*()`, `sendToTarget(msg,
@@ -830,12 +859,38 @@ Sources: `[README]` "`stop()`"; `[ARCH]` §4b "Teardown"; `[store.test]` "a
 never-settling store call: stop(true) returns at once and the parked send
 settles".
 
+Bound your pool shutdown too: `pg`'s `Client.end()` (and so `pool.end()`)
+waits, without a limit, for the server to close the socket, so with a frozen
+server a process that ran `await engine.stop(); await pool.end()` cannot exit
+until the server thaws (`[trial]`, 3/3). Race `end()` against a grace period
+and then end the process with `process.exit()`, which a parked store call does
+not hold up at this revision (`[README]` "Process exit"); in a process that
+must live on, destroy the sockets of the clients that did not end (for `pg`,
+`client.connection.stream`, which is not a public API).
+
 **I8. The `'storeError'` event** is `(sessionID, method, error, poisoned)` with
 `error.name === 'QuickFixError'`, `error.fixErrorName === 'IOException'`,
 `error.message === 'message store <method>: <your message>'` (suffixed
 `(late)` for a late settlement). Observe-only; applications alert on
 `poisoned: true`. Sources: `[store.ts]` `ioError()`, `StoreBinding.bridge.storeError`;
 `src/engine.ts` `EngineEvents.storeError`.
+
+**I9. Handle the driver's error events, on the pool AND on every client you
+hold.** A connection the server ends while your code is not awaiting it
+(`pg_terminate_backend`, `idle_session_timeout`, a restart, a failover) is
+reported as an `'error'` event; with no listener it is an uncaught exception
+that kills the process, and every FIX session in it. `pg-pool` emits an idle
+client's error on the pool (`pool.on('error', ...)`), but REMOVES that
+listener from a client while it is checked out: a client you hold between two
+statements (a transaction wrapper, a warm-up, a replenish, a dedicated
+connection for a lock or for the kill step of I2) needs its own
+`client.on('error', ...)` for as long as you hold it. `[trial]`: an adapter
+with `pool.on('error')` only crashed in 11 of 13 runs when the server ended
+its connections during warm-up or replenish. The listener only records the
+failure (and schedules a replenish); the call that was using the client
+learns of it through its own rejection. Other drivers have the same two
+levels (a pool-wide and a per-connection error event); check which one your
+driver uses for a connection you hold, and listen on both.
 
 ---
 
