@@ -268,11 +268,17 @@ the upstream files, not these.
     housekeeping job may delete rows with `msgseqnum < outgoing_seqnum - N`
     only if you accept that a resend request older than `N` will be gap-filled
     (derived; not something upstream does).
-12. **`refresh()` upstream re-reads the row and would INSERT a missing one**;
-    the binding's `load()` must only read (contract B1), so a row deleted
-    underneath a running engine makes the next `load()` return `null`, which a
-    reload treats as "nothing to apply" (`if (o.present) Apply(o.state)` in
-    `cpp/js_message_store.cpp` `Gate()`): the cached numbers are kept.
+12. **`refresh()` upstream re-reads the row and INSERTs a missing one**
+    (`PostgreSQLStore.cpp:320-323`: `m_cache.reset(now)`, then
+    `populateCache()`, whose `else` branch at `:107-127` inserts `1/1`). The
+    binding's `load()` must only read (contract B1); the engine does the
+    INSERT itself. A row deleted underneath a running engine makes the next
+    reload's `load()` (a `refresh()` or the reload that lifts a poison) return
+    `null`, and `Reload()` in `cpp/js_message_store.cpp` then calls
+    `create(sessionID, { now, 1, 1 })` and applies `1/1` once it resolves (a
+    failing `create()` poisons the store): the numbering restarts, as upstream's
+    does. So a missing row must read as `null`, never as an error, and
+    `create()` must work outside preload too (contract B3, B5).
 13. **Key comparison must be exact (case- and accent-sensitive).** QuickFIX
     compares session ids by their string form (`SessionID.h:113-119`), so
     `ACME` and `acme` are two sessions. Upstream's DDL declares no collation:
