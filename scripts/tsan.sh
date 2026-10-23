@@ -7,8 +7,9 @@
 #
 # Node itself is not instrumented, so the run is expected to produce reports in
 # node / V8 / libstdc++ frames; those are noise. QuickFIX v1.16.0 has races of
-# its own (FIX::Mutex's recursion bookkeeping, SessionState's enabled flag and
-# heartbeat timestamps), reached from any thread that calls into a session;
+# its own (FIX::Mutex's recursion bookkeeping, SessionState's enabled flag,
+# logon flags and heartbeat timestamps), reached from any thread that calls
+# into a session or stops the engine;
 # they are listed but do not fail the run. scripts/tsan-gate.py classifies
 # each report by its two racing accesses and holds that list.
 #

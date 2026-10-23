@@ -46,7 +46,7 @@ Useful scripts:
   into `build-tsan/` and run the suite (or the given files) against it, failing on a
   report whose racing access is in this addon's code, or a QuickFIX race that
   `scripts/tsan-gate.py` does not list as upstream's (`FIX::Mutex`'s recursion
-  bookkeeping, `SessionState`'s `enabled` flag and heartbeat timestamps). Node itself is
+  bookkeeping, `SessionState`'s `enabled` flag, logon flags and heartbeat timestamps). Node itself is
   not instrumented, so reports in `node`/V8 frames are expected noise. The script refuses
   a binary without `__tsan_` symbols. Linux + gcc (binutils, python3) only. Set
   `QUICKFIX_SOURCE_DIR=build/_deps/quickfix-src` to reuse an already fetched QuickFIX.

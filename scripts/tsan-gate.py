@@ -39,6 +39,12 @@ KNOWN_UPSTREAM = [
     # (SessionState.h:56-57); FIX::Initiator/Acceptor::stop() write it from
     # the stopping thread the same way. See cpp/session_wrap.cpp.
     ('SessionState::enabled flag', re.compile(r'^FIX::SessionState::enabled\(')),
+    # receivedLogon/sentLogon, the plain bools Session::isLoggedOn() reads:
+    # FIX::Initiator/Acceptor::stop() polls isLoggedOn() from the stopping
+    # thread during its 10 s logout grace (Initiator.cpp:267, :297) while the
+    # network thread's Session::disconnect() clears them (Session.cpp:628-629).
+    ('SessionState logon flags (isLoggedOn)', re.compile(
+        r'^FIX::SessionState::(receivedLogon|sentLogon)\(')),
     # SessionState's last sent/received timestamps: Session::fill() (sendRaw,
     # under Session::m_mutex) and next(Message) write them on whichever thread
     # sends or receives, while the network thread's Session::next(now) reads
