@@ -18,7 +18,8 @@ the tables with a C++ engine during a cutover or as a standby.
   it) nor the binding's own: that one is `sqlSchema()` in `src/store/sql.ts`
   and `sql/*.sql` on the branch that ships the SQL adapter
   (`@homaiohq/napi-quickfix` branch `feat/js-message-store` @ `f802818`,
-  identical at `6b8caa0`, the commit that added it), elided from the
+  PR #31, identical at `6b8caa0`, the commit that added it; not in the
+  checkout that carries this skill, it ships with PR #33), elided from the
   reproduction in `sql-adapter-reference.md`; it was tested against
   `node:sqlite` and PostgreSQL by that revision's SQL adapter test.
 - **Verification** (2026-10-23). Statements marked "observed" were run, not
@@ -68,7 +69,7 @@ m_cache.getNextSenderMsgSeqNum()` of a `MemoryStore` that starts at `1/1`).
 
 **Session key**: exactly `(beginstring, sendercompid, targetcompid,
 session_qualifier)`. QuickFIX C++'s `SessionID` has no SubID/LocationID members
-(`SessionID.h:33-52`), so two sessions that differ only in `SenderSubID` share a
+(`SessionID.h:103-109`), so two sessions that differ only in `SenderSubID` share a
 row; the qualifier is the only disambiguator, and it is stored as the empty
 string, not `NULL` (`NOT NULL` column; `getSessionQualifier()` returns `""`).
 

@@ -16,12 +16,16 @@ ascending range with gaps omitted" means, when a write must already be durable,
 which failures the engine tolerates and which poison the session, and what the
 upstream tables' columns really mean. This skill is that knowledge, sourced.
 
-**Sources and versions.** The binding at `@homaiohq/napi-quickfix` 0.3.1, branch
-`feat/js-message-store` @ `f802818` (`src/store.ts`, `cpp/js_message_store.{h,cpp}`,
-`README.md` "Message store", `ARCHITECTURE.md` §4b/§5, `test/store.test.ts`,
-`test/store-adapters.ts`, and that revision's SQL adapter test, whose `contract()`
-section 1 of `references/test-checklist.md` extends: begin > end, gaps, numeric
-order, seqnums at 2^40), and QuickFIX C++
+**Sources and versions.** The binding as it is in the checkout that carries this
+skill (`@homaiohq/napi-quickfix`, unreleased after 0.3.1: CHANGELOG
+`[Unreleased]`; branch `feat/message-store-adapter`, PR #32): `src/store.ts`,
+`cpp/js_message_store.{h,cpp}`, `README.md` "Message store", `ARCHITECTURE.md`
+§4b/§5, `test/store.test.ts`, `test/store-adapters.ts`. The generic SQL adapter
+is not in this checkout: its source, its test (whose `contract()` section 1 of
+`references/test-checklist.md` extends: begin > end, gaps, numeric order,
+seqnums at 2^40) and its README section are cited at branch
+`feat/js-message-store` @ `f802818` (PR #31), and ship with PR #33. And
+QuickFIX C++
 **v1.16.0**
 (the tag `CMakeLists.txt` pins). Every rule in the references cites one of them;
 when the skill and a newer repository disagree, the repository wins: re-read the
@@ -130,7 +134,7 @@ is unclear: it is the oracle the test checklist compares against.
 | each outbound message | `setMessage(id, n, wire)` then `setSeqNums(id, n+1, target)` **then** the bytes go out | the engine's network thread or a `sendToTarget()` worker, holding the session-state mutex | Write-through: your ack precedes the wire |
 | each inbound message | `setSeqNums(id, sender, target+1)` | network thread | After your `fromApp` handler ran |
 | peer's ResendRequest | `getMessages(id, begin, end)` | network thread | Range already bounded by the engine |
-| `ResetOnLogon=Y`, `ResetOnLogout=Y`, `ResetOnDisconnect=Y`, a Logon sent or received with `ResetSeqNumFlag=Y`, session-time rollover (there is no JS-side `reset()`: `setNextSenderMsgSeqNum()` / `setNextTargetMsgSeqNum()` reach the adapter as `setSeqNums`) | `reset(id, {now, 1, 1})` | network thread (a `sendToTarget()` worker only if the application itself sends a Logon carrying `ResetSeqNumFlag=Y`, `Session.cpp:559-567`) | Never fatal to QuickFIX; failure poisons, and the same `reset` (same `creationTime`) is retried by every later call until it succeeds |
+| `ResetOnLogon=Y`, `ResetOnLogout=Y`, `ResetOnDisconnect=Y`, a Logon sent or received with `ResetSeqNumFlag=Y`, session-time rollover (there is no JS-side `reset()`: `setNextSenderMsgSeqNum()` / `setNextTargetMsgSeqNum()` reach the adapter as `setSeqNums`) | `reset(id, {now, 1, 1})` | network thread (a `sendToTarget()` worker only if the application itself sends a Logon carrying `ResetSeqNumFlag=Y`, `Session.cpp:559-567`) | Never fatal to QuickFIX; failure poisons, and that `reset` (with its `creationTime`; a later failing `reset` replaces it) is retried by every later call until it succeeds |
 | `RefreshOnLogon=Y`, `session.refresh()`, and the reload that lifts a poisoned store | `load(id)`, then `create(id, {now, 1, 1})` if it returned `null` | network thread / worker | `null` means the row is gone: the numbering restarts at `1/1`, as upstream's `refresh()` does |
 | `await engine.stop()` | `close(id)` once per session, after the sessions are destroyed | JS | Also when `create()` rejects after building the engine (constructor-time `reset()` failed); not when the engine is dropped without `stop()` |
 
@@ -202,8 +206,10 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   the driver shorter timeouts than `storeTimeoutMs`, enforced
   by the server (`statement_timeout`) rather than the client: a Promise that
   rejects while the statement still commits defeats the engine's ordering.
-  Poison = the session's writes fail, the engine disconnects it, and the next
-  call after all late writes settled reloads through `load()`; QuickFIX
+  Poison = the session's writes fail until the next call after all late
+  writes settled has reloaded through `load()`. A reload that succeeds at once
+  (a plain rejection) lifts it with the session still up; while it cannot, the
+  engine disconnects the session at its next inbound message and QuickFIX
   reconciles with the peer at the next logon.
 - **`close` (J).** Optional, per session, after `stop()` (and when `create()`
   rejects after building the engine); not a durability hook; do not close a
@@ -340,7 +346,8 @@ const engine = await Initiator.create({
 engine.on('storeError', (sessionID, method, error, poisoned) => {
   // error.name === 'QuickFixError', error.fixErrorName === 'IOException',
   // error.message === `message store ${method}: ...` ('(late)' suffix for a late settlement).
-  // poisoned === true: the session will disconnect and reload through load() when the adapter is back.
+  // poisoned === true: writes fail until a reload through load() succeeds; the session disconnects
+  // at its next inbound message unless that reload succeeds first.
 });
 ```
 

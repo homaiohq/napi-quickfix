@@ -240,8 +240,10 @@ revision, see the sources table in `contract.md`) is the minimal version of 2.1-
 ## 3. Failure injection (wrap the candidate, do not modify it)
 
 Wrap the candidate in an object that forwards every method but can be told to
-reject / hang per method (copy `ControlledStore` from `test/store-adapters.ts`:
-it wraps any inner adapter).
+reject / hang per method (copy `ControlledStore` from `test/store-adapters.ts`;
+it is typed to wrap a `MapMessageStore`: retype its `inner` field and
+constructor parameter as `MessageStoreAdapter`, and drop its `row()` helper,
+which reads `MapMessageStore.rows`, to wrap yours).
 
 - **3.1 `setMessage` rejects.** `sendToTarget()` resolves `false`,
   `getExpectedSenderNum()` is unchanged, the session is still logged on,
@@ -250,7 +252,10 @@ it wraps any inner adapter).
   consume (test "setMessage rejection: ...").
 - **3.2 `setSeqNums` rejects.** `sendToTarget()` resolves `false`,
   `'storeError'` has `poisoned === true`, `getExpectedSenderNum()` throws an
-  `IOException`, the session disconnects on its next inbound message; restore
+  `IOException`; while `setSeqNums` keeps rejecting, the session disconnects
+  on its next inbound message (the reload succeeds, the inbound message's own
+  write then fails; a single rejection heals at the next call's reload with no
+  disconnect, test "a send whose setSeqNums rejects once: ..."); restore
   the adapter and `session.logon()`: the candidate's `load` is called (the
   reload) and the session is back (test "ResetOnDisconnect=Y + rejecting
   reset() ..." uses the same recovery path).

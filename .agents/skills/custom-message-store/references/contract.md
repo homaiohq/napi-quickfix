@@ -4,14 +4,15 @@ Every rule below is sourced. The sources, and the versions they were read at:
 
 | Tag | Meaning |
 | --- | --- |
-| `[store.ts]` | `src/store.ts` of `@homaiohq/napi-quickfix` 0.3.1, branch `feat/js-message-store` @ `f802818` (the TS interface, its JSDoc, `MapMessageStore`, `StoreBinding.preload()`/`closeAll()`, `validState()`) |
+| `[store.ts]` | `src/store.ts` of `@homaiohq/napi-quickfix` as it is in the checkout that carries this skill (unreleased after 0.3.1, CHANGELOG `[Unreleased]`; branch `feat/message-store-adapter`, PR #32) (the TS interface, its JSDoc, `MapMessageStore`, `StoreBinding.preload()`/`closeAll()`, `validState()`) |
 | `[js_message_store.h]` / `[js_message_store.cpp]` | `cpp/js_message_store.{h,cpp}`, same revision (the native `FIX::MessageStore` over the adapter: dispatch, cache, timeout, poison, `ParseResult`) |
 | `[README]` | `README.md` section "Message store", same revision |
+| `[README@f802818]` | `README.md` section "Generic SQL adapter" at branch `feat/js-message-store` @ `f802818` (PR #31); not in this checkout, it ships with the SQL adapter (PR #33) |
 | `[ARCH]` | `ARCHITECTURE.md` §4b "The message-store bridge" and §5 "Lock order", same revision |
 | `[store.test]` | `test/store.test.ts`, same revision; cited by test title |
-| `[store-sql.test]` | the SQL adapter test, `test/store-sql.test.ts` at the same revision (identical at `6b8caa0`, the commit that introduced the SQL adapter): `contract()`, reproduced as section 1 of `test-checklist.md`, and `loopback()`. Not part of every checkout that carries this skill |
+| `[store-sql.test]` | the SQL adapter test, `test/store-sql.test.ts` at branch `feat/js-message-store` @ `f802818` (PR #31; `contract()` identical at `6b8caa0`, the commit that introduced the SQL adapter, and on `feat/sql-message-store`, PR #33): `contract()`, reproduced as section 1 of `test-checklist.md`, and `loopback()`. Not in this checkout |
 | `[QF <file>:<line>]` | QuickFIX C++ **v1.16.0** (the tag pinned by `CMakeLists.txt` `GIT_TAG v1.16.0`; FetchContent checkout `2ce8a60667d95a55cdc57a210f165e19cb757126`), path under `src/C++/` |
-| `[probe]` | a loopback probe run on 2026-10-23 through the binding at `4dc1231` (branch `feat/message-store-adapter`): a real `Acceptor` + `Initiator` over 127.0.0.1, the initiator on a test-double adapter. Each probe is reproduced as a scenario in `test-checklist.md` (the rule names it), so you can rerun it against your adapter |
+| `[probe]` | a loopback probe run on 2026-10-23 through the binding at `4dc1231` (branch `feat/message-store-adapter`, an ancestor of this checkout; later commits changed the poison, reset-retry and reload paths, none of which the probes exercise: the seqnum writes of a healthy store, `setMessage` ordering, `getMessages` parsing): a real `Acceptor` + `Initiator` over 127.0.0.1, the initiator on a test-double adapter. Each probe is reproduced as a scenario in `test-checklist.md` (the rule names it), so you can rerun it against your adapter |
 
 Where a rule is *derived* (a consequence of sourced facts rather than a
 sentence in a source) it says so.
@@ -28,7 +29,7 @@ QuickFIX's network thread or a libuv worker running a session operation; "SS" is
 `beginString`, `senderCompID`, `targetCompID`, `sessionQualifier` (the empty
 string when there is none). There is no SenderSubID/LocationID in a QuickFIX
 C++ session id. Sources: `[store.ts]` every method takes `sessionID: SessionID`;
-`src/session-id.ts` exposes exactly those four getters; `[QF SessionID.h:33-52]`
+`src/session-id.ts` exposes exactly those four getters; `[QF SessionID.h:103-109]`
 has exactly those four identity fields (plus an `isFIXT` flag and the frozen
 string); the upstream tables' primary key is
 `(beginstring, sendercompid, targetcompid, session_qualifier)` (see
@@ -285,7 +286,8 @@ settlement after the timeout is discarded by the engine (not reported), but
 the write itself still lands in your backend, possibly AFTER the retry's
 write: see D7. Sources: `[README]` "Failure policy"; `[js_message_store.cpp]`
 `set()` → `Forward(r, /*fatal=*/false)`, `OnSettled()` returns early for any
-method other than `kSetSeqNums`/`kReset`; `[store.test]` "setMessage timeout:
+method other than `kSetSeqNums`/`kReset`/`kCreate` (the `create()` a reload
+issues for a missing row); `[store.test]` "setMessage timeout:
 not fatal; the late settlement is discarded" (`storeErrors.length == 1`, "a
 late setMessage is not reported").
 
@@ -296,7 +298,8 @@ Implement it anyway; it is the default.
 **D7. For one session, writes must take effect in the order the engine issued
 them, including a write the engine already gave up on.** The engine serialises
 its calls per session (H1), but a timed-out call is not counted for
-`setMessage` (only `setSeqNums`/`reset` hold back recovery, I2), so the next
+`setMessage` (only `setSeqNums`/`reset`, and the `create()` a reload issues
+for a missing row, hold back recovery, I2), so the next
 call can start while the late one is still running. On a connection POOL the
 two run on different connections and the older one can commit last. Then the
 row for `n` no longer holds what went out as `n`: a resend of `n` (say the
@@ -479,7 +482,7 @@ messages are gone, which the engine handles by gap-filling a resend. The reverse
 order would leave stale messages under low sequence numbers that a resend
 request after the reset could replay as `PossDupFlag=Y` application messages.
 Sources: `[store.ts]` JSDoc ("in one transaction where the backend allows");
-`[README]` "Generic SQL adapter" (`reset()` runs its two statements in a
+`[README@f802818]` "Generic SQL adapter" (`reset()` runs its two statements in a
 transaction when one is provided).
 
 **F3. `reset()` must UPSERT the session row**: resetting a session that has no row
@@ -701,16 +704,26 @@ messages outside its guards on the connect path and in its `RejectLogon`/
 `UnsupportedVersion` handlers), and so does the inbound increment inside those
 handlers: the failure is recorded and nothing stamped while poisoned is sent.
 A poisoned initiator's Logon fails the same way, after QuickFIX counted it as
-sent, so that attempt ends at `LogonTimeout`. Every inbound message ends in a
+sent, so that attempt ends at `LogonTimeout`. Whether the session goes down
+depends on the reload below. After a plain rejection (nothing unsettled) the
+next store call reloads, the network thread's next tick at the latest; if that
+succeeds the poison lifts with the session still up (the send whose write was
+rejected resolved `false`). While the poison cannot lift (a timed-out write
+still unsettled, or the adapter still failing), every inbound message ends in a
 sequence-number write that fails, so the engine disconnects the session at its
-next inbound message (a heartbeat at the latest); `'storeError'` fires with
-`poisoned: true`; `session.getExpected*()` throw.
+next inbound message (a heartbeat at the latest); a failed inbound
+sequence-number write disconnects it at once. `'storeError'` fires with
+`poisoned: true`; `session.getExpected*()` throw until the poison lifts.
+`[store.test]` "a send whose setSeqNums rejects once: poisoned, healed by the
+next call's reload, no disconnect, the seqnum is reused".
 Poison lifts in two steps: once every timed-out write has settled, the next
 store call of any kind first reloads the state through `load()` (one reload in
 flight at a time), then proceeds; QuickFIX reconciles with the peer at the next
 logon (resend request, or redelivery with `PossDupFlag=Y`). A failed `reset` is
 the exception: that step is the reset itself, retried as `reset(id, {the
-original creationTime, 1, 1})` until it succeeds, never a `load()` (which
+creationTime of the latest failed reset, 1, 1})` until it succeeds (a later
+`reset()` that fails too replaces the pending one's timestamp, cpp
+`reset()`), never a `load()` (which
 would bring back the numbers QuickFIX meant to discard). A message stamped
 while poisoned, whose sender number the lifting reload then moved, is refused
 (non-poisoning `'storeError'`, not sent). A timed-out `setSeqNums`/`reset` that

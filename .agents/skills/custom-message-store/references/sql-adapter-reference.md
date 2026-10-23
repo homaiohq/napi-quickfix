@@ -1,8 +1,9 @@
 # Worked example: the generic SQL adapter (abridged: DDL elided)
 
 This is `src/store/sql.ts` as it existed on `@homaiohq/napi-quickfix` branch
-`feat/js-message-store` @ `f802818` (introduced by commit `6b8caa0` "feat:
-generic SQL message-store adapter"). It was removed from that pull request to
+`feat/js-message-store` @ `f802818` (PR #31; introduced by commit `6b8caa0`
+"feat: generic SQL message-store adapter"; not in the checkout that carries
+this skill, it ships with PR #33). It was removed from that pull request to
 be shipped separately; it is reproduced here, abridged (the body of
 `sqlSchema()` is elided: this skill links to schemas, it does not copy them,
 see `upstream-schemas.md` section 5), as the executable form of the
@@ -240,7 +241,13 @@ export function createSqlMessageStore(options: SqlMessageStoreOptions): MessageS
 }
 ```
 
-## How it was wired to real drivers (from the README of the same revision)
+## How to wire it to real drivers (adapted from the README and test of the same revision)
+
+Give every wiring a `transaction`: without one, `reset()` runs its DELETE and
+its UPSERT as two autocommitted statements (on a pool, possibly on two
+connections), and a crash or a failure between them leaves the messages gone
+with the old numbers still in the row (contract F2, SKILL.md "reset (F)": one
+transaction).
 
 ```ts
 // pg
@@ -249,15 +256,21 @@ const store = createSqlMessageStore({
   execute: async (sql, params) => (await pool.query(sql, params)).rows,
   transaction: async (fn) => {
     const client = await pool.connect();
+    // A client whose ROLLBACK failed is in an unknown state: release(err)
+    // destroys it instead of returning it to the pool.
+    let broken: Error | undefined;
     try {
       await client.query('BEGIN');
       await fn(async (sql, params) => (await client.query(sql, params)).rows);
       await client.query('COMMIT');
     } catch (err) {
-      await client.query('ROLLBACK');
+      // Keep the original error: a failing ROLLBACK must not replace it.
+      await client.query('ROLLBACK').catch((e: Error) => {
+        broken = e;
+      });
       throw err;
     } finally {
-      client.release();
+      client.release(broken);
     }
   },
 });
@@ -265,6 +278,25 @@ const store = createSqlMessageStore({
 const store = createSqlMessageStore({
   dialect: 'mysql',
   execute: async (sql, params) => (await pool.execute(sql, params))[0] as Record<string, unknown>[],
+  transaction: async (fn) => {
+    const conn = await pool.getConnection();
+    let broken = false;
+    try {
+      await conn.beginTransaction();
+      await fn(async (sql, params) => (await conn.execute(sql, params))[0] as Record<string, unknown>[]);
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback().catch(() => {
+        broken = true;
+      });
+      throw err;
+    } finally {
+      // destroy() closes a connection whose ROLLBACK failed; release() would
+      // hand it back to the pool mid-transaction.
+      if (broken) conn.destroy();
+      else conn.release();
+    }
+  },
 });
 // node:sqlite (synchronous driver; the adapter still returns Promises, which is fine)
 const execute: SqlExecute = (sql, params) => db.prepare(sql).all(...(params as (string | number)[]));
@@ -277,20 +309,29 @@ const store = createSqlMessageStore({
       await fn(execute);
       db.exec('COMMIT');
     } catch (err) {
-      db.exec('ROLLBACK');
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // Keep the original error (SQLite may already have rolled back).
+      }
       throw err;
     }
   },
 });
-// Prisma
+// Prisma (interactive transaction; its default 5 s timeout must exceed the
+// reset's own latency, and stay below storeTimeoutMs)
 const store = createSqlMessageStore({
   dialect: 'postgres',
   execute: (sql, params) => prisma.$queryRawUnsafe(sql, ...params),
+  transaction: (fn) => prisma.$transaction((tx) => fn((sql, params) => tx.$queryRawUnsafe(sql, ...params))),
 });
 ```
 
-(The `transaction` wrappers are those of `test/store-sql.test.ts`
-`sqliteBackend()` / `postgresBackend()`.)
+(The pg and node:sqlite `transaction` wrappers are adapted from those of
+`test/store-sql.test.ts` `postgresBackend()` / `sqliteBackend()`, which let a
+failing ROLLBACK replace the original error and returned a pg client to the
+pool whatever its state. The mysql2 and Prisma wirings in the README of that
+revision passed no `transaction`.)
 
 Two things the adapter did NOT do, which a production copy should consider:
 
