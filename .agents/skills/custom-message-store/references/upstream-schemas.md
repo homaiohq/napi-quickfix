@@ -175,6 +175,15 @@ Upstream hard-codes the names `sessions` and `messages` in database `quickfix`
 used `t<pid>_` to isolate CI runs. Interop with an
 upstream deployment means an empty prefix.
 
+A PostgreSQL **schema** is the other way to separate deployments, and the one
+upstream can follow: create the tables in a schema of their own and point
+both sides at it through `search_path`. Upstream's C++ store has no schema
+setting; run it with `PGOPTIONS='-c search_path=<schema>'` in its environment
+(libpq applies it to every connection), or `ALTER ROLE <role> SET
+search_path = <schema>`. On the Node side pass the same option to the pool
+(`options: '-c search_path=<schema>'`, next to the timeouts) or qualify the
+table names (`<schema>.sessions`).
+
 ## 5. The DDL: read it upstream, do not copy it from here
 
 QuickFIX ships its table definitions in the repository under `src/sql/`, one
@@ -194,6 +203,20 @@ are:
 | MySQL | `src/sql/mysql/` | `sessions_table.sql`, `messages_table.sql` | `messages_log_table.sql`, `event_log_table.sql` | `mysql.sql` (drops and recreates database `quickfix`, then `source`s the four table files), `user.sql`, `create.sh`, `create_user.sh`, `create.bat` |
 | PostgreSQL | `src/sql/postgresql/` | `sessions_table.sql`, `messages_table.sql` | `messages_log_table.sql`, `event_log_table.sql` | `postgresql.sql` (`\i` of the four table files), `user.sql`, `create.sh`, `create_user.sh`, `create.bat` |
 | MSSQL | `src/sql/mssql/` | `mssql.sql` (one file: the database, both store tables and the four log tables) | in `mssql.sql` | `create.bat` |
+
+**Run only the two store tables.** For a store, execute `sessions_table.sql`
+and `messages_table.sql` of your dialect (MSSQL: the two `CREATE TABLE`
+statements for `sessions` and `messages` from `mssql.sql`). The driver
+scripts do more: `postgresql.sql` `\i`s the two log tables too, `mysql.sql`
+DROPs and recreates the database `quickfix` first, `mssql.sql` creates a
+database. Neither are the table files safe to re-run: PostgreSQL's are a
+plain `CREATE TABLE` (fails the second time), and **MySQL's start with `USE
+quickfix;` and `DROP TABLE IF EXISTS`**, so re-running one on a live database
+deletes the session state and every stored message. To run them on every
+deploy, guard them yourself: drop the `USE`/`DROP` lines, and write `CREATE
+TABLE IF NOT EXISTS` with the same column list (PostgreSQL, MySQL) or `IF
+OBJECT_ID(N'sessions', N'U') IS NULL CREATE TABLE ...` (SQL Server); or apply
+them once through your migration tool. Keep the column types and primary keys exactly as upstream has them.
 
 What you need to know about them without opening them (prose, verified
 against the C++ in sections 1-2): `sessions` has the four key columns plus
@@ -321,7 +344,7 @@ driver takes; `<key>` is the four key columns compared to four parameters.
 | `load` | `SELECT to_char(creation_time, 'YYYY-MM-DD HH24:MI:SS.MS') AS creation_time, incoming_seqnum, outgoing_seqnum FROM sessions WHERE <key>`; parse `creation_time + 'Z'` strictly (section 3: `::text` and `pg`'s default parser both depend on `DateStyle`/`TZ`) |
 | Write `creation_time` | a UTC text parameter `YYYY-MM-DD HH:MM:SS`, never a JS `Date` (pg serialises a `Date` with the process offset, and a `TIMESTAMP` column keeps the local wall-clock: observed, `new Date('2026-10-22T10:11:12Z')` under `TZ=Europe/Paris` is stored as `12:11:12`) |
 | `setMessage` | `INSERT INTO messages (<key cols>, msgseqnum, message) VALUES ($1,...,$6) ON CONFLICT (<key cols>, msgseqnum) DO UPDATE SET message = EXCLUDED.message` (needs upstream's primary key) |
-| `reset` | `BEGIN`; `DELETE FROM messages WHERE <key>`; `INSERT INTO sessions ... ON CONFLICT (<key cols>) DO UPDATE SET ...`; `COMMIT`, all on ONE client from `pool.connect()` |
+| `reset` | one statement: `WITH gone AS (DELETE FROM messages WHERE <key>) INSERT INTO sessions (...) VALUES (...) ON CONFLICT (<key cols>) DO UPDATE SET creation_time = EXCLUDED.creation_time, incoming_seqnum = EXCLUDED.incoming_seqnum, outgoing_seqnum = EXCLUDED.outgoing_seqnum` through `pool.query()` (observed on PostgreSQL 16 with untyped parameters: every message of the session deleted, the row upserted, other sessions untouched). Atomic and bounded by one `statement_timeout`. A `BEGIN`/`DELETE`/upsert/`COMMIT` on a checked-out client is four separately bounded statements, unbounded as a whole before PostgreSQL 17's `transaction_timeout`, and idle in transaction between them |
 | Text | the database encoding (normally `UTF8`) holds any message except a NUL byte; observed byte-identical round trips both ways with SOH, quotes, backslash, `みずほ証券`, `é` |
 | Keys | compared exactly; nothing to change |
 | Timeouts | `statement_timeout` / `lock_timeout` on the store's own pool (`options: '-c statement_timeout=... -c lock_timeout=...'`) and `connectionTimeoutMillis`; checkout + connect + statement together shorter than `storeTimeoutMs`. No `query_timeout`: a statement sent without an answer is ended with `pg_terminate_backend(client.processID)` from another connection and confirmed gone in `pg_stat_activity` before the call rejects (contract I2) |

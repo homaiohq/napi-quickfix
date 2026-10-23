@@ -212,22 +212,29 @@ in `contract.md`, is the minimal version of 2.1-2.2.)
   show `setMessage` then `setSeqNums` (test "sync Map adapter on both sides ...":
   "Every outbound message = setMessage + setSeqNums, as upstream").
 - **2.4 `ResetOnLogon=Y` resets through the adapter.** The initiator's `reset`
-  is called at logon; afterwards the row is `1/1` with no messages below the
-  Logon's own seqnum.
+  is called at logon (twice: in `generateLogon()` and again when the Logon
+  with `ResetSeqNumFlag=Y` is sent, contract F5), each time with state `1/1`;
+  right after the logon completed, before any other message, the row is
+  `2/2` (the Logon went out as 1 and the peer's Logon came in as 1), and the
+  only stored message is the Logon, under 1.
 - **2.5 `close()` on `stop()`.** After `await engine.stop()` the last recorded
   call is `close` (once per session), and `await Initiator.create({ store:
   sameAdapter })` right after records `load` next, never a call before `close`
   (test "await stop(); await create({ store: same }) sees close() before load()").
 - **2.6 A session constructed outside its session time.** Configure
-  `StartTime`/`EndTime` as a one-hour window two hours from now; pre-create the
+  `StartTime`/`EndTime` as a one-hour window two hours from now (they are UTC
+  unless `TimeZone` is set: compute them from `new Date()` with the UTC
+  getters, or set `TimeZone`); pre-create the
   row with `9/9`; `Acceptor.create()` must call `load` then `reset` and resolve
   with `getExpectedSenderNum() === 1`. Make `reset` reject: `create()` rejects
   and `doesSessionExist(id)` is `false` (test "a session constructed outside its
   session time resets through the adapter on the JS thread; create() awaits
   it").
 - **2.7 Forcing a resend without touching the backend.** Log on with
-  `ResetOnLogon=N` on both sides, send a few orders from the initiator, then
-  rewind the acceptor: `acc.getSession(ACC_ID).setNextTargetMsgSeqNum(n)` with
+  `ResetOnLogon=N` on both sides, send a few orders from the initiator, wait
+  until the session is quiet (no message in flight either way: a heartbeat
+  that crosses the rewind is counted against the new number and shifts the
+  range), then rewind the acceptor: `acc.getSession(ACC_ID).setNextTargetMsgSeqNum(n)` with
   `n` the first order's seqnum, and send one more order. The acceptor sees a
   number above the one it expects and sends `ResendRequest(n, 0)`; the
   initiator answers from its adapter's `getMessages(n, next - 1)`. This is how
@@ -306,15 +313,16 @@ an array your listener fills) instead of asserting on it right after
 
 - **3.1 `setMessage` rejects.** `sendToTarget()` resolves `false`,
   `getExpectedSenderNum()` is unchanged, the session is still logged on,
-  `'storeError'` fired once with `poisoned === false`; restore the adapter; the
+  `'storeError'` fires once (wait for it) with `poisoned === false`; restore the adapter; the
   next send succeeds and arrives with the seqnum the failed send did not
   consume (test "setMessage rejection: ...").
 - **3.2 `setSeqNums` rejects.** `sendToTarget()` resolves `false`,
   `'storeError'` has `poisoned === true`, `getExpectedSenderNum()` throws an
-  `IOException`; while `setSeqNums` keeps rejecting, the session disconnects
-  on its next inbound message (the reload succeeds, the inbound message's own
-  write then fails; a single rejection heals at the next call's reload with no
-  disconnect, test "a send whose setSeqNums rejects once: ..."); restore
+  `IOException`. Make `load` reject too: with only `setSeqNums` failing, the
+  next store call's reload (a heartbeat's, at the latest) succeeds and lifts
+  the poison before you can look (a single rejection heals that way with no
+  disconnect, test "a send whose setSeqNums rejects once: ..."). With both
+  failing, the session disconnects on its next inbound message; restore
   the adapter and `session.logon()`: the candidate's `load` is called (the
   reload) and the session is back (test "ResetOnDisconnect=Y + rejecting
   reset() ..." uses the same recovery path).

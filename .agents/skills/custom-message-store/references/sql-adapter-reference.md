@@ -416,3 +416,10 @@ in any copy:
    in `serialisePerSession()` (SKILL.md "Wiring"), or give each session its
    own connection. The `node:sqlite` wiring is synchronous and therefore
    already ordered.
+8. **`reset` is two statements in a client-side transaction.** On PostgreSQL
+   that is four round trips on a held client (`BEGIN`, `DELETE`, upsert,
+   `COMMIT`): each bounded by `statement_timeout`, the whole unbounded before
+   PostgreSQL 17's `transaction_timeout`, with an idle-in-transaction window
+   between them. Use one data-modifying CTE through `pool.query()` instead
+   (`upstream-schemas.md` section 7.1, verified on PostgreSQL 16); keep the
+   `transaction` for the other dialects.

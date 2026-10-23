@@ -144,8 +144,12 @@ never been seen") and `preload()` (`state === null || state === undefined` →
 
 **B2. `load()` of an unknown session must not throw**: a throw or rejection is a
 failure, and during `Initiator.create()` / `Acceptor.create()` a failure rejects
-the factory and no engine is built. Source: `[store.test]` "create() rejects on a
-load()/create() failure with no native object behind it".
+the factory and no engine is built. The factory rejects with YOUR error as is
+(a plain `Error` with `code: 'ECONNREFUSED'`, say), not a `QuickFixError`;
+only a timeout is a `QuickFixError` (`IOException`, "timed out after N ms"),
+and a malformed state a `TypeError` (B4). Sources: `[store.test]` "create()
+rejects on a load()/create() failure with no native object behind it";
+`[store.ts]` `preload()`, `settle()`, `withTimeout()`; `[trial]`.
 
 **B3. When `load()` is called**: (a) by `Initiator.create()` / `Acceptor.create()`
 for every session the engine will own, before the engine exists, once per
@@ -164,6 +168,28 @@ resolved; a failing `create()` poisons the store. So `null` must mean "no row",
 never "could not read" (reject for that). Sources: `[js_message_store.cpp]`
 `Reload()`; `[store.test]` "refresh() / a reload after the row was deleted
 ...".
+
+What a `null` at (b) or (c) costs is worth knowing before you allow it.
+`[trial]`, the `sessions` row deleted under a live session against a real
+counterparty: the engine restarted at `1/1`, the peer answered "MsgSeqNum too
+low, expecting 60 but received 1" and the session looped on Logout; meanwhile
+51 sends that resolved `true` (logged out, so stored for the resend that
+follows the next logon, D8) were stored under the reused numbers 1..59, which
+the peer never asks for: silently lost. Recovery came only because those sends
+pushed the number past 60. A `TRUNCATE`, or a restore from an older backup,
+does the same. So:
+
+- treat a reload that finds no row as an alarm (it is visible as the
+  `create()` call that follows a `load()` after startup);
+- optionally, make the adapter refuse to renumber: remember, per adapter
+  instance, the sessions whose row it has read or written, and REJECT a later
+  `load()` of such a session that finds no row ("row vanished"). The store
+  stays poisoned and the session goes down instead of renumbering, until an
+  operator restores the row or deliberately recreates it. The first `load()`
+  of a session in the instance (the preload) must still return `null` for a
+  never-seen session (B1), and checklist test 1.1 and the engine's own
+  "row deleted" path then differ from `MapMessageStore` by design.
+  (Derived; `[trial]`.)
 
 **B4. The returned object must satisfy A3** (a valid `Date`, two positive safe
 integers). A malformed object is a `TypeError` from `create()` at preload time,
@@ -520,6 +546,11 @@ the engine constructor when a session is constructed outside its session time
 (`[QF Session.cpp:85-87]`; `[store.test]` "a session constructed outside its
 session time resets through the adapter on the JS thread; create() awaits it":
 `calls == ['load', 'reset']`).
+With `ResetOnLogon=Y` an initiator's logon calls `reset()` twice: once in
+`generateLogon()` (`[QF Session.cpp:680-682]`), and again in `sendRaw()`
+after `toAdmin`, because that Logon carries `ResetSeqNumFlag=Y`
+(`[QF Session.cpp:559-567]`; observed in the `[trial]`). Keep `reset()` cheap
+and idempotent (I4).
 There is no JS-side `reset()`: the binding deliberately does not expose
 `Session::reset()` / `disconnect()` (`src/session.ts` class doc: "only safe on
 the engine's own network thread"; `cpp/session_wrap.cpp` registers `logon`,
@@ -585,7 +616,22 @@ with the database (e.g. updated before a failed write) breaks C5. Source:
 **G3. One engine per session row.** Nothing locks the row; upstream treats
 duplicate rows as a configuration error (B6). Two engines (two processes, two
 nodes) owning the same session id through the same tables corrupt each other.
-(Derived from B6 and G2.)
+(Derived from B6 and G2.) `[trial]`: a standby process started with the same
+sessions overwrote 14 stored orders per session with its own Logons, silently.
+
+A cheap STARTUP check catches that misconfiguration without fencing every
+write (which D7 advises against): take an exclusive lock per session when the
+adapter first sees it, and refuse the session if another process holds it.
+PostgreSQL: on a dedicated connection the adapter keeps open (not a pool
+client, since session-level advisory locks belong to the connection),
+`SELECT pg_try_advisory_lock(hashtextextended($1, 0))` with
+`sessionID.toString()`, at the first `load()` of the session (the preload);
+`false` → reject, so `Initiator.create()` rejects. Release it with
+`pg_advisory_unlock` in `close()`. If that connection drops, the lock is gone:
+re-take it before the next `load()` succeeds (a reload), and reject when
+someone else got it. It only guards Node processes using the same adapter;
+a QuickFIX C++ engine on the same tables takes no lock (section 8 of
+`upstream-schemas.md`). (Derived; suggested by the `[trial]`.)
 
 **G4. Synchronous methods are allowed**, and are the simplest correct choice for
 embedded stores (`node:sqlite`, `better-sqlite3`, an in-memory test double): a
@@ -872,8 +918,22 @@ must live on, destroy the sockets of the clients that did not end (for `pg`,
 `error.name === 'QuickFixError'`, `error.fixErrorName === 'IOException'`,
 `error.message === 'message store <method>: <your message>'` (suffixed
 `(late)` for a late settlement). Observe-only; applications alert on
-`poisoned: true`. Sources: `[store.ts]` `ioError()`, `StoreBinding.bridge.storeError`;
-`src/engine.ts` `EngineEvents.storeError`.
+`poisoned: true`. It travels through the event loop on its own, so it can
+arrive AFTER the `sendToTarget()` Promise of the failed send settled; wait for
+it, do not assume it already fired. Sources: `[store.ts]` `ioError()`,
+`StoreBinding.bridge.storeError`; `src/engine.ts` `EngineEvents.storeError`;
+`[trial]`.
+
+What a `sendToTarget()` that resolved `false` means depends on the failed
+method: when it was `setMessage`, nothing was stored and nothing was sent
+(D2). When it was `setSeqNums` (rejected, or timed out) the message was
+already stored under its number, and if the write still committed (a late
+settlement, or a rejection whose statement landed anyway) the reload brings
+that number back and the message goes out later through the resend path
+with `PossDupFlag=Y` (`[trial]`: 2-4 such deliveries per run of a 15 s
+server freeze). So: `false` with a `setMessage` `'storeError'` = not sent;
+otherwise = unknown, reconcile on the counterparty's answers (ExecutionReports,
+by `ClOrdID`) instead of resubmitting blindly. (Derived from D2, D7, I4.)
 
 **I9. Handle the driver's error events, on the pool AND on every client you
 hold.** A connection the server ends while your code is not awaiting it
@@ -891,6 +951,17 @@ failure (and schedules a replenish); the call that was using the client
 learns of it through its own rejection. Other drivers have the same two
 levels (a pool-wide and a per-connection error event); check which one your
 driver uses for a connection you hold, and listen on both.
+
+**I10. The store holds credentials.** Every outbound message is stored, the
+Logon included (D8), so the messages table carries the session's `Password`
+(554), and `RawData` (96) when a venue puts its password there, in clear, in
+every Logon row. Upstream's stores and its file log do the same. Restrict
+access to the table like a credential store, and do not enable statement
+logging on the store's database (PostgreSQL `log_statement`,
+`log_min_duration_statement`; MySQL's general log), which writes every
+`setMessage` parameter to the server log. Never rewrite a stored Logon's bytes
+to mask the password: a changed byte fails BodyLength/CheckSum on a resend
+(A8). (Derived; `[trial]`.)
 
 ---
 

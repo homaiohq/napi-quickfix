@@ -88,7 +88,7 @@ Reference files next to this one:
    server, threadpool, shutdown).
 7. **Review** against the pitfalls list at the end of this file.
 
-## The interface (from `src/store.ts`)
+## The interface (`dist/esm/store.d.ts` in the package, `src/store.ts` in the repository)
 
 ```ts
 import type { SessionID } from '@homaiohq/napi-quickfix';
@@ -174,7 +174,11 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
 - **`load` / `create` (B).** `load` returns `null` for an unknown session and
   never creates; it is also the refresh and the recovery read, where `null`
   (row gone) makes the engine `create` a `1/1` row. `create` inserts.
-  A malformed state is a `TypeError` at startup, an `IOException` later.
+  A malformed state is a `TypeError` at startup, an `IOException` later; a
+  preload rejection reaches the `create()` caller as your own error object.
+  A renumbering after a vanished row loses every message stored while
+  logged out: alarm on it, and consider rejecting a later `load()` that finds
+  no row for a session the adapter has already seen (B3).
 - **`setSeqNums` (C).** Both numbers, every call, one write by primary key;
   fatal on failure (poison). Resolve after commit. **No monotonic guard**: the
   numbers go down too (`reset`, `session.setNext*()`); last write wins (C6).
@@ -209,7 +213,8 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   crash" (`fflush`, no `fsync`); surviving a host crash depends on the
   server's flush settings (`synchronous_commit`, `innodb_flush_log_at_trx_commit`,
   `appendfsync`), a deliberate trade. Sync methods are allowed. One engine per
-  session row. Inbound processing stays at-least-once whatever you do
+  session row (a per-session advisory lock taken at the preload catches a
+  second process at startup, G3). Inbound processing stays at-least-once whatever you do
   (`fromApp` runs before the number is written): dedupe in the app (G5).
 - **Threads (H).** Per-session calls are serialised by the engine, except a
   call that timed out (D7); your method runs on the event loop while an engine
@@ -238,6 +243,9 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   (a plain rejection) lifts it with the session still up; while it cannot, the
   engine disconnects the session at its next inbound message and QuickFIX
   reconciles with the peer at the next logon.
+- **Credentials (I10).** Stored Logons carry the password in clear: restrict
+  access to the messages table and keep statement logging off on its
+  database.
 - **`close` (J).** Optional, per session, after `stop()` (and when `create()`
   rejects after building the engine); not a durability hook; do not close a
   pool shared with other engines from it.
@@ -264,7 +272,7 @@ SQLite; no SQL Server):
 | `setSeqNums` | `UPDATE sessions SET outgoing_seqnum=$1, incoming_seqnum=$2 WHERE <key>` (`$1 = nextSender`, `$2 = nextTarget`) |
 | `setMessage` | `INSERT INTO messages (<key cols>, msgseqnum, message) VALUES (...) ON CONFLICT (<key cols>, msgseqnum) DO UPDATE SET message = EXCLUDED.message` |
 | `getMessages` | `SELECT message FROM messages WHERE <key> AND msgseqnum >= $5 AND msgseqnum <= $6 ORDER BY msgseqnum ASC` |
-| `reset` | in one transaction: `DELETE FROM messages WHERE <key>`; then `INSERT INTO sessions (...) VALUES (...) ON CONFLICT (<key cols>) DO UPDATE SET creation_time=EXCLUDED.creation_time, incoming_seqnum=EXCLUDED.incoming_seqnum, outgoing_seqnum=EXCLUDED.outgoing_seqnum` |
+| `reset` | ONE statement, a data-modifying CTE: `WITH gone AS (DELETE FROM messages WHERE <key>) INSERT INTO sessions (...) VALUES (...) ON CONFLICT (<key cols>) DO UPDATE SET creation_time=EXCLUDED.creation_time, incoming_seqnum=EXCLUDED.incoming_seqnum, outgoing_seqnum=EXCLUDED.outgoing_seqnum`. Atomic, one `statement_timeout` bounds it, no checkout. (`BEGIN`/`DELETE`/upsert/`COMMIT` is four statements on a held client: each is bounded, the whole is not before PostgreSQL 17's `transaction_timeout`, and it leaves an idle-in-transaction window) |
 
 Read `creation_time` through a fixed format and parse it strictly as UTC: `pg`
 otherwise builds a local-time `Date` from a `TIMESTAMP` column, and
@@ -375,6 +383,9 @@ engine.on('storeError', (sessionID, method, error, poisoned) => {
   // error.message === `message store ${method}: ...` ('(late)' suffix for a late settlement).
   // poisoned === true: writes fail until a reload through load() succeeds; the session disconnects
   // at its next inbound message unless that reload succeeds first.
+  // May arrive after the failed send's Promise settled. A send that resolved `false` was not
+  // sent only when the method was 'setMessage'; after a 'setSeqNums' failure the message may
+  // still go out later as a PossDupFlag=Y resend: reconcile, do not resubmit blindly (contract I8).
 });
 ```
 
@@ -517,3 +528,9 @@ Before declaring the adapter done, confirm each of these explicitly:
 24. The store has its own pool, with idle connections kept open, warmed before
     `create()`, replenished from the event loop; `pool.end()` cannot hold the
     process forever (test 3.10).
+25. On PostgreSQL, `reset` is one statement (a data-modifying CTE), not a
+    client-side transaction.
+26. The messages table is access-restricted (it holds Logon passwords), and
+    the store database does not log statements.
+27. A reload whose `load()` finds no row is alarmed on (or rejected, B3), and
+    a second process on the same sessions is refused at startup (G3).
