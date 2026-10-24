@@ -123,7 +123,11 @@ export interface NativeSessionIDConstructor {
 
 /** Native `FIX::SessionSettings` wrapper. */
 export interface NativeSessionSettings {
-  getSessions(): NativeSessionID[];
+  /**
+   * Every `[SESSION]`, or with `connectionType` (`'initiator'` | `'acceptor'`)
+   * only those an engine of that type would create (`[DEFAULT]` merged in).
+   */
+  getSessions(connectionType?: string): NativeSessionID[];
 }
 
 /**
@@ -212,11 +216,43 @@ export interface NativeApplicationHandlers {
   fromApp?(message: NativeMessage, sessionID: NativeSessionID): void;
 }
 
+/**
+ * The object a JS-backed message store hands the native `JsMessageStoreFactory`
+ * (`cpp/js_message_store.h`). Every method returns a Promise; the native side
+ * binds its continuations to it (or, on the JS thread, lets the TS binding
+ * collect it). `storeError` is the native side's failure report.
+ */
+export interface NativeStoreBridge {
+  load(sessionID: NativeSessionID): Promise<unknown>;
+  create(sessionID: NativeSessionID, state: NativeStoreStateValue): Promise<unknown>;
+  setSeqNums(sessionID: NativeSessionID, nextSender: number, nextTarget: number): Promise<unknown>;
+  setMessage(sessionID: NativeSessionID, seqNum: number, message: string): Promise<unknown>;
+  getMessages(sessionID: NativeSessionID, begin: number, end: number): Promise<unknown>;
+  reset(sessionID: NativeSessionID, state: NativeStoreStateValue): Promise<unknown>;
+  storeError(sessionID: NativeSessionID, method: string, message: string, poisoned: boolean, late: boolean): void;
+}
+
+/** The state object the native store passes to `create`/`reset`. */
+export interface NativeStoreStateValue {
+  creationTime: Date;
+  nextSenderMsgSeqNum: number;
+  nextTargetMsgSeqNum: number;
+}
+
+/** One preloaded session state (`storeStates` of {@link NativeEngineOptions}). */
+export interface NativeStoreState extends NativeStoreStateValue {
+  sessionID: NativeSessionID;
+}
+
 /** Options passed to the native `InitiatorWrap` / `AcceptorWrap` constructors. */
 export interface NativeEngineOptions {
   settings: NativeSessionSettings;
   handlers?: NativeApplicationHandlers;
-  store?: 'file' | 'memory';
+  /** A bridge object selects the JS-backed store; `storeStates` is then required. */
+  store?: 'file' | 'memory' | NativeStoreBridge;
+  storeStates?: NativeStoreState[];
+  /** Per-call deadline for the JS-backed store; `undefined` = 30000, `0` = none. */
+  storeTimeoutMs?: number;
   log?: 'screen' | 'file' | 'none';
 }
 
@@ -228,12 +264,16 @@ export interface NativeEngineOptions {
  * {@link QuickFixError} with `fixErrorName: 'SessionNotFound'` once the owning
  * engine has been stopped.
  *
- * Every member is synchronous: none takes the session mutex QuickFIX holds
- * across application callbacks, so they cannot deadlock the main thread
- * (`logon()`/`logout()` write a plain flag the network thread reads without a
- * lock, as QuickFIX's own `Initiator::stop()` does).
- * `FIX::Session::disconnect()`/`reset()` are not exposed; they are only safe
- * on the engine's own network thread (see `cpp/session_wrap.cpp`).
+ * The state queries, the sequence-number getters and the option getters /
+ * setters are synchronous: none takes a QuickFIX mutex another thread may hold
+ * while it waits on the JS event loop. `logon`/`logout`/`refresh` and the two
+ * sequence-number setters take `SessionState`'s mutex, which a network thread
+ * or a `sendToTarget` worker holds while it waits on a JS message store, so
+ * they run on a libuv worker under the engine's gate and return a Promise
+ * (rejected with `SessionNotFound` once the engine is gone). They are NOT
+ * serialised against each other here; the TS `Session` chains them per
+ * session. `FIX::Session::disconnect()`/`reset()` are not exposed; they are
+ * only safe on the engine's own network thread (see `cpp/session_wrap.cpp`).
  */
 export interface NativeSession {
   getSessionID(): NativeSessionID;
@@ -251,8 +291,9 @@ export interface NativeSession {
 
   getExpectedSenderNum(): number;
   getExpectedTargetNum(): number;
-  setNextSenderMsgSeqNum(seqNum: number): void;
-  setNextTargetMsgSeqNum(seqNum: number): void;
+  /** Throws `RangeError` synchronously for a bad argument; rejects `SessionNotFound` / `IOException`. */
+  setNextSenderMsgSeqNum(seqNum: number): Promise<void>;
+  setNextTargetMsgSeqNum(seqNum: number): Promise<void>;
 
   getResetOnLogon(): boolean;
   setResetOnLogon(value: boolean): void;
@@ -286,10 +327,10 @@ export interface NativeSession {
   /** Throws a `RangeError` unless `precision` is an integer in `0..9`. */
   setTimestampPrecision(precision: number): void;
 
-  logon(): void;
-  logout(reason?: string): void;
-  /** May throw a `QuickFixError` (`IOException`) from the message store. */
-  refresh(): void;
+  logon(): Promise<void>;
+  logout(reason?: string): Promise<void>;
+  /** Rejects with a `QuickFixError` (`IOException`) if the message store cannot be read. */
+  refresh(): Promise<void>;
 }
 
 /**
@@ -345,6 +386,12 @@ export interface NativeModule {
   version(): string;
   quickfixParseMsgType(raw: string): string;
   /**
+   * Releases every libuv thread this environment's engines may have parked on
+   * a JS round trip; from then on their handlers are refused. Process exit
+   * only (see below).
+   */
+  prepareExit(): void;
+  /**
    * Runs off the main thread; resolves `true` if accepted for sending.
    *
    * Second argument: an explicit SessionID, or a session qualifier (possibly
@@ -385,3 +432,11 @@ export interface NativeModule {
  * assert it to the contract here — the single localized cast in the codebase.
  */
 export const native = nativeModule as unknown as NativeModule;
+
+// process.exit() and a fatal exception join the libuv threadpool without
+// running the environment cleanup hooks that tear the engines down, so a pool
+// thread parked on a JS round trip (a sendToTarget() in toApp or in a store
+// call, a stop() waiting on a network thread that is) would keep the process
+// from ever exiting. 'exit' is emitted just before that join, on both paths.
+// `on`, not `once`: prepareExit() is idempotent.
+process.on('exit', () => native.prepareExit());

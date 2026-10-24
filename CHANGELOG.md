@@ -9,7 +9,71 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
-Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
+Bundles **QuickFIX v1.16.0** (statically linked, with two upstream fixes carried: see
+"Fixed").
+
+### Added
+
+- `MessageStoreAdapter`: a pluggable message store. Pass an adapter object (one per
+  engine, keyed by `SessionID`: `load`/`create`/`setSeqNums`/`setMessage`/`getMessages`/
+  `reset`/`close?`, each sync or async) to the new `Initiator.create()` /
+  `Acceptor.create()` factories to persist session state write-through in any database
+  Node can reach, through your own driver and pool. The factories preload the state
+  (`load()`, `create()` for a session never seen) before constructing the engine, and
+  also accept `'file'`/`'memory'`. `storeTimeoutMs` (default 30 s, `0` disables) bounds
+  how long an engine thread waits on one adapter call. Failures reach the engine as
+  `IOException` and are reported through the new `'storeError'` event: `setMessage`/
+  `getMessages` failures are never fatal; `setSeqNums`/`reset` rejections, timeouts and
+  late settlements (and `load` failures) poison the session's store until it has been
+  reloaded: a reload that succeeds at the next store call lifts it with the session
+  still up, otherwise the session is taken down at its next inbound message and
+  QuickFIX reconciles with the peer at the next logon; a failed `reset` is retried rather than undone by that reload, so
+  the session never goes on with the numbers it meant to discard. `reset()`/`refresh()`
+  and the seqnum reads never throw into QuickFIX (its `ResetOnDisconnect`/`RefreshOnLogon`
+  paths, a connect after the session period ended, and its `RejectLogon`/
+  `UnsupportedVersion` handlers have no guard; observed `std::terminate`); a poisoned
+  store fails the write instead, so nothing stamped while poisoned reaches the wire, and
+  a poisoned initiator's logon attempt ends at `LogonTimeout`. Nor does the inbound
+  increment QuickFIX makes from inside those handlers. A reload that finds the session's
+  row gone recreates it at 1/1 through `create()`, as upstream's `refresh()` does.
+  `storeTimeoutMs` also bounds the calls `create()`/`stop()` await (preload,
+  constructor-time `reset()`, `close()`).
+  `stop(true)` fails pending store calls first; a graceful `stop()` lets them complete
+  and calls `close()` per session before settling. Sequence numbers above 2^53-1
+  (`Number.MAX_SAFE_INTEGER`) are refused in both directions: a `load()` result above it
+  fails, and a write of one (a counterparty's `SequenceReset` can ask for it) is reported
+  as a non-poisoning `'storeError'` and disconnects the session instead of persisting a
+  rounded value. `MapMessageStore` (in-memory
+  reference implementation) is exported; README "Message store" has the threading and
+  latency contract (bound in-flight sends; an adapter must not depend on the libuv
+  threadpool; keep one session's writes in call order, since a timed-out `setMessage`
+  can still commit after the retry's write on a connection pool).
+- `.agents/skills/custom-message-store` (in the repository, not the npm package): an
+  agent skill for writing a custom `MessageStoreAdapter` (the contract as sourced rules,
+  the column mapping onto QuickFIX v1.16.0's `sessions`/`messages` tables for interop
+  with links to the upstream DDL, driver guidance from a PostgreSQL adapter trial
+  (issue #35), a test checklist).
+- `SessionSettings.getSessions(connectionType?)`: only the sessions an engine of that
+  type would create.
+- `scripts/tsan.sh` and a ThreadSanitizer CI job over the suite, failing on a race in
+  this addon's code or a QuickFIX race not known to be upstream's
+  (`scripts/tsan-gate.py`), and refusing a build the sanitizer did not instrument.
+
+### Changed
+
+- **Breaking:** `Session.logon()`, `Session.logout()`, `Session.refresh()`,
+  `Session.setNextSenderMsgSeqNum()` and `Session.setNextTargetMsgSeqNum()` now return
+  a `Promise<void>` and run on a libuv worker under the engine's gate, like
+  `sendToTarget()`. They take the session-state mutex that the engine holds while it
+  writes to the message store; with the message store adapter above, that write waits
+  on the event loop, so taking the mutex on the main thread deadlocked the whole
+  process (observed in the issue #29 spike, with a synchronous adapter too). Calls on
+  one session are serialised in program order whether awaited or not, so
+  `logout(); logon();` still ends enabled. Argument validation still throws
+  synchronously (`TypeError`/`RangeError`); `SessionNotFound` is now a rejection, which
+  a `'logout'` listener fired by `stop()` can see if the write lands after the engine
+  was destroyed. The getters, state queries and option getters/setters stay
+  synchronous.
 
 ### Fixed
 
@@ -40,11 +104,49 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   `NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS` for the interrupted-handler case, which is
   told apart from a handler that threw so the interruption is not reported to QuickFIX
   as a throw.
+- A process that called `process.exit()`, or died of an uncaught exception or an
+  unhandled rejection, never exited (only `SIGKILL` ended it) when a `sendToTarget()`
+  or a `stop()` was in flight at that instant. Both paths join the libuv threadpool
+  without running the environment cleanup hooks that tear the engines down, so a pool
+  thread parked on a JS round trip (a send in its `toApp` round trip or in a store
+  call, a `stop()` joining a network thread parked in `toAdmin`) was never woken. Any
+  in-flight send could trigger it, with any store; a stalled `MessageStoreAdapter` made
+  it near-certain. The module now releases those threads from `process.on('exit')`.
+  From then on the exiting engines run no handler and act on nothing a handler has not
+  seen: an outbound message is neither stored nor sent, an inbound one is not consumed
+  (see "Process exit" in the README).
+- An initiator whose session was disconnected by an inbound message (a peer's Logout,
+  a failed store write) generated a Logon with no connection to send it on, stored it
+  under a fresh `MsgSeqNum` that never reached the wire (the peer saw a gap and had to
+  gap-fill it), and emitted `'logout'` twice for the one disconnect. A QuickFIX v1.16.0
+  bug with any store: the engine ticks the session once more before it has processed
+  the dropped connection. With a `MessageStoreAdapter` whose store was poisoned, that
+  tick also retried `load()` several times on the engine's single network thread,
+  stalling every other session of the engine for as long. The build now carries the
+  one-line upstream fix (no Logon without a connection).
+- An initiator session could stay disconnected for good, while every `sendToTarget()`
+  on it kept resolving `true` (stored, never delivered), when it was disconnected
+  while handling inbound data (a peer's Logout, a `RejectLogon`, a failed store write)
+  in the same pass of the network loop as another session's due reconnect. A QuickFIX
+  v1.16.0 bug with any store: the dropped connection's socket was closed at once but
+  its disconnect only processed on the next pass, so the reconnect was given the same
+  socket number and the queued disconnect tore down the new connection instead, never
+  marking the dropped session as disconnected (so it was never redialled, and
+  `logon()` did not help). Any engine with two or more sessions was exposed; a
+  `MessageStoreAdapter` call that stalls the network thread past `ReconnectInterval`
+  and then fails (a timed-out `setSeqNums`) made it near-certain. An acceptor could
+  hand the socket number to a new inbound connection the same way. The build now
+  carries a fix to QuickFIX's `SocketMonitor`: a dropped socket is closed only once
+  its disconnect has been processed.
+- The npm package shipped every `CMakeLists.txt` of a local build tree
+  (`build/_deps/quickfix-*/**`, `build-tsan/_deps/...`) when packed from a working
+  tree: the `files` entry matched at any depth. It now names the root file only.
 
 ### Known QuickFIX limitations
 
 Two file-descriptor leaks found by the same audit are in QuickFIX itself and are not
-patched by this binding (it never patches QuickFIX; see `ARCHITECTURE.md`):
+patched by this binding (it carries two upstream fixes, see "Fixed" and
+`ARCHITECTURE.md`):
 
 - An `Acceptor` whose `start()` fails because its port is already bound leaks the
   listening socket it created (`socket_createAcceptor` returns without closing it on a

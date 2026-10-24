@@ -37,6 +37,9 @@ included.
 - **TLS for initiators** — `createTlsTunnel` is a built-in, stunnel-style TLS
   tunnel (mTLS, SNI, certificate verification via Node's `tls`), so you don't need
   a separate stunnel process.
+- **Pluggable message store** — persist session state (sequence numbers, sent
+  messages) write-through in any database Node can reach, through a small
+  `MessageStoreAdapter` over your own driver and pool.
 
 ## Install
 
@@ -355,6 +358,9 @@ Both extend Node's `EventEmitter` and share the same options and lifecycle:
 ```ts
 new Initiator({ settings, handlers?, store?: 'file' | 'memory', log?: 'screen' | 'file' | 'none' });
 new Acceptor({ settings, handlers?, store?, log? });
+// With a MessageStoreAdapter (see "Message store"), or for one uniform async entry point:
+await Initiator.create({ settings, handlers?, store?: 'file' | 'memory' | MessageStoreAdapter, storeTimeoutMs?, log? });
+await Acceptor.create({ ... });
 
 engine.start(): Promise<void>;
 engine.stop(force?: boolean): Promise<void>;   // graceful drain by default; force to abort
@@ -387,6 +393,16 @@ the engine owning it has been stopped. A constructor that fails on a later
 `[SESSION]` (any `ConfigError`) cleans up the sessions it had already created
 (so the ids are not locked out by the failed attempt) and the engine-level log
 QuickFIX had already opened for it.
+
+**Process exit.** `process.exit()`, an uncaught exception or an unhandled
+rejection end the process even while an engine is busy: a `sendToTarget()` in
+a handler round trip or a store call, a `stop()` in flight. From the `'exit'`
+event on, no handler runs and nothing the handlers have not seen is acted on:
+an outbound message (`toAdmin`/`toApp`) is neither stored nor sent, and an
+inbound one (`fromAdmin`/`fromApp`) is not consumed (the peer resends it after
+the next logon). A graceful `stop()` in flight therefore sends no Logout, and
+the exit waits for QuickFIX's `LogoutTimeout` (2 s by default) before the
+session drops. Pending promises never settle, and no adapter `close()` is called.
 
 ### TLS (stunnel-style) for initiators
 
@@ -512,9 +528,10 @@ session.sentLogon(): boolean;    session.sentLogout(): boolean;   session.receiv
 session.isInitiator(): boolean;  session.isAcceptor(): boolean;
 session.isSessionTime(now?: Date): boolean;   session.isLogonTime(now?: Date): boolean;
 
-// Sequence numbers (sync; setters write to the message store -- on a quiet session, see below)
-session.getExpectedSenderNum(): number;         session.getExpectedTargetNum(): number;
-session.setNextSenderMsgSeqNum(n: number): void; session.setNextTargetMsgSeqNum(n: number): void;
+// Sequence numbers (getters sync; the setters write to the message store on a
+// worker thread -- on a quiet session, see below)
+session.getExpectedSenderNum(): number;                  session.getExpectedTargetNum(): number;
+session.setNextSenderMsgSeqNum(n: number): Promise<void>; session.setNextTargetMsgSeqNum(n: number): Promise<void>;
 
 // Runtime options (sync; change the live session, not its SessionSettings)
 session.getResetOnLogon() / setResetOnLogon(v: boolean)        // likewise: ResetOnLogout,
@@ -525,31 +542,47 @@ session.getTimestampPrecision() / setTimestampPrecision(0..9)  //   CheckCompId,
                                                                //   ValidateLengthAndChecksum,
                                                                //   SendNextExpectedMsgSeqNum, IsNonStopSession
 
-// Control
-session.logon(): void;                   // enable; an initiator reconnects + logs on
-session.logout(reason?: string): void;   // disable + graceful Logout; stays down until logon()
-session.refresh(): void;                 // re-read state from the message store
+// Control (worker thread)
+session.logon(): Promise<void>;                   // enable; an initiator reconnects + logs on
+session.logout(reason?: string): Promise<void>;   // disable + graceful Logout; stays down until logon()
+session.refresh(): Promise<void>;                 // re-read state from the message store
 ```
 
-Everything is synchronous: none of these members takes the mutex QuickFIX holds
-while it runs your handlers, so they cannot deadlock the main thread — and
-because they run inline, `session.logout('x'); session.logon();` takes effect in
-that order. (`logon()`/`logout()` flip a plain flag the engine's network thread
-reads without a lock, exactly as QuickFIX's own `Initiator::stop()` does from
-the stopping thread; the engine picks the change up on its next pass.) The
-sequence-number setters are likewise not serialised against a message the
-engine is sending or receiving on that session at the same moment: QuickFIX
-reads the number, runs your handler, then increments from the store under a
-lock the setters do not take, so a value set in that window — from a handler,
-or while a `sendToTarget()` or a heartbeat is in flight — is overwritten and the
-session ends up one off from its counterparty. Renumber a **quiet** session:
-before `start()`, from a `'logout'` event, or when you know nothing is in
-flight. QuickFIX's `Session::disconnect()` and `reset()` are deliberately **not**
-exposed: they drop the transport through the engine's socket monitor, which is
-only safe from the engine's own network thread (QuickFIX itself never calls them
-from anywhere else). Bring a session down with `logout()` and renumber it with
-the sequence-number setters. Observe the outcome through the engine's
-`'logon'` / `'logout'` events:
+The state queries, the sequence-number getters and the option getters/setters
+are synchronous: none of them takes a QuickFIX mutex that another thread may
+hold while it waits on the event loop. `logon()`, `logout()`, `refresh()` and
+the two sequence-number setters return a Promise: they take the session-state
+mutex, the one the engine holds while it writes to the message store, and
+with a [message store adapter](#message-store) that write waits on the event
+loop, so taking the mutex on the main thread would deadlock the process. They
+run on a worker thread instead, like `sendToTarget()`, and calls on one
+session are serialised in program order whether you await them or not:
+`session.logout('x'); session.logon();` lands in that order. Their latency is
+that of the libuv worker pool: they queue behind in-flight `sendToTarget()`
+calls on any session, each of which may itself be waiting on a store write.
+Bound the number of sends in flight (await them, or cap them with a
+semaphore) and/or raise `UV_THREADPOOL_SIZE` if that latency matters. Once the
+owning engine is gone they reject with `SessionNotFound`; a `'logout'`
+listener fired by `engine.stop()` may see that, since the engine is destroyed
+when the stop settles. (`logon()`/`logout()` flip a plain flag the engine's
+network thread reads without a lock, exactly as QuickFIX's own
+`Initiator::stop()` does from the stopping thread; the engine picks the change
+up on its next pass.) The sequence-number setters are not serialised against a
+message the engine is sending or receiving on that session at the same
+moment: QuickFIX reads the number, runs your handler, then increments from the
+store under a lock the setters do not take, so a value set in that window —
+from a handler, or while a `sendToTarget()` or a heartbeat is in flight — is
+overwritten and the session ends up one off from its counterparty (with a
+`MessageStoreAdapter`, a sender number set after the header was stamped but
+before the message was written fails that send instead: it resolves `false`
+with a non-poisoning `'storeError'`). Renumber a
+**quiet** session: before `start()`, from a `'logout'` event, or when you know
+nothing is in flight. QuickFIX's `Session::disconnect()` and `reset()` are
+deliberately **not** exposed: they drop the transport through the engine's
+socket monitor, which is only safe from the engine's own network thread
+(QuickFIX itself never calls them from anywhere else). Bring a session down
+with `logout()` and renumber it with the sequence-number setters. Observe the
+outcome through the engine's `'logon'` / `'logout'` events:
 
 ```ts
 initiator.on('logon', (id) => {
@@ -557,12 +590,200 @@ initiator.on('logon', (id) => {
 });
 initiator.on('logout', (id) => {
   // The session is quiet now: renumber it, e.g. after the counterparty reset.
-  initiator.getSession(id)?.setNextTargetMsgSeqNum(1);
+  // If this 'logout' was fired by stop(), the engine may be gone by the time
+  // the write runs: it then rejects SessionNotFound instead of succeeding.
+  void initiator.getSession(id)?.setNextTargetMsgSeqNum(1).catch(() => {});
 });
 
-lookupSession(id)?.logout('maintenance');   // -> 'logout' event, isLoggedOn() === false
-lookupSession(id)?.logon();                 // -> reconnects, 'logon' event
+await lookupSession(id)?.logout('maintenance');   // -> 'logout' event, isLoggedOn() === false
+await lookupSession(id)?.logon();                 // -> reconnects, 'logon' event
 ```
+
+### Message store
+
+By default the engine persists each session's state — the next sequence
+numbers, the session's creation time and every outbound message (for resends)
+— with QuickFIX's file store (`store: 'file'`, under `FileStorePath`), or keeps
+it in memory (`'memory'`). A **`MessageStoreAdapter`** replaces that with your
+own database, through whatever driver and pool you already use; QuickFIX's own
+PostgreSQL/MySQL/ODBC stores are not built (they need client libraries in the
+prebuild). One adapter object serves every session of an engine; each method
+receives the `SessionID`. Every method may return a value or a Promise:
+
+```ts
+import { Initiator, type MessageStoreAdapter, type MessageStoreState } from '@homaiohq/napi-quickfix';
+
+interface MessageStoreState { creationTime: Date; nextSenderMsgSeqNum: number; nextTargetMsgSeqNum: number }
+
+interface MessageStoreAdapter {
+  load(sessionID): MessageStoreState | null | Promise<...>;     // null: never seen
+  create(sessionID, state): void | Promise<void>;                // first time a session is seen
+  setSeqNums(sessionID, nextSender, nextTarget): void | Promise<void>;
+  setMessage(sessionID, seqNum, message): void | Promise<void>;  // an UPSERT, never fails on a duplicate
+  getMessages(sessionID, begin, end): string[] | Promise<string[]>; // inclusive, ascending, missing omitted
+  reset(sessionID, state): void | Promise<void>;                 // delete the messages + write state, one tx if possible
+  close?(sessionID): void | Promise<void>;                       // after stop() destroyed the sessions
+}
+
+const initiator = await Initiator.create({
+  settings,
+  store: myAdapter,          // a MessageStoreAdapter: create() only, `new` throws TypeError
+  storeTimeoutMs: 30_000,    // default; 0 disables (see below)
+  log: 'none',
+});
+initiator.on('storeError', (sessionID, method, error, poisoned) => { /* alert */ });
+```
+
+`Initiator.create()` / `Acceptor.create()` call `load()` for every session the
+engine will own (and `create()` for one it has never seen) before constructing
+the engine, which needs that state synchronously; they also accept `'file'` and
+`'memory'`, so there is one async entry point for every store. A ready-made
+`MapMessageStore` (an in-memory `Map` per session) is exported as the reference
+implementation and a test double.
+
+Writing your own adapter? The repository (not the npm package) has an agent
+skill,
+[`.agents/skills/custom-message-store/`](https://github.com/homaiohq/napi-quickfix/tree/main/.agents/skills/custom-message-store),
+that an LLM can follow (copy the directory into your project's skills
+directory, e.g. `.claude/skills/`): the store contract as numbered rules with their sources,
+the verified column mapping onto QuickFIX's own `sessions`/`messages` tables
+(v1.16.0; the upstream DDL is linked, not copied) for interoperating with a C++
+deployment, and a test checklist.
+
+**Threads and latency.** The store is write-through: the engine persists a
+message and bumps the sequence number *before* the message hits the wire, and
+the thread doing that — the engine's network thread, or the worker running a
+`sendToTarget()` — waits for your Promise. The event loop stays free (that is
+what serves the Promise), but that thread holds the session's state mutex
+meanwhile, which is why `logon()`, `logout()`, `refresh()` and the sequence-number
+setters run on a worker (see "Session") and why a parked send pins one libuv
+pool thread. Two rules follow:
+
+- **An adapter must not depend on the libuv threadpool on its hot path**
+  (`fs.promises`, `dns.lookup`, `zlib`, async `crypto`, …), or the pool must be
+  sized for it (`UV_THREADPOOL_SIZE`, default 4): with every slot parked in a
+  store write, an adapter that needs a slot to finish the write deadlocks through
+  the pool. Socket-based database drivers (`pg`, `mysql2`, …) run their
+  queries without it, but (re)connecting uses it: `dns.lookup`, and `pg`'s
+  SCRAM-SHA-256 authentication (WebCrypto) takes several slots per
+  connection. Size `UV_THREADPOOL_SIZE` above your in-flight sends plus a
+  margin for reconnects.
+- **Bound your sends** (await them, or cap them with a semaphore): each
+  in-flight `sendToTarget()` may be parked in a store write, and the session
+  control calls queue behind them on the same pool.
+- Never await an engine operation on the *same* session from inside a store
+  method (`session.logout()`, `sendToTarget(msg, thatSession)`, `engine.stop()`):
+  it waits on the mutex the thread parked in your method holds. The timeout
+  surfaces it as an `IOException` and poisons the store.
+
+**Timeout.** `storeTimeoutMs` (default 30 s) bounds every adapter call: how
+long an engine thread waits on one, and how long `create()` and `stop()` wait
+on the ones they make themselves (`load()`/`create()` at preload, a
+constructor-time `reset()`, `close()`). On expiry the call fails with
+`IOException` and the engine proceeds as for a rejection, while the Promise is
+still observed (see "late" below). The trade-off: a longer timeout freezes heartbeats of *every*
+session of the engine (one network thread) for that long when the adapter
+stalls; a shorter one produces more late outcomes, each fatal for the session.
+`0` disables it, accepting that a stalled adapter stalls the engine, a
+graceful `stop()` and a natural process exit with it (`process.exit()` is not
+held up, see "Process exit").
+
+**Failure policy.** A rejection, a synchronous throw, a malformed return value
+or a timeout reach the engine as an `IOException`; every one is reported
+through the `'storeError'` event (`sessionID, method, error, poisoned`) and
+the session log.
+
+- `setMessage` and `getMessages` are **never fatal**: a failed `setMessage`
+  makes `sendToTarget()` resolve `false` (nothing was sent, the sequence number
+  is reused by the next send: hence the upsert), and a failed `getMessages`
+  makes the engine disconnect so the peer reconnects and re-requests — QuickFIX's
+  own behaviour. A `setMessage` that settles after its timeout is not reported,
+  but its write still lands, and nothing holds back the session's next call
+  meanwhile: on a connection pool the late write can commit *after* the retry's
+  write for the same sequence number, and a later resend of that number then
+  delivers the message whose send resolved `false`. Keep one session's writes
+  in call order (a per-session queue in front of the adapter, or one connection
+  per session), and settle a Promise only once the database is done with the
+  statement (a server-side `statement_timeout`, not a client-side query timeout
+  that rejects while the statement still commits).
+- `setSeqNums` and `reset` failing, timing out or settling **late** (after the
+  timeout already failed the call), and `load` (a `refresh`) failing or timing
+  out, **poison** the session's store. The engine cannot know whether a rejected
+  or late write was committed: a late increment leaves the cache one behind the
+  database, a late reset leaves it with the old numbers while the database says
+  `1/1` with the messages gone. A poisoned store fails every write at once, so
+  every send fails before it reaches the wire (no stale number is ever sent).
+  How long that lasts depends on the reload below: after a plain rejection
+  (nothing left unsettled) the next store call reloads, the network thread's
+  next tick at the latest, and if the reload succeeds the poison lifts with
+  the session still up (the send whose write was rejected resolved `false`;
+  the next send takes the number the reload found). While the poison cannot
+  lift (a timed-out write still unsettled, or the reload failing too), every
+  inbound message ends in a sequence-number write that fails, so the engine
+  disconnects the session at its next inbound message (a heartbeat at the
+  latest); a failed inbound sequence-number write disconnects it at once. A
+  poisoned initiator's Logon cannot be persisted either; QuickFIX has already
+  counted it as sent, so that connection attempt ends at `LogonTimeout`. `'storeError'` fires with `poisoned: true`, and the
+  `getExpected*()` getters throw `IOException` until it lifts. **Poison lifts in
+  two steps**, whatever `RefreshOnLogon` says: once every timed-out write has
+  settled (so a late write has landed), the next store call of any kind first
+  reloads the state through `load()` (one reload in flight at a time, so a dead
+  adapter costs one timeout per attempt, not per call), then proceeds. A
+  failed `reset` is the exception: reloading would bring back the numbers
+  QuickFIX meant to discard, so the reset itself is retried (`reset()` with
+  the original creation time) until it succeeds, and only then does the
+  poison lift. A message stamped while the store was poisoned is refused
+  (non-poisoning `'storeError'`, not sent) if the reload moved the sender
+  number before it could be written. QuickFIX's
+  own sequence logic then reconciles with the peer at the next logon (a resend
+  request, or redelivery with `PossDupFlag=Y`). An inbound message whose
+  sequence-number write failed after `fromApp` ran is therefore delivered
+  **again** with `PossDupFlag=Y` on reconnect: standard FIX dedupe, not a
+  sequence-number inconsistency. A timed-out `setSeqNums`/`reset` whose
+  Promise **never** settles keeps the session poisoned until the engine is
+  stopped (no reload, `refresh()` included, can lift it while that write may
+  still land): give your driver timeouts shorter than `storeTimeoutMs`, so it
+  rejects instead.
+- `reset()` and `refresh()` never raise into QuickFIX, which runs them on
+  paths without a handler (`ResetOnDisconnect=Y` inside its own error handler,
+  `RefreshOnLogon=Y` on the connect path); they poison and report instead.
+  Neither do the sequence-number reads: QuickFIX stamps outbound messages
+  outside its own guards on the connect path (a connect after the session
+  period ended resets the session and sends a Logout first) and inside its
+  error handlers (a `fromAdmin` rejecting a Logon with `'RejectLogon'`, a
+  message with the wrong BeginString). They fall back to the cached number
+  while poisoned, and nothing stamped with it reaches the wire, since the
+  write that follows fails. Neither does the inbound increment inside those
+  handlers: the failure is recorded, and the Logout those handlers send
+  (unpersisted) lets QuickFIX's logout timeout drop the session.
+- A reload (`refresh()`, `RefreshOnLogon=Y`, or lifting the poison) whose
+  `load()` returns `null` means the session's row is gone. As QuickFIX's own
+  SQL stores do in `refresh()`, the numbering restarts: the engine calls
+  `create()` with `1/1` and a new creation time, and the cache follows once it
+  resolved (a failing `create()` poisons the store).
+- Sequence numbers cross as JS `number`s, exact only up to **2^53-1**
+  (`Number.MAX_SAFE_INTEGER`). A `load()` result above that is refused
+  (`create()` rejects with `TypeError`, a reload fails with `IOException`),
+  and the engine never hands the adapter a larger value either: a sequence
+  number above the limit — a counterparty's `SequenceReset` with such a
+  `NewSeqNo`, or an increment past it — is refused before the write, reported
+  as a `'storeError'` with `poisoned: false` (nothing reached the adapter, cache
+  and row are still equal), and the session disconnects, instead of a rounded
+  number being persisted.
+
+**`stop()`.** `stop(true)` fails every pending store call first, so a stalled
+adapter cannot hold it up. A graceful `stop()` lets in-flight writes complete
+(each bounded by the timeout, at most one per session) before the engine logs
+its sessions out; if the Logout itself cannot be persisted, QuickFIX's own 10 s
+logout grace applies on top. Once the sessions are destroyed the adapter's
+`close()` is called for each session (each bounded by the timeout; a failure
+is a `'storeError'`, never a rejection), and `stop()` settles after it, so
+`await engine.stop(); await Initiator.create({ store: sameAdapter })` never
+races `close()` against `load()`. `close()` is also called when `create()`
+rejects after constructing the engine (a constructor-time `reset()` failed:
+the engine is stopped before the rejection). An engine dropped without
+`stop()` is torn down at process exit without calling `close()` (see
+"Process exit").
 
 ### Handlers vs. events
 
@@ -580,7 +801,8 @@ This is the key distinction to understand:
 - **Events** (`engine.on('logon', ...)`, etc.) are **observe-only**. The engine
   emits `'create' | 'logon' | 'logout' | 'toAdmin' | 'fromAdmin' | 'toApp' | 'fromApp'`
   *after* the corresponding handler runs. Event listeners **cannot** mutate a
-  message or reject it — use `handlers` for that.
+  message or reject it — use `handlers` for that. An engine built with a
+  message store adapter also emits `'storeError'` (see "Message store").
 
 ### Rejections
 

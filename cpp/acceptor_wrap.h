@@ -11,9 +11,11 @@
 #include "quickfix/SessionID.h"
 #include "quickfix/SocketAcceptor.h"
 
+#include "addon_data.h"
 #include "application_bridge.h"
 #include "engine_common.h"
 #include "engine_workers.h"
+#include "js_message_store.h"
 #include "session_op_gate.h"
 
 namespace napi_quickfix {
@@ -46,11 +48,15 @@ class SocketAcceptor final : public FIX::SocketAcceptor {
 // Napi::ObjectWrap over FIX::SocketAcceptor. Mirrors InitiatorWrap.
 //
 //   new Acceptor({ settings, handlers?, store?, log? })
-class AcceptorWrap : public Napi::ObjectWrap<AcceptorWrap> {
+class AcceptorWrap : public Napi::ObjectWrap<AcceptorWrap>,
+                     public ExitParticipant {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
   explicit AcceptorWrap(const Napi::CallbackInfo& info);
   ~AcceptorWrap() override;
+
+  // process.on('exit'): see ExitParticipant (addon_data.h).
+  void PrepareExit() override;
 
  private:
 
@@ -71,6 +77,11 @@ class AcceptorWrap : public Napi::ObjectWrap<AcceptorWrap> {
   // Destruct order: acceptor first (declared last), then log, store, bridge.
   std::unique_ptr<ApplicationBridge> bridge_;
   std::unique_ptr<FIX::MessageStoreFactory> storeFactory_;
+  // storeFactory_ as a JsMessageStoreFactory when the engine was built with a
+  // MessageStoreAdapter (store: <bridge object>), else null. Its bridge is
+  // torn down next to the Application bridge on every path (Teardown, the
+  // stop worker's settlement, DestroyStoppedEngine, ref/unref).
+  JsMessageStoreFactory* jsStore_ = nullptr;
   // Wraps the real factory so a failed engine constructor can reclaim the
   // engine-level Log QuickFIX would otherwise leak (see engine_common.h).
   std::unique_ptr<TrackingLogFactory> logFactory_;

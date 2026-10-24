@@ -90,10 +90,15 @@ class SessionOpGate {
     explicit OpScope(std::shared_ptr<SessionOpGate> gate)
         : gate_(std::move(gate)) {
       std::unique_lock<std::mutex> lock(gate_->mtx_);
-      gate_->cv_.wait(lock, [this] { return gate_->frozen_ == 0; });
+      gate_->cv_.wait(lock, [this] {
+        return gate_->frozen_ == 0 || gate_->refuseWhileFrozen_;
+      });
+      if (gate_->frozen_ != 0) return;  // refused, see RefuseWhileFrozen()
       ++gate_->inflight_;
+      held_ = true;
     }
     ~OpScope() {
+      if (!held_) return;
       {
         std::lock_guard<std::mutex> lock(gate_->mtx_);
         --gate_->inflight_;
@@ -103,8 +108,12 @@ class SessionOpGate {
     OpScope(const OpScope&) = delete;
     OpScope& operator=(const OpScope&) = delete;
 
+    // False if the gate refused the operation instead of letting it run.
+    bool Held() const { return held_; }
+
    private:
     std::shared_ptr<SessionOpGate> gate_;
+    bool held_ = false;
   };
 
   SessionOpGate() = default;
@@ -127,6 +136,21 @@ class SessionOpGate {
     {
       std::lock_guard<std::mutex> lock(mtx_);
       --frozen_;
+    }
+    cv_.notify_all();
+  }
+
+  // Process exit (PrepareExit, addon_data.h): from now on an operation that
+  // meets a frozen gate -- parked already, or arriving later -- is refused
+  // (SessionNotFound) instead of waiting. It would otherwise wait for the
+  // Unfreeze() that the JS thread runs once a stop() settles, which never
+  // happens once the process is exiting, and pin its pool thread, which the
+  // exit joins. Never lets an operation run under a freeze: in a Worker the
+  // destructor's Freeze() still precedes the engine's destruction.
+  void RefuseWhileFrozen() {
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      refuseWhileFrozen_ = true;
     }
     cv_.notify_all();
   }
@@ -168,7 +192,8 @@ class SessionOpGate {
   // Hold an OpScope on `gate` -- the registered owner of `id` when the
   // caller looked it up on the JS thread -- or return nullptr if it no longer
   // is (-> SessionNotFound). Constructing the scope may block (the owner is
-  // stopping); once it is held the registry is re-read, and the scope is kept
+  // stopping) or, once the process is exiting, be refused (nullptr too); once
+  // it is held the registry is re-read, and the scope is kept
   // only if the same gate is still registered. Otherwise the owner was
   // destroyed while we waited -- possibly replaced by a new engine with the
   // same id -- and the operation is refused (nullptr) rather than run against
@@ -176,7 +201,7 @@ class SessionOpGate {
   static std::unique_ptr<OpScope> Acquire(
       const std::shared_ptr<SessionOpGate>& gate, const FIX::SessionID& id) {
     auto scope = std::make_unique<OpScope>(gate);
-    if (Lookup(id) != gate) return nullptr;
+    if (!scope->Held() || Lookup(id) != gate) return nullptr;
     return scope;
   }
 
@@ -194,6 +219,7 @@ class SessionOpGate {
   std::condition_variable cv_;
   int inflight_ = 0;
   int frozen_ = 0;
+  bool refuseWhileFrozen_ = false;
 };
 
 }  // namespace napi_quickfix

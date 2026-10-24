@@ -76,7 +76,14 @@ InitiatorWrap::InitiatorWrap(const Napi::CallbackInfo& info)
   bridge_ = std::make_unique<ApplicationBridge>(env, handlers);
 
   NQ_TRY(env) {
-    if (store == "memory") {
+    if (opts.Has("store") && opts.Get("store").IsObject()) {
+      auto js = std::make_unique<JsMessageStoreFactory>(
+          env, opts.Get("store").As<Napi::Object>(),
+          JsMessageStoreFactory::ReadSeeds(env, opts.Get("storeStates")),
+          JsMessageStoreFactory::ReadTimeout(env, opts.Get("storeTimeoutMs")));
+      jsStore_ = js.get();
+      storeFactory_ = std::move(js);
+    } else if (store == "memory") {
       storeFactory_ = std::make_unique<FIX::MemoryStoreFactory>();
     } else {
       storeFactory_ = std::make_unique<FIX::FileStoreFactory>(settings);
@@ -117,6 +124,9 @@ InitiatorWrap::InitiatorWrap(const Napi::CallbackInfo& info)
   // thread call into an already-destroyed TSFN and abort the process.
   env_ = env;
   cleanupHook_ = env.AddCleanupHook(&InitiatorWrap::CleanupEntry, this);
+  // Last, once nothing above can throw: a wrap only ever registered is one
+  // whose destructor runs (and unregisters it).
+  AddonData::Get(env).engines.insert(this);
 }
 
 void InitiatorWrap::CleanupEntry(InitiatorWrap* self) {
@@ -134,8 +144,30 @@ InitiatorWrap::~InitiatorWrap() {
   if (!cleanupHookFired_ && !cleanupHook_.IsEmpty() && env_ != nullptr) {
     cleanupHook_.Remove(env_);
   }
+  // The instance data outlives every wrap finalizer (addon_data.h).
+  if (env_ != nullptr) AddonData::Get(env_).engines.erase(this);
   Teardown(true);
   DestroyEngine();
+}
+
+void InitiatorWrap::PrepareExit() {
+  // process.exit() and a fatal exception emit 'exit', then join the libuv
+  // threadpool WITHOUT running the environment cleanup hooks: CleanupEntry
+  // never runs, and a pool thread parked on a JS round trip -- a
+  // sendToTarget() in toApp or in a store call, a stop() worker joining a
+  // network thread that is -- would keep the process from exiting. Release
+  // every such wait, the non-blocking half of Teardown(): the store bridge
+  // first (a parked store call holds the session mutex the other waiters
+  // need), then the Application bridge, which from now on refuses every
+  // callback instead of passing it through (see DeactivateForExit), then the
+  // gate, which refuses an operation queued behind a stop()'s freeze instead
+  // of parking it until a destruction that will never run. No join and no
+  // TSFN operation: the engine stays as it is until the process is gone. In
+  // a Worker the cleanup hooks do run afterwards, and Teardown() then finds
+  // both bridges already deactivated.
+  if (jsStore_) jsStore_->Deactivate();
+  if (bridge_) bridge_->DeactivateForExit();
+  gate_->RefuseWhileFrozen();
 }
 
 void InitiatorWrap::Teardown(bool force) {
@@ -143,17 +175,21 @@ void InitiatorWrap::Teardown(bool force) {
   // JS round-trip and MUST NOT deadlock. Ordering matters:
   //   1. Deactivate the bridge (set a flag, no TSFN op): any callback firing on
   //      a QuickFIX network thread during the upcoming stop() will pass through
-  //      immediately without touching the TSFN or waiting on the (frozen) JS
-  //      loop, and every BlockingCall already waiting is woken. This breaks
+  //      immediately (or be refused, if PrepareExit() ran first: an 'exit'
+  //      event precedes every teardown that follows a process exit) without
+  //      touching the TSFN or waiting on the (frozen) JS loop, and every
+  //      BlockingCall already waiting is woken. This breaks
   //      the stop()->onLogout->BlockingCall deadlock.
   //   2. Join the stop() worker if one is in flight: its operation may still
   //      be inside FIX::Initiator::stop() -- or waiting in gate->Freeze() for
   //      a sendToTarget() that step 1 has just unblocked -- on a libuv thread,
   //      and the destructor's DestroyEngine() that follows Teardown() must not
-  //      delete the engine under it. (Node drains the thread pool before it
-  //      runs cleanup hooks or finalizers, so this wait is expected to return
-  //      at once; it makes the ordering a property of this code rather than
-  //      of Node's shutdown sequence.) This is also why the early return is
+  //      delete the engine under it. (An environment torn down once its
+  //      loop has drained has no pool work left, so this wait is expected to
+  //      return at once; it makes the ordering a property of this code rather
+  //      than of Node's shutdown sequence. process.exit() and a fatal
+  //      exception never get here: they join the pool without running the
+  //      cleanup hooks, see PrepareExit().) This is also why the early return is
   //      keyed on tornDown_, not stopped_: stopped_ is set for the whole
   //      duration of an in-flight stop().
   //   3. stop(force): joins all QuickFIX network threads. A no-op if the
@@ -164,6 +200,11 @@ void InitiatorWrap::Teardown(bool force) {
   if (tornDown_) return;
   tornDown_ = true;
   stopped_ = true;
+  // The store bridge first: a network thread parked in a store call holds
+  // SessionState::m_mutex, which the stop() below takes (logout()).
+  if (jsStore_) {
+    jsStore_->Deactivate();
+  }
   if (bridge_) {
     bridge_->Deactivate();
   }
@@ -179,6 +220,9 @@ void InitiatorWrap::Teardown(bool force) {
   }
   if (bridge_) {
     bridge_->Abort();
+  }
+  if (jsStore_) {
+    jsStore_->Abort();
   }
 }
 
@@ -198,6 +242,13 @@ void InitiatorWrap::DestroyEngine() {
   SessionOpGate::Unregister(sessionIDs_, gate_.get());
   initiator_.reset();
   gate_->Unfreeze();
+  // No session is left to call the store: release its bridge and drop the
+  // adapter it roots (the TS layer calls the adapter's close() once the
+  // stop() promise has settled).
+  if (jsStore_) {
+    jsStore_->Release();
+    jsStore_->DropBridge();
+  }
 }
 
 // The stop() path: the gate was frozen by the stop worker; destroy and lift
@@ -206,6 +257,13 @@ void InitiatorWrap::DestroyStoppedEngine() {
   SessionOpGate::Unregister(sessionIDs_, gate_.get());
   initiator_.reset();
   gate_->Unfreeze();
+  // No session is left to call the store: release its bridge and drop the
+  // adapter it roots (the TS layer calls the adapter's close() once the
+  // stop() promise has settled).
+  if (jsStore_) {
+    jsStore_->Release();
+    jsStore_->DropBridge();
+  }
   // The engine is gone, so nothing will call the handlers again: drop the
   // bridge's reference to them. It is what kept this wrap reachable from the
   // user's Engine object (the handlers close over it) and so made the wrap
@@ -275,10 +333,23 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
       bridge_->Release();
       bridge_->DropHandlers();
     }
+    if (jsStore_) {
+      jsStore_->Release();
+      jsStore_->DropBridge();
+    }
     return ResolvedPromise(env);
   }
   busy_ = true;
   stopped_ = true;
+  // A forced stop must not wait on a store call that may never settle:
+  // FIX::Initiator/Acceptor::stop() takes SessionState::m_mutex (logout())
+  // on the worker, and a network thread may hold it inside a store call.
+  // Failing every pending and future store call with IOException first lets
+  // that thread out of the store. A graceful stop keeps the store serving:
+  // its writes are legitimate, and each is bounded by storeTimeoutMs.
+  if (force && jsStore_) {
+    jsStore_->Deactivate();
+  }
   // Lets Teardown() wait for the worker's operation instead of destroying the
   // engine under it; cleared in onSettled once the operation has returned.
   auto stopDone = std::make_shared<StopCompletion>();
@@ -290,6 +361,7 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
   // must wait for it just the same.
   FIX::SocketInitiator* initiator = initiator_.get();
   ApplicationBridge* bridge = bridge_.get();
+  JsMessageStoreFactory* jsStore = jsStore_;
   const bool started = started_;
   std::shared_ptr<SessionOpGate> gate = gate_;
   auto* self = this;
@@ -319,7 +391,7 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
         // sendToTarget() -> toApp). Other engines' operations are unaffected.
         gate->Freeze();
       },
-      [self, bridge, env, force, gate](
+      [self, bridge, jsStore, env, force, gate](
           bool ok, const std::shared_ptr<EngineOpWorker::Settlement>& s) {
         self->busy_ = false;
         self->stopSync_.reset();  // the worker's operation has returned
@@ -356,6 +428,15 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
               // them. The retried stop() drops them in
               // DestroyStoppedEngine().
               bridge->Release();
+            }
+          }
+          // Same for the store bridge: released, so the engine's remaining
+          // store calls fail (IOException) rather than keep the loop alive.
+          if (jsStore) {
+            if (force) {
+              jsStore->Abort();
+            } else {
+              jsStore->Release();
             }
           }
           settle();
@@ -486,12 +567,14 @@ Napi::Value InitiatorWrap::GetSession(const Napi::CallbackInfo& info) {
 Napi::Value InitiatorWrap::Ref(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (bridge_) bridge_->Ref(env);
+  if (jsStore_) jsStore_->Ref(env);
   return info.This();
 }
 
 Napi::Value InitiatorWrap::Unref(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (bridge_) bridge_->Unref(env);
+  if (jsStore_) jsStore_->Unref(env);
   return info.This();
 }
 

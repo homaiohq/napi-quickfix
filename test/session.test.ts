@@ -219,8 +219,8 @@ describe('Session control over a loopback (in-process)', () => {
           waitForEvent(ini, 'logout', 'initiator logout', HANDSHAKE_TIMEOUT_MS),
           waitForEvent(acc, 'logout', 'acceptor logout', HANDSHAKE_TIMEOUT_MS),
         ]);
-        iniSession.logout('test logout');
-        assert.equal(iniSession.isEnabled(), false, 'logout() disables the session immediately');
+        await iniSession.logout('test logout');
+        assert.equal(iniSession.isEnabled(), false, 'logout() has disabled the session once it resolves');
         await logouts;
         assert.ok(await waitUntil(() => !iniSession!.isLoggedOn(), DELIVERY_TIMEOUT_MS));
         assert.equal(iniSession.isLoggedOn(), false);
@@ -234,7 +234,7 @@ describe('Session control over a loopback (in-process)', () => {
           waitForEvent(ini, 'logon', 'initiator re-logon', HANDSHAKE_TIMEOUT_MS),
           waitForEvent(acc, 'logon', 'acceptor re-logon', HANDSHAKE_TIMEOUT_MS),
         ]);
-        iniSession.logon();
+        await iniSession.logon();
         assert.equal(iniSession.isEnabled(), true);
         await relogons;
         assert.equal(iniSession.isLoggedOn(), true);
@@ -244,8 +244,8 @@ describe('Session control over a loopback (in-process)', () => {
         // ResetOnLogon=Y, so both sides restarted at 1; jump CLIENT->SERVER to 50 on
         // both ends so the next order carries 34=50 and the acceptor accepts it
         // without a resend dance.
-        iniSession.setNextSenderMsgSeqNum(50);
-        accSession.setNextTargetMsgSeqNum(50);
+        await iniSession.setNextSenderMsgSeqNum(50);
+        await accSession.setNextTargetMsgSeqNum(50);
         assert.equal(iniSession.getExpectedSenderNum(), 50);
         assert.equal(accSession.getExpectedTargetNum(), 50);
         const sentBefore = sentSeqNums.length;
@@ -261,6 +261,7 @@ describe('Session control over a loopback (in-process)', () => {
         assert.equal(sentSeqNums[sentBefore + 1], '51', 'toApp saw MsgSeqNum 51 on the following order');
         assert.equal(received[receivedBefore + 1].seqNum, '51', 'acceptor received MsgSeqNum 51');
 
+        // Argument validation is synchronous (a RangeError thrown, not a rejection).
         assert.throws(() => iniSession!.setNextSenderMsgSeqNum(-1), RangeError);
         assert.throws(() => iniSession!.setNextTargetMsgSeqNum(1.5), RangeError);
         // MsgSeqNum is 1-based: 0 would go out on the wire as 34=0 and be
@@ -268,8 +269,8 @@ describe('Session control over a loopback (in-process)', () => {
         assert.throws(() => iniSession!.setNextSenderMsgSeqNum(0), RangeError);
         assert.throws(() => iniSession!.setNextTargetMsgSeqNum(0), RangeError);
 
-        // --- refresh() is sync and does not throw ------------------------------------------
-        assert.doesNotThrow(() => iniSession!.refresh());
+        // --- refresh() resolves -------------------------------------------------------------
+        await assert.doesNotReject(() => iniSession!.refresh());
 
         // --- runtime option getters/setters round-trip ----------------------------------
         assert.equal(iniSession.getResetOnLogon(), true, 'ResetOnLogon=Y from the config');
@@ -339,11 +340,11 @@ describe('Session control over a loopback (in-process)', () => {
       assert.equal(iniSession.sessionID.toString(), INI_ID.toString());
       assert.throws(() => iniSession!.isLoggedOn(), isSessionNotFound);
       assert.throws(() => accSession!.getExpectedSenderNum(), isSessionNotFound);
-      assert.throws(() => iniSession!.setNextSenderMsgSeqNum(1), isSessionNotFound);
+      await assert.rejects(() => iniSession!.setNextSenderMsgSeqNum(1), isSessionNotFound);
       assert.throws(() => iniSession!.getResetOnLogon(), isSessionNotFound);
-      assert.throws(() => iniSession!.logout(), isSessionNotFound);
-      assert.throws(() => iniSession!.logon(), isSessionNotFound);
-      assert.throws(() => accSession!.refresh(), isSessionNotFound);
+      await assert.rejects(() => iniSession!.logout(), isSessionNotFound);
+      await assert.rejects(() => iniSession!.logon(), isSessionNotFound);
+      await assert.rejects(() => accSession!.refresh(), isSessionNotFound);
     },
   );
 
@@ -404,9 +405,9 @@ describe('Session control over a loopback (in-process)', () => {
       // the sends (they hold raw FIX::Session pointers on a worker thread);
       // each then either completes or, if it had not yet resolved its session
       // when the engine went away, rejects SessionNotFound.
-      accSession.logout('stopping');
-      iniSession.refresh();
       const pending = [
+        settles(accSession.logout('stopping')),
+        settles(iniSession.refresh()),
         settles(sendToTarget(newOrder(), INI_ID)),
         settles(sendToTarget(newOrder(), ACC_ID)),
         settles(sendToTarget(newOrder(), INI_ID)),
@@ -414,7 +415,7 @@ describe('Session control over a loopback (in-process)', () => {
       await ini.stop();
       await acc.stop();
       const outcomes = await Promise.all(pending);
-      assert.equal(outcomes.length, 3);
+      assert.equal(outcomes.length, 5);
       assert.equal(lookupSession(INI_ID), undefined);
       assert.equal(lookupSession(ACC_ID), undefined);
     } finally {
@@ -666,8 +667,8 @@ StartDay=Monday
     // registry QuickFIX keeps is keyed by SessionID alone, so without that
     // binding `first`'s handles would now silently operate on `second`'s session.
     assert.throws(() => stale.isEnabled(), isSessionNotFound);
-    assert.throws(() => stale.logout('from a stale handle'), isSessionNotFound);
-    assert.throws(() => staleLookup.setNextSenderMsgSeqNum(7), isSessionNotFound);
+    await assert.rejects(() => stale.logout('from a stale handle'), isSessionNotFound);
+    await assert.rejects(() => staleLookup.setNextSenderMsgSeqNum(7), isSessionNotFound);
     assert.equal(fresh.isEnabled(), true, "the stale logout() did not reach second's session");
     assert.equal(fresh.getExpectedSenderNum(), 1, "nor did the stale setter");
     assert.equal(lookupSession(ACC_ID)!.isEnabled(), true, 'a fresh lookup resolves the new owner');
@@ -709,7 +710,7 @@ StartDay=Monday
     await second.stop();
   });
 
-  test('logon() / logout() / refresh() are synchronous and take effect in program order', async () => {
+  test('logon() / logout() / refresh() run on a worker and take effect in program order', async () => {
     // A never-started engine has live sessions and no network thread, so the
     // enabled flag is only ever touched by these calls.
     const port = await freePort();
@@ -718,17 +719,85 @@ StartDay=Monday
       const session = engine.getSession(ACC_ID);
       assert.ok(session);
       assert.equal(session.isEnabled(), true);
-      // As AsyncWorkers these could land on two pool threads in either order.
-      session.logout('flip');
-      session.logon();
-      assert.equal(session.isEnabled(), true, 'logout(); logon(); ends enabled');
-      session.logon();
-      session.logout('flop');
+      // Awaited: each resolves once its flag write has landed.
+      await session.logout('flip');
+      assert.equal(session.isEnabled(), false);
+      await session.logon();
+      assert.equal(session.isEnabled(), true, 'await logout(); await logon(); ends enabled');
+      // Unawaited: the two workers could land on two pool threads in either
+      // order; the per-session chain keeps them in program order.
+      const a = session.logon();
+      const b = session.logout('flop');
+      await Promise.all([a, b]);
       assert.equal(session.isEnabled(), false, 'logon(); logout(); ends disabled');
-      assert.equal(session.refresh(), undefined);
-      assert.equal(session.logon(), undefined);
+      // The chain is keyed by id, not by handle: a second handle on the same
+      // session is ordered with the first.
+      const other = lookupSession(ACC_ID)!;
+      const ops = [session.logout('x'), other.logon(), session.logout('y'), other.logout('z'), session.logon()];
+      await Promise.all(ops);
+      assert.equal(session.isEnabled(), true, 'five interleaved calls across two handles land in program order');
+      assert.equal(await session.refresh(), undefined);
+      assert.equal(await session.logon(), undefined);
     } finally {
       await engine.stop();
+    }
+  });
+
+  test("setNext* from the 'logout' listener a graceful stop() fires settles: before the gate freezes it succeeds, after it rejects SessionNotFound", { timeout: 30_000 }, async () => {
+    const port = await freePort();
+    const acc = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
+    const ini = new Initiator({ settings: SessionSettings.fromString(initiatorCfg(port)), store: 'memory', log: 'none' });
+    const outcomes: string[] = [];
+    const settles = (p: Promise<unknown>) =>
+      p.then(
+        () => outcomes.push('resolved'),
+        (e) => (isSessionNotFound(e), outcomes.push('rejected')),
+      );
+    try {
+      const logons = Promise.all([
+        waitForEvent(acc, 'logon', 'acceptor logon', HANDSHAKE_TIMEOUT_MS),
+        waitForEvent(ini, 'logon', 'initiator logon', HANDSHAKE_TIMEOUT_MS),
+      ]);
+      await acc.start();
+      await ini.start();
+      await logons;
+      const iniSession = ini.getSession(INI_ID)!;
+
+      // Before any stop: a 'logout' fired by session.logout() leaves the
+      // engine alive, so a setter from the listener resolves and sticks.
+      const fromListener = new Promise<void>((resolve) => {
+        ini.once('logout', (id) => {
+          void settles(ini.getSession(id)!.setNextTargetMsgSeqNum(77)).then(() => resolve());
+        });
+      });
+      await iniSession.logout('renumber');
+      await fromListener;
+      assert.deepEqual(outcomes, ['resolved']);
+      assert.equal(iniSession.getExpectedTargetNum(), 77);
+      await iniSession.logon();
+      await waitForEvent(ini, 'logon', 'initiator re-logon', HANDSHAKE_TIMEOUT_MS);
+
+      // From the 'logout' the graceful stop() fires: the engine is still
+      // alive when the event is delivered, but its gate may already be
+      // frozen (stop() freezes it on the worker right after FIX::stop()
+      // returns). The setter either runs before the freeze and resolves, or
+      // parks on the gate until the engine is destroyed and rejects
+      // SessionNotFound; it never hangs and never runs after destruction.
+      const fromStopListener = new Promise<void>((resolve) => {
+        ini.once('logout', (id) => {
+          void settles(ini.getSession(id)!.setNextTargetMsgSeqNum(78)).then(() => resolve());
+        });
+      });
+      await ini.stop();
+      await fromStopListener;
+      assert.equal(outcomes.length, 2);
+      assert.ok(['resolved', 'rejected'].includes(outcomes[1]));
+
+      // After stop() settled: the engine is gone, so the setter rejects.
+      await assert.rejects(() => iniSession.setNextTargetMsgSeqNum(79), isSessionNotFound);
+    } finally {
+      await ini.stop().catch(() => {});
+      await acc.stop().catch(() => {});
     }
   });
 
@@ -758,6 +827,47 @@ StartDay=Monday
       );
     } finally {
       await engine.stop();
+    }
+  });
+
+  test("a peer's Logout disconnects the initiator once: one 'logout', no Logon generated without a connection", async () => {
+    // QuickFIX v1.16.0 ticks a session whose connection was just dropped
+    // (SocketInitiator::onTimeout() runs before the drop is processed): with
+    // no responder and sentLogon cleared, Session::next() generated a Logon,
+    // persisted it under a fresh MsgSeqNum it never sent, and the real
+    // disconnect that followed fired onLogout a second time. Patched in
+    // CMakeLists.txt.
+    const port = await freePort();
+    // No reconnect within the test: its Logon would advance the counters.
+    const iniCfg = initiatorCfg(port).replace('ReconnectInterval=1', 'ReconnectInterval=30');
+    const acc = new Acceptor({ settings: SessionSettings.fromString(acceptorCfg(port)), store: 'memory', log: 'none' });
+    const ini = new Initiator({ settings: SessionSettings.fromString(iniCfg), store: 'memory', log: 'none' });
+    let logouts = 0;
+    ini.on('logout', () => logouts++);
+    try {
+      const logons = Promise.all([
+        waitForEvent(ini, 'logon', 'initiator logon', HANDSHAKE_TIMEOUT_MS),
+        waitForEvent(acc, 'logon', 'acceptor logon', HANDSHAKE_TIMEOUT_MS),
+      ]);
+      await acc.start();
+      await ini.start();
+      await logons;
+      await acc.getSession(ACC_ID)!.logout('peer logout');
+      assert.ok(await waitUntil(() => logouts > 0, HANDSHAKE_TIMEOUT_MS), "the initiator saw the peer's Logout");
+      // The orphan Logon and the second 'logout' came within one network
+      // thread tick (1 s) of the first.
+      await new Promise((r) => setTimeout(r, 2500));
+      assert.equal(logouts, 1, "one 'logout' per disconnect");
+      // The acceptor received every message the initiator numbered: no
+      // sequence number went to a message that never reached the wire.
+      assert.equal(
+        ini.getSession(INI_ID)!.getExpectedSenderNum(),
+        acc.getSession(ACC_ID)!.getExpectedTargetNum(),
+        'the initiator numbered no message it did not send',
+      );
+    } finally {
+      await ini.stop(true);
+      await acc.stop(true);
     }
   });
 });

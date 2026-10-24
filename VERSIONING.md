@@ -91,6 +91,10 @@ alters the shipped binary and is classified under the buckets above —
 - a QuickFIX upgrade that changes observable FIX behavior → **breaking** (pre-1.0: MINOR);
 - a QuickFIX bump with no observable change (internal fix, rebuild) → **PATCH**.
 
+A fix the build carries on top of the pinned tag (`CMakeLists.txt` patches the fetched
+sources; see `ARCHITECTURE.md`) is classified the same way, by its observable effect, and
+the CHANGELOG's provenance line says that the bundled QuickFIX is patched.
+
 The pinned QuickFIX version is recorded as a **provenance mapping** (our version → bundled
 QuickFIX version) in the [CHANGELOG](./CHANGELOG.md), not as a compatibility table — a
 matrix would imply a consumer choice that does not exist. Its value is security/audit
