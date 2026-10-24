@@ -291,7 +291,7 @@ SQLite; no SQL Server):
 | `setSeqNums` | `UPDATE sessions SET outgoing_seqnum=$1, incoming_seqnum=$2 WHERE <key>` (`$1 = nextSender`, `$2 = nextTarget`) |
 | `setMessage` | `INSERT INTO messages (<key cols>, msgseqnum, message) VALUES (...) ON CONFLICT (<key cols>, msgseqnum) DO UPDATE SET message = EXCLUDED.message` |
 | `getMessages` | `SELECT message FROM messages WHERE <key> AND msgseqnum >= $5 AND msgseqnum <= $6 ORDER BY msgseqnum ASC` |
-| `reset` | ONE statement, a data-modifying CTE: `WITH gone AS (DELETE FROM messages WHERE <key>) INSERT INTO sessions (...) VALUES (...) ON CONFLICT (<key cols>) DO UPDATE SET creation_time=EXCLUDED.creation_time, incoming_seqnum=EXCLUDED.incoming_seqnum, outgoing_seqnum=EXCLUDED.outgoing_seqnum`. Atomic, one `statement_timeout` bounds it, no checkout. (`BEGIN`/`DELETE`/upsert/`COMMIT` is four statements on a held client: each is bounded, the whole is not before PostgreSQL 17's `transaction_timeout`, and it leaves an idle-in-transaction window) |
+| `reset` | ONE statement, a data-modifying CTE: `WITH gone AS (DELETE FROM messages WHERE <key>) INSERT INTO sessions (...) VALUES (...) ON CONFLICT (<key cols>) DO UPDATE SET creation_time=EXCLUDED.creation_time, incoming_seqnum=EXCLUDED.incoming_seqnum, outgoing_seqnum=EXCLUDED.outgoing_seqnum`. Atomic, one `statement_timeout` bounds it, no transaction held open on a client. (`BEGIN`/`DELETE`/upsert/`COMMIT` is four statements on a held client: each is bounded, the whole is not before PostgreSQL 17's `transaction_timeout`, and it leaves an idle-in-transaction window) |
 
 Read `creation_time` through a fixed format and parse it strictly as UTC: `pg`
 otherwise builds a local-time `Date` from a `TIMESTAMP` column, and
@@ -417,8 +417,9 @@ engine.on('storeError', (sessionID, method, error, poisoned) => {
   check included) + the kill-and-confirm step of an unknown outcome, and that
   sum must stay below `storeTimeoutMs` (contract I2 has a worked budget). No
   client-side query timeout as a backstop; on an unknown outcome follow
-  contract I2 (PostgreSQL: at connect, read `pid, backend_start` from
-  `pg_stat_activity WHERE pid = pg_backend_pid()`; on an unknown outcome,
+  contract I2 (PostgreSQL: at connect, read `pid` and `backend_start` (as
+  integer microseconds, never a `Date`) from `pg_stat_activity WHERE pid =
+  pg_backend_pid()`; on an unknown outcome,
   `pg_terminate_backend` that `(pid, backend_start)` from another, already
   open connection, poll `pg_stat_activity` until it is gone, then reject).
 - **Check the connection at connect, refuse to start on a mismatch**:

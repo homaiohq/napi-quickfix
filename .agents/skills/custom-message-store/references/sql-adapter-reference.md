@@ -428,7 +428,7 @@ arrived at 1543 ms with `timeout: 300`, and with `timeout: 1000` a
 | `setSeqNums` | `updateMany`, then reject when `count === 0` (C3) | `update` throws P2025 on a missing row and adds a `RETURNING` read through the DateStyle-dependent parser |
 | `setMessage` | `$executeRaw` `INSERT ... ON CONFLICT ... DO UPDATE` | `upsert` on the composite id is a native single `ON CONFLICT` only while Prisma's eligibility rules hold; pin it with a test that checks the emitted SQL, or use raw SQL |
 | `getMessages` | `findMany` with `orderBy: { msgseqnum: 'asc' }`, or `$queryRaw` | numeric column, so numeric order |
-| `reset` | `$executeRaw` with the data-modifying CTE | one statement, no checkout |
+| `reset` | `$executeRaw` with the data-modifying CTE | one statement, no transaction held open |
 
 `$queryRawUnsafe` returns rows only, never a count: use `$executeRaw` (it
 returns the affected row count) for every write you must check.
@@ -513,6 +513,6 @@ in any copy:
    that is four round trips on a held client (`BEGIN`, `DELETE`, upsert,
    `COMMIT`): each bounded by `statement_timeout`, the whole unbounded before
    PostgreSQL 17's `transaction_timeout`, with an idle-in-transaction window
-   between them. Use one data-modifying CTE through `pool.query()` instead
+   between them. Use one data-modifying CTE, a single statement, instead
    (`upstream-schemas.md` section 7.1, verified on PostgreSQL 16); keep the
    `transaction` for the other dialects.

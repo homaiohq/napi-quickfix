@@ -691,7 +691,7 @@ PostgreSQL, with session-level advisory locks:
   session whose lock someone else took stays refused, and alarm on it.
 - **At every reload** (`load()` after startup), verify the lock through the
   lock connection itself, which also proves that connection answers, and
-  reject the `load()` when the row is missing: `WITH k AS (SELECT
+  reject the `load()` when the query returns no row: `WITH k AS (SELECT
   hashtextextended($1, 0) AS key) SELECT 1 FROM pg_locks, k WHERE locktype
   = 'advisory' AND granted AND pid = pg_backend_pid() AND objsubid = 1 AND
   classid = ((key >> 32) & 4294967295)::oid AND objid = (key &
@@ -877,12 +877,17 @@ How to confirm the backend is gone, per server (PostgreSQL was verified in the
 their documented commands, derived):
 
 - **PostgreSQL**: identify each connection's backend by `(pid,
-  backend_start)`, read FROM THE SERVER once at connect: `SELECT pid,
-  backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid()`. On an
-  unknown outcome, destroy the client (`release(err)` for a pool client), then
-  from ANOTHER connection run `SELECT pg_terminate_backend(pid) FROM
-  pg_stat_activity WHERE pid = $1 AND backend_start = $2` and poll `SELECT 1
-  FROM pg_stat_activity WHERE pid = $1 AND backend_start = $2` until it
+  backend_start)`, read FROM THE SERVER once at connect, the start time as
+  integer microseconds: `SELECT pid, (extract(epoch FROM backend_start) *
+  1000000)::bigint AS started FROM pg_stat_activity WHERE pid =
+  pg_backend_pid()` (`pg` returns the `bigint` as a string; keep it as is).
+  Never hold it as a JS `Date`: `backend_start` has microseconds, a `Date`
+  milliseconds, and the comparison below then never matches. On an unknown
+  outcome, destroy the client (`release(err)` for a pool client), then from
+  ANOTHER connection run `SELECT pg_terminate_backend(pid) FROM
+  pg_stat_activity WHERE pid = $1 AND (extract(epoch FROM backend_start) *
+  1000000)::bigint = $2` and poll `SELECT 1 FROM pg_stat_activity WHERE pid =
+  $1 AND (extract(epoch FROM backend_start) * 1000000)::bigint = $2` until it
   returns no row; then reject. `backend_start` guards against pid reuse; add
   NO other predicate. Terminating a backend rolls back its open transaction,
   and an autocommit statement either committed before (the row shows it, a
