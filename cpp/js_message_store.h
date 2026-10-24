@@ -53,7 +53,13 @@
 //     numbers QuickFIX meant to discard (a ResetOnLogon=Y Logon would leave
 //     with the old MsgSeqNum and no ResetSeqNumFlag). It stays pending, and
 //     the reload that lifts the poison is the reset itself, retried with its
-//     original timestamp (refresh() included).
+//     original timestamp (refresh() included). The cache takes the reset
+//     numbers at once anyway, as upstream's stores do (cache first): each
+//     read QuickFIX makes on its way to the wire retries the reset on its
+//     own, and they must agree whichever retry succeeds (a Logon's
+//     ResetSeqNumFlag and its MsgSeqNum are two reads). So until the retry
+//     lands, QuickFIX's getters read 1/1 while the adapter's row still holds
+//     the old numbers (JS's getExpected*() throw: the store is poisoned).
 //   * A message stamped from the cache while the store was poisoned, whose
 //     persist() then finds the poison lifted by a reload that moved the
 //     sender seqnum, is refused (set(): its MsgSeqNum is no longer the next

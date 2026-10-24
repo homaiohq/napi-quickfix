@@ -253,7 +253,8 @@ sequenceDiagram
   already handles; `setSeqNums`/`reset` rejections, timeouts and late settlements, and `load` failures, **poison**
   the store (every write throws until a reload through `load()` succeeds, after every timed-out write has settled; a
   failed `reset` is instead retried with its original timestamp, since a reload would bring back the numbers QuickFIX
-  meant to discard). A message stamped from the cache of a poisoned store is refused at `persist()` if the reload
+  meant to discard; the cache takes the reset numbers at once, so the several reads one Logon makes, each retrying
+  on its own, cannot disagree on `141=Y` and `34=`). A message stamped from the cache of a poisoned store is refused at `persist()` if the reload
   that lifted the poison moved the sender seqnum (`CheckStamp()`; `incrNextSenderMsgSeqNum()` with
   `PersistMessages=N`). Sequence numbers cross the bridge as doubles: `ReadSeq()` refuses a value above
   2^53-1 coming back from JS, and `CheckSafeSeq()` refuses one going out (`set()`, `setNext*()`, hence `incr*()`;

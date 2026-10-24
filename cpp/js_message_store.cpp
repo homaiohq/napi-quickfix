@@ -1004,10 +1004,17 @@ void JsMessageStore::reset(const FIX::UtcTimeStamp& now) EXCEPT(FIX::IOException
     // recorded (poison + storeError) by Gate()/Forward(). The reset itself
     // is remembered: the poison lifts only once Gate() has retried it
     // (RetryReset()), never through a plain reload of the old numbers.
+    // The cache takes the reset numbers now, as upstream's stores do (cache
+    // first), so every read QuickFIX makes on its way to the wire agrees
+    // whichever of their Gate() retries succeeds: generateLogon()'s
+    // shouldSendReset() and fill() must both see 1, or a Logon leaves as
+    // 34=1 without 141=Y. Nothing reloads the old numbers over it while the
+    // reset is pending, and every write Gate()s (retries the reset) first.
     std::lock_guard<std::mutex> lock(mtx_);
     if (poisoned_) {
       pendingReset_ = true;
       pendingResetTime_ = now;
+      cache_.reset(now);
     }
   }
 }

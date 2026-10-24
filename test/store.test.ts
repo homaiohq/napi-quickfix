@@ -766,47 +766,64 @@ describe('MessageStoreAdapter: failure policy', () => {
     assert.ok((result.errors as string[]).includes('load:true'), 'the refresh poisoned the store');
   });
 
-  test('ResetOnLogon=Y + a reset() that rejects once: the reset is retried before the Logon goes out, never undone by a reload', { timeout: 30_000 }, async () => {
-    // generateLogon() resets, then reads the sender seqnum for
-    // ResetSeqNumFlag and MsgSeqNum. Before the fix that read reloaded the
-    // old row and lifted the poison: the Logon left with 34=57 and no 141=Y,
-    // as if the reset had happened.
-    const port = await freePort();
-    const logons: Array<{ seq: number; reset: string }> = [];
-    const acc = await Acceptor.create({
-      settings: SessionSettings.fromString(acceptorCfg(port)),
-      store: 'memory',
-      log: 'none',
-      handlers: {
-        fromAdmin(msg: Message) {
-          if (msg.getHeaderField(FIELD.MsgType) === MsgType.Logon) {
-            logons.push({ seq: Number(msg.getHeaderField(FIELD.MsgSeqNum)), reset: msg.getFieldIfSet(FIELD.ResetSeqNumFlag) ?? '' });
-          }
+  for (const rejections of [1, 2, 3, 4]) {
+    test(`ResetOnLogon=Y + a reset() that rejects ${rejections}x: every Logon stamped and sent is 34=1 with 141=Y, the reset never undone by a reload`, { timeout: 30_000 }, async () => {
+      // generateLogon() resets, then reads the sender seqnum twice: in
+      // shouldSendReset() for ResetSeqNumFlag and in fill() for MsgSeqNum,
+      // each read a getter whose Gate() retries the pending reset on its own.
+      // Before the fix, one rejection: the read reloaded the old row and lifted
+      // the poison, and the Logon left with 34=57 and no 141=Y. Two or three:
+      // the flag was decided on the stale cache (57) and the stamp on the reset
+      // one (1), a 34=1 Logon without 141=Y. Four: stamped 34=57 without the
+      // flag, refused by CheckStamp(), nothing sent until LogonTimeout.
+      const port = await freePort();
+      const logons: Array<{ seq: number; reset: string }> = [];
+      const acc = await Acceptor.create({
+        settings: SessionSettings.fromString(acceptorCfg(port)),
+        store: 'memory',
+        log: 'none',
+        handlers: {
+          fromAdmin(msg: Message) {
+            if (msg.getHeaderField(FIELD.MsgType) === MsgType.Logon) {
+              logons.push({ seq: Number(msg.getHeaderField(FIELD.MsgSeqNum)), reset: msg.getFieldIfSet(FIELD.ResetSeqNumFlag) ?? '' });
+            }
+          },
         },
-      },
+      });
+      const iniStore = new ControlledStore(undefined, 1);
+      iniStore.inner.create(INI_ID, { creationTime: new Date(), nextSenderMsgSeqNum: 57, nextTargetMsgSeqNum: 40 });
+      let left = rejections;
+      iniStore.set('reset', 'reject', () => left-- > 0);
+      // toAdmin runs in sendRaw() after fill(), before persist(): it sees every
+      // Logon stamped, including one CheckStamp() then refuses to send.
+      const stamped: Array<{ seq: number; reset: string }> = [];
+      const ini = await Initiator.create({
+        settings: SessionSettings.fromString(initiatorCfg(port)),
+        store: iniStore,
+        log: 'none',
+        handlers: {
+          toAdmin(msg: Message) {
+            if (msg.getHeaderField(FIELD.MsgType) === MsgType.Logon) {
+              stamped.push({ seq: Number(msg.getHeaderField(FIELD.MsgSeqNum)), reset: msg.getFieldIfSet(FIELD.ResetSeqNumFlag) ?? '' });
+            }
+          },
+        },
+      });
+      const storeErrors: StoreErrorSeen[] = [];
+      ini.on('storeError', (_id, method, err, poisoned) => storeErrors.push({ method, message: err.message, poisoned }));
+      try {
+        await logonBoth(acc, ini);
+        assert.ok(storeErrors.some((e) => e.method === 'reset' && e.poisoned), 'the first reset() was rejected');
+        assert.ok(iniStore.count('reset') > rejections, 'the rejected reset was retried until it landed');
+        assert.deepEqual(stamped[0], { seq: 1, reset: 'Y' }, 'the first Logon stamped');
+        assert.deepEqual(logons[0], { seq: 1, reset: 'Y' }, 'the first Logon received');
+        assert.ok(iniStore.row(INI_ID).state.nextSenderMsgSeqNum < 57, 'the row was reset');
+        assert.equal(ini.getSession(INI_ID)!.getExpectedSenderNum(), iniStore.row(INI_ID).state.nextSenderMsgSeqNum);
+      } finally {
+        await stopBoth(acc, ini);
+      }
     });
-    const iniStore = new ControlledStore(undefined, 1);
-    iniStore.inner.create(INI_ID, { creationTime: new Date(), nextSenderMsgSeqNum: 57, nextTargetMsgSeqNum: 40 });
-    let rejections = 1;
-    iniStore.set('reset', 'reject', () => rejections-- > 0);
-    const ini = await Initiator.create({
-      settings: SessionSettings.fromString(initiatorCfg(port)),
-      store: iniStore,
-      log: 'none',
-    });
-    const storeErrors: StoreErrorSeen[] = [];
-    ini.on('storeError', (_id, method, err, poisoned) => storeErrors.push({ method, message: err.message, poisoned }));
-    try {
-      await logonBoth(acc, ini);
-      assert.ok(storeErrors.some((e) => e.method === 'reset' && e.poisoned), 'the first reset() was rejected');
-      assert.ok(iniStore.count('reset') >= 2, 'the rejected reset was retried');
-      assert.deepEqual(logons[0], { seq: 1, reset: 'Y' });
-      assert.ok(iniStore.row(INI_ID).state.nextSenderMsgSeqNum < 57, 'the row was reset');
-      assert.equal(ini.getSession(INI_ID)!.getExpectedSenderNum(), iniStore.row(INI_ID).state.nextSenderMsgSeqNum);
-    } finally {
-      await stopBoth(acc, ini);
-    }
-  });
+  }
 
   test('refresh() / a reload after the row was deleted: like upstream, the row is recreated at 1/1 and the cache follows', { timeout: 30_000 }, async () => {
     const port = await freePort();
