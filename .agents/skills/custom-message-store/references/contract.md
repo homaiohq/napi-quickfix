@@ -20,6 +20,7 @@ versions they were read at:
 | `[QF <file>:<line>]` | QuickFIX C++ **v1.16.0** (the tag pinned by `CMakeLists.txt` `GIT_TAG v1.16.0`, commit `2ce8a60667d95a55cdc57a210f165e19cb757126`), path under `src/C++/`: https://github.com/quickfix/quickfix/tree/v1.16.0/src/C++ |
 | `[probe]` | a loopback probe run on 2026-10-23 through the binding at `4dc1231` (PR #32, an ancestor of this revision; later commits changed the poison, reset-retry and reload paths, none of which the probes exercise: the seqnum writes of a healthy store, `setMessage` ordering, `getMessages` parsing): a real `Acceptor` + `Initiator` over 127.0.0.1, the initiator on a test-double adapter. Each probe is reproduced as a scenario in `test-checklist.md` (the rule names it), so you can rerun it against your adapter |
 | `[trial]` | issue #35 (`REPO/issues/35`): a PostgreSQL adapter written from this skill alone (`pg` 8.23.1, PostgreSQL 16.15, Node 22) and run against a live counterparty's FIX UAT and through local fault injection (frozen, stopped and restarted server, `pg_terminate_backend`, a TCP proxy holding one connection's bytes, `kill -9`) |
+| `[trial2]` | issue #36 (`REPO/issues/36`): the same exercise through an ORM, Prisma 7 (`prisma`/`@prisma/client`/`@prisma/adapter-pg` 7.10.1 over `pg` 8.23.1, PostgreSQL 16, Node 22, the binding at `9225e7a`), against the same counterparty's UAT, through a loopback fault campaign that checks every commit against the adapter call that issued it, and through an independent review. A pooler was simulated by a loopback proxy rewriting `BackendKeyData` as PgBouncer does, not run against a real PgBouncer |
 
 Where a rule is *derived* (a consequence of sourced facts rather than a
 sentence in a source) it says so.
@@ -191,7 +192,29 @@ does the same. So:
   `MapMessageStore`, by design, is the reload after a deleted row (the
   repository's `[store.test]` "refresh() / a reload after the row was
   deleted ..." expects the `1/1` restart).
-  (Derived; `[trial]`.)
+- that memory dies with the process: after a RESTART the next `load()` is a
+  first load again, returns `null`, and the engine `create()`s a `1/1` row.
+  `[trial2]`: an adapter that refused the reload correctly then renumbered
+  after a restart; 56-57 messages were stored under reused numbers, 174
+  sends resolved `true`, about 50 were never delivered, and the peer
+  answered "too low" (3/3). Close that gap from the data: a first `load()`
+  that finds no session row but finds messages for the session (`SELECT 1
+  FROM messages WHERE <key> LIMIT 1`, in the same statement or right after)
+  rejects too, so `Initiator.create()` rejects until an operator restores
+  the row (below). A never-seen session has no messages, and `reset()` keeps the
+  row while it deletes them, so this only fires after a deletion (3/3 in
+  the `[trial2]`). A `TRUNCATE` of both tables, or a restore of both from
+  an old backup, still cannot be detected;
+- rate-limit the alarm and the log line: the engine retries the reload on
+  every store call of the poisoned session, unpaced (I5; `[trial2]`: about
+  83 per second per session);
+- operator recovery: INSERT the row by hand, `outgoing_seqnum` = the number
+  the counterparty says it expects ("MsgSeqNum too low, expecting N"),
+  `incoming_seqnum` = the next number you expect from it (its last
+  `MsgSeqNum` in your logs + 1), `creation_time` = now in UTC, whole
+  seconds (inside the current session window, F4). The session logs back on
+  at its next attempt (0.6-6.2 s in the `[trial2]`).
+  (Derived; `[trial]`, `[trial2]`.)
 
 **B4. The returned object must satisfy A3** (a valid `Date`, two positive safe
 integers). A malformed object is a `TypeError` from `create()` at preload time,
@@ -607,6 +630,11 @@ counterparty then rejects them as too low, and the session needs a manual
 sequence reset). Pick it knowingly; never get the same effect by
 acknowledging before the write was even sent (write-behind). (Derived; the
 server settings are those products' documented knobs, not reproduced here.)
+The stronger settings cost liveness as well as latency: with synchronous
+replication (`synchronous_commit` `on` or above and a
+`synchronous_standby_names`), every commit waits for the standby, no
+timeout bounds that wait, and a missing standby stalls every store write
+until it is back (I2, `[trial2]`).
 
 **G2. You need no read cache.** The engine already caches the three state values
 and reads them from its cache; your `load()` is only called at preload, on
@@ -621,20 +649,63 @@ nodes) owning the same session id through the same tables corrupt each other.
 (Derived from B6 and G2.) `[trial]`: a standby process started with the same
 sessions overwrote 14 stored orders per session with its own Logons, silently.
 
-A cheap STARTUP check catches that misconfiguration without fencing every
-write (which D7 advises against): take an exclusive lock per session when the
-adapter first sees it, and refuse the session if another process holds it.
-PostgreSQL: on a dedicated connection the adapter keeps open (not a pool
-client, since session-level advisory locks belong to the connection),
-`SELECT pg_try_advisory_lock(hashtextextended($1, 0))` with
-`sessionID.toString()`, at the first `load()` of the session (the preload);
-`false` → reject, so `Initiator.create()` rejects. Release it with
-`pg_advisory_unlock` in `close()`. If that connection drops, the lock is gone:
-re-take it before the next `load()` succeeds (a reload), and reject when
-someone else got it. It only guards Node processes using the same adapter;
-a QuickFIX C++ engine on the same tables takes no lock (section 8 of
-`upstream-schemas.md`), and two engines in the SAME process sharing the
-adapter are not caught either (the lock is per connection, and reentrant). (Derived; suggested by the `[trial]`.)
+A per-session lock catches that misconfiguration without fencing every write
+(which D7 advises against): take an exclusive lock per session when the
+adapter first sees it, refuse the session if another process holds it, and
+refuse the session's writes for as long as this process does not hold it.
+PostgreSQL, with session-level advisory locks:
+
+- **One dedicated lock connection** (a plain `pg.Client`, not a pool client:
+  session-level advisory locks belong to the connection), opened during
+  warm-up, before `Initiator.create()`. Opening it lazily inside the first
+  `load()` puts a connect and a SCRAM handshake inside a store call: a 1 s
+  connect stall failed `Initiator.create()` (`storeTimeoutMs` 800 ms) 9/9
+  (`[trial2]`). Give it `keepAlive: true` (`pg` defaults to `false`: a
+  black-holed lock connection then raises no `'error'` and no `'end'`, and
+  the adapter believes it holds locks it lost), `idle_session_timeout = 0`
+  in its `options` (it is idle by construction), and its own `'error'` and
+  `'end'` listeners (I9). Connect it directly to PostgreSQL, never through
+  a pooler (I2).
+- **Take**: `SELECT pg_try_advisory_lock(hashtextextended($1, 0))` at the
+  session's first `load()` (the preload); `false` → reject, so
+  `Initiator.create()` rejects. The key text is this skill's convention, so
+  that two adapters on the same tables (a cutover, a standby) exclude each
+  other: `'quickfix-store:' + <schema>.<prefix>sessions + ':' +
+  sessionID.toString()`, e.g. `quickfix-store:public.sessions:FIX.4.4:CLIENT->SERVER`.
+  An adapter that hashes anything else is invisible to one that follows it.
+- **Lose**: any server restart, failover, `pg_terminate_backend` or idle
+  timeout ends the lock connection, and its locks with it. Nothing tells the
+  engine, and a healthy session never reloads, so a rule of the form
+  "re-take it before the next `load()`" never runs for it. `[trial2]`: live,
+  the locks went from 2 to 0 after a `pg_terminate_backend` and a second
+  adapter instance's `load()` then succeeded for both sessions; in loopback,
+  a second process took both locks, logged on and overwrote the stored
+  messages from seq 37 on, which the first had already sent (3/3), while
+  the first saw no error and went on writing (about 70 rows per session in
+  4 s).
+- **So, on loss** (the lock connection's `'error'` or `'end'`): mark every
+  session it held as unlocked, and from then on REJECT every write method of
+  those sessions (`setSeqNums` poisons, which is what you want; `setMessage`
+  resolves the send `false`). Re-take from the event loop at once (reconnect,
+  `pg_try_advisory_lock` per session), not at the next store call; a
+  session whose lock someone else took stays refused, and alarm on it.
+- **At every reload** (`load()` after startup), verify the lock through the
+  lock connection itself, which also proves that connection answers, and
+  reject the `load()` when the row is missing: `WITH k AS (SELECT
+  hashtextextended($1, 0) AS key) SELECT 1 FROM pg_locks, k WHERE locktype
+  = 'advisory' AND granted AND pid = pg_backend_pid() AND objsubid = 1 AND
+  classid = ((key >> 32) & 4294967295)::oid AND objid = (key &
+  4294967295)::oid` (a `bigint` key shows as its high half in `classid`,
+  its low half in `objid`, `objsubid = 1`). Count that round trip in the
+  call's budget (I2).
+- **Release** with `pg_advisory_unlock` in `close()`.
+
+The loopback runs of the `[trial2]` passed with all of the above. It guards
+only adapters that follow the same convention: a QuickFIX C++ engine on the
+same tables takes no lock (section 8 of `upstream-schemas.md`), and two
+engines in the SAME process sharing the adapter are not caught either (the
+lock is per connection, and reentrant). Behind a transaction-mode pooler it
+guards nothing (I2). (Derived; `[trial]`, `[trial2]`.)
 
 **G4. Synchronous methods are allowed**, and are the simplest correct choice for
 embedded stores (`node:sqlite`, `better-sqlite3`, an in-memory test double): a
@@ -709,14 +780,32 @@ send resolved `false`. So, for any driver that connects through the pool:
   the environment before Node starts, or as the first statement of the entry
   module, before anything uses the pool), and bound in-flight sends below it
   (H6);
+- an adapter that follows I2 and G3 adds connections of its own to the
+  recovery path: the pool's replacements, the connection that ends a backend
+  of unknown outcome, the lock connection. `[trial2]`, `docker restart` with
+  N sends in flight (recovered runs of 3): with 4 slots, 3 sends 3/3, 5 sends
+  1/3, 6 sends 0/3; with 8 slots, 3 to 6 sends 3/3 within 0.74 s, 8 sends
+  3/3 but in 5.6-23.7 s. Open the kill and lock connections during warm-up
+  and keep them, and count every connection the adapter may open at once in
+  the margin;
 - warming the pool before `Initiator.create()` is necessary but not
   sufficient: servers drop connections (restart, failover,
   `idle_session_timeout`, PgBouncer), so reconnects happen during operation.
   Keep idle connections open (`pg-pool`: `idleTimeoutMillis: 0`; its default
   10 s closes them, and its `min`, where your version has it, opens nothing by
-  itself), warm explicitly (check out N clients and release them), and
-  replenish from the event loop (on a client's `'error'`/`'end'`, outside any
-  store call) rather than inside a store call;
+  itself), warm explicitly, and replenish from the event loop (on a client's
+  `'error'`/`'end'`, outside any store call) rather than inside a store call.
+  Warm by holding N clients AT ONCE, then releasing them: `pg-pool` hands out
+  an idle client before it opens a new one, so checking out and releasing N
+  times in a row opens one connection. And avoid `pool.query()` on the store
+  path: `pg-pool` destroys the client on EVERY error it reports, a
+  `statement_timeout` (57014) included, so the next store call reconnects
+  (connect + SCRAM) inside its own budget. Check out explicitly and
+  `release()` after a server error (the connection is fine), `release(err)`
+  only when the connection itself failed (`[trial2]`; `pg-pool` 3.x).
+  `idleTimeoutMillis: 0` keeps the process alive while the pool is open;
+  `allowExitOnIdle: true` lets it exit, but then a pending `await
+  pool.end()` can be abandoned when the loop empties (I7);
 - connect by IP, or resolve once at startup, to keep `dns.lookup` off the
   path.
 
@@ -787,14 +876,51 @@ How to confirm the backend is gone, per server (PostgreSQL was verified in the
 `[trial]` on every fault scenario; the others are the same recipe through
 their documented commands, derived):
 
-- **PostgreSQL**: note `client.processID` (the backend pid, set once `pg`
-  connected) before each statement. On an unknown outcome, destroy the client
-  (`release(err)` for a pool client), then from ANOTHER connection run
-  `SELECT pg_terminate_backend($1)` and poll `SELECT 1 FROM pg_stat_activity
-  WHERE pid = $1` until it returns no row; then reject. Terminating a backend
-  rolls back its open transaction, and an autocommit statement either
-  committed before (the row shows it, a reload reads it) or never will. The
-  role needs to be the backend's own or a member of `pg_signal_backend`.
+- **PostgreSQL**: identify each connection's backend by `(pid,
+  backend_start)`, read FROM THE SERVER once at connect: `SELECT pid,
+  backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid()`. On an
+  unknown outcome, destroy the client (`release(err)` for a pool client), then
+  from ANOTHER connection run `SELECT pg_terminate_backend(pid) FROM
+  pg_stat_activity WHERE pid = $1 AND backend_start = $2` and poll `SELECT 1
+  FROM pg_stat_activity WHERE pid = $1 AND backend_start = $2` until it
+  returns no row; then reject. `backend_start` guards against pid reuse; add
+  NO other predicate. Terminating a backend rolls back its open transaction,
+  and an autocommit statement either committed before (the row shows it, a
+  reload reads it) or never will. The role needs to be the backend's own or a
+  member of `pg_signal_backend`. Keep that other connection open from warm-up
+  on (H4: opening it at the moment of the kill costs a connect and a SCRAM
+  handshake on the recovery path).
+
+  The recipe fails OPEN, and silently: a kill that matches nothing and a
+  confirm that sees no row look exactly like "already gone", so the call
+  rejects while the statement lives on. Three ways to get there, each seen in
+  the `[trial2]` with the write committing after the rejection:
+  - **A predicate the server does not hold as you configured it.** The
+    adapter added `AND application_name = $3`; the server's value differs
+    when the URL carries `?application_name=` (`pg` merges the URL over the
+    config), when the name exceeds 63 bytes (truncated) or holds non-ASCII
+    (escaped): 5/5 runs committed after the rejection, 0/5 in the
+    control. Read
+    identifiers back from the server; never compare with your config.
+  - **A pooler between you and the server.** `client.processID` comes from
+    the `BackendKeyData` message, which PgBouncer rewrites: in the
+    simulation the client saw pid 4019940 for server pid 131, the confirm
+    reported "gone" 5 ms later and the rejected write committed, with the
+    pid-only recipe. In transaction mode even `pg_backend_pid()` names a
+    server connection shared with other clients, so a kill hits them, and a
+    session advisory lock (G3) means nothing. Connect the store directly to
+    PostgreSQL, and at connect refuse to start when `pg_backend_pid()`
+    differs from `client.processID`.
+  - **Settings the connection string replaced.** An `options=` parameter in
+    the URL replaces the `options` the adapter passes (its
+    `statement_timeout`, `lock_timeout`, `datestyle`, `search_path`):
+    `statement_timeout` went from `2s` to `0` while the adapter's own budget
+    check, which read its config, still passed. At connect, read back the
+    effective values (`SELECT current_setting('statement_timeout'), ...`)
+    and refuse to start on a mismatch.
+
+  Test 3.7 with the production connection string and network path, not a
+  loopback default (`[trial2]`).
 - **MySQL/MariaDB**: note `connection.threadId`; `KILL <id>` from another
   connection, then poll `SELECT 1 FROM information_schema.PROCESSLIST WHERE
   ID = ?` until empty.
@@ -809,10 +935,34 @@ FIFO, D7) until then. That is the correct outcome: the alternative is a write
 that may land under a number the engine has already reused.
 
 Driver limits still go SHORTER than `storeTimeoutMs`, but count them per
-call, not per limit: the bound of one call is checkout/connect + statement
-(+ the kill-and-confirm step when the outcome is unknown), and that sum must
-stay below `storeTimeoutMs`, or a healthy-but-slow call becomes a timeout.
-(Derived; `[trial]`.)
+call, not per limit: the bound of one call is checkout/connect + every round
+trip the method makes (+ the kill-and-confirm step when the outcome is
+unknown), and that sum must stay below `storeTimeoutMs`, or a
+healthy-but-slow call becomes a timeout. A worked example, `storeTimeoutMs:
+5000`, PostgreSQL:
+
+| Step | Limit | Budget |
+| --- | --- | --- |
+| checkout (a warm pool; a reconnect is a connect + SCRAM) | `connectionTimeoutMillis` | 1000 ms |
+| `load()` only: verify the G3 lock on its connection (one round trip) | that connection's `statement_timeout` | 500 ms |
+| the statement | `statement_timeout` / `lock_timeout` | 1500 ms |
+| unknown outcome only: terminate + confirm, on the warm admin connection | the admin connection's `statement_timeout`, a poll deadline | 1500 ms |
+| total | | 4500 ms < 5000 |
+
+The `[trial2]` adapter budgeted per statement, and a `load()` that also
+connected the lock connection cost connect + lock query + checkout + SELECT,
+about 6 s against a 5 s `storeTimeoutMs`.
+
+What no setting bounds: **COMMIT**. `statement_timeout` does not cover the
+wait for a synchronous standby. `[trial2]`, `synchronous_standby_names`
+naming an absent standby: `setSeqNums` was still pending at 7 s
+(`statement_timeout` 2 s, `storeTimeoutMs` 5 s), its backend in `wait_event =
+SyncRep`. Staying pending is correct (the outcome is unknown: the commit is
+already durable locally and waits only for the standby; a backend terminated
+there has committed, and a reload reads it), so a synchronous standby that
+goes away poisons every session until it returns or is removed from
+`synchronous_standby_names`. Count that in your availability, not your budget
+(G1). (Derived; `[trial]`, `[trial2]`.)
 
 **I3. Severity by method**
 
@@ -897,7 +1047,10 @@ reload path (and the checkout timeout) far below `HeartBtInt`, and make
 opposite cost: `[trial]`, 18,000-40,000 `load()` attempts during a 20 s server
 stop (about 850/s); the engine does not pace them, so an adapter that opens a
 connection per attempt should rate-limit its reconnects (reject at once while
-a reconnect is cooling down).
+a reconnect is cooling down). That makes each attempt cheap; it does not make
+them rarer (`[trial2]`: about 250 `load()` calls per second per poisoned
+session behind a 200 ms cooldown), so rate-limit the adapter's own alarms
+and log lines as well.
 
 **I6. Never swallow a failed write.** Returning normally after a write that did
 not land is the one unrecoverable error: the engine's cache advances (C5) and
@@ -921,7 +1074,21 @@ until the server thaws (`[trial]`, 3/3). Race `end()` against a grace period
 and then end the process with `process.exit()`, which a parked store call does
 not hold up at this revision (`[README]` "Process exit"); in a process that
 must live on, destroy the sockets of the clients that did not end (for `pg`,
-`client.connection.stream`, which is not a public API).
+`client.connection.stream`, which is not a public API). Snapshot the pool's
+clients BEFORE calling `pool.end()` (`[...pool._clients]`, not public
+either): `end()` removes the idle ones from `_clients` before they have
+closed, so a list taken after the grace period misses them (`[trial2]`).
+
+A bounded shutdown is not a cancelled one. Destroying a socket, or a call the
+adapter rejects with its own `ESHUTDOWN`, does not withdraw a statement the
+server has already received: it is an unknown outcome like any other (the
+table above). `[trial2]`: `stop()` against a frozen server, then `end(2000)`;
+the Logout's `setMessage` calls were rejected, and after the thaw both
+INSERTs committed. Harmless there, because the next Logon upserted the same
+numbers, but a process restarted on the same rows while such statements are
+still queued can see one of them land after its own writes. On an unclean
+end, log the `(pid, backend_start)` of every connection that did not close,
+and terminate-and-confirm them (I2) before the sessions are started again.
 
 **I8. The `'storeError'` event** is `(sessionID, method, error, poisoned)` with
 `error.name === 'QuickFixError'`, `error.fixErrorName === 'IOException'`,
@@ -959,7 +1126,20 @@ its connections during warm-up or replenish. The listener only records the
 failure (and schedules a replenish); the call that was using the client
 learns of it through its own rejection. Other drivers have the same two
 levels (a pool-wide and a per-connection error event); check which one your
-driver uses for a connection you hold, and listen on both.
+driver uses for a connection you hold, and listen on both. A simple way to
+cover every client the pool ever opens: `pool.on('connect', (c) =>
+c.on('error', record))` next to `pool.on('error', record)`, both attached
+when the pool is constructed.
+
+An ORM that wraps the pool does not change this, and may own the listener
+only part of the time. `[trial2]`: Prisma's `PrismaPg` attaches its pool
+error handler at the first query or `$connect()` and removes it at
+`$disconnect()`. A pool warmed before that, or used after it, turned a
+server-side kill of an idle connection into an unhandled `57P01` and the
+process exited with code 1; while attached, the handler swallows the error
+silently unless you pass `onPoolError`. So own the pool (a `pg.Pool` you
+construct, with both listeners above) and hand it to the ORM, rather than
+letting the ORM build it from a connection string.
 
 **I10. The store holds credentials.** Every outbound message is stored, the
 Logon included (D8), so the messages table carries the session's `Password`

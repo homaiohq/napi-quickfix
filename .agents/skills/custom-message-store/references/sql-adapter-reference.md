@@ -40,7 +40,9 @@ What to copy from it, in order of importance:
    and the placeholder syntax.
 
 It takes an `execute(sql, params)` over any driver (`pg`, `mysql2`,
-`node:sqlite`, Prisma `$queryRawUnsafe`, ...) and has no driver dependency.
+`node:sqlite`, ...) and has no driver dependency. Not over an ORM's raw-query
+API: Prisma's `$queryRawUnsafe`, for one, reports no row count (C3) and no
+backend to end on an unknown outcome (I2); see "Through an ORM" below.
 
 ```ts
 /**
@@ -338,14 +340,11 @@ const store = createSqlMessageStore({
     }
   },
 });
-// Prisma (interactive transaction; its default 5 s timeout must exceed the
-// reset's own latency, and stay below storeTimeoutMs)
-const store = createSqlMessageStore({
-  dialect: 'postgres',
-  execute: (sql, params) => prisma.$queryRawUnsafe(sql, ...params),
-  transaction: (fn) => prisma.$transaction((tx) => fn((sql, params) => tx.$queryRawUnsafe(sql, ...params))),
-});
 ```
+
+(Earlier revisions of this file had a Prisma wiring here, an interactive
+`$transaction` over `$queryRawUnsafe`. It was wrong three ways and is gone:
+see "Through an ORM" below.)
 
 (The pg and node:sqlite `transaction` wrappers are adapted from those of
 `test/store-sql.test.ts` `postgresBackend()` / `sqliteBackend()`, which let a
@@ -353,15 +352,22 @@ failing ROLLBACK replace the original error, returned a pg client to the
 pool whatever its state, and attached no `'error'` listener to the checked-out
 client. The pool settings and listeners of the pg wiring come from the
 `[trial]` of `contract.md`. The mysql2 and Prisma wirings in the README of that
-revision passed no `transaction`; give their pools and held connections the
-same error listeners.)
+revision passed no `transaction`; give the mysql2 pool and its held
+connections the same error listeners.)
 
-What these wirings still do NOT do: settle only a final outcome (contract I2).
-A connection dropped after a statement was sent rejects `pool.query()` with
-"Connection terminated" while the statement may still commit; a production
-`execute` notes `client.processID`, and on such a rejection ends that backend
-from another connection and waits until `pg_stat_activity` no longer lists it
-before rethrowing (stays pending while the server is unreachable).
+What these wirings still do NOT do:
+
+- Settle only a final outcome (contract I2). A connection dropped after a
+  statement was sent rejects `pool.query()` with "Connection terminated"
+  while the statement may still commit; a production `execute` knows each
+  connection's `(pid, backend_start)`, read from the server at connect, and
+  on such a rejection ends that backend from another connection and waits
+  until `pg_stat_activity` no longer lists it before rethrowing (stays
+  pending while the server is unreachable).
+- Keep a connection after a server error. `pool.query()` destroys its client
+  on every error, a `statement_timeout` included, so the next call
+  reconnects inside its own budget (contract H4); a production `execute`
+  checks out, and `release()`s a client that got a server error.
 
 Two things the adapter did NOT do, which a production copy should consider:
 
@@ -376,6 +382,93 @@ Two things the adapter did NOT do, which a production copy should consider:
   `execute` built on a client-side query timeout rejects while the statement
   may still commit. Settle only a final outcome (contract I2: end the backend
   and confirm it gone before rejecting an unanswered statement).
+
+## Through an ORM (Prisma 7)
+
+`[trial2]` of `contract.md` wrote a store with Prisma 7 (`@prisma/adapter-pg`
+7.10.1 over `pg` 8.23.1). What it established:
+
+**Prisma's API cannot carry contract I2.** Settling only a final outcome
+needs the backend of the connection a statement went to, and an error that
+says whether the server answered. Prisma exposes neither: a connection lost
+mid-statement surfaces as P2010 "Server has closed the connection" with no
+SQLSTATE, a dead transaction client as a plain `Error`, and no connection or
+pid is reachable. The two ways out:
+
+1. **Recommended: Prisma for the application, plain `pg` for the store.**
+   The store is seven statements; write them on the store's own `pg.Pool`
+   (this file, SKILL.md "Wiring"), on the same tables Prisma's schema maps
+   if you want them visible to the application.
+2. **Prisma for the store too, with I2 implemented under it.** The trial's
+   adapter (about 850 lines, 145 of them through Prisma) owned a `pg.Pool`
+   subclass whose `query()` records each statement's client and
+   `(pid, backend_start)` and runs kill-and-confirm on an unknown outcome,
+   and handed it to `new PrismaPg(pool, { schema })`. This depends on
+   adapter-pg 7.10.1 sending every statement outside a transaction through
+   `pool.query(config)` (`PgQueryable.performIO`) and on `pg` internals
+   (`_clients`, `connection.stream`, `processID`). Anything that goes through
+   `pool.connect()`, which is every `$transaction`, bypasses it. Verify the
+   routing at startup (run one statement and check your `query()` saw it)
+   and refuse to start otherwise: a Prisma upgrade can remove the protection
+   without a compile error.
+
+**Never `$transaction` in the store.** The `reset` rule is one statement on
+PostgreSQL (SKILL.md "Data model", contract F2 and `upstream-schemas.md` 7.1),
+and an interactive transaction runs on a client from `pool.connect()`, outside
+whatever implements I2. Its `timeout` option is no deadline either: P2028
+arrived at 1543 ms with `timeout: 300`, and with `timeout: 1000` a
+`$transaction` was still pending at 8 s, waiting on its COMMIT (`SyncRep`).
+
+**One statement per method**, chosen for what it reports:
+
+| Method | Prisma 7 call | Why |
+| --- | --- | --- |
+| `load` | `$queryRaw` with `to_char(creation_time, ...)` (or `findUnique`/`findMany` under a pinned ISO `DateStyle`, below) | the model API parses timestamps itself |
+| `create` | `createMany` (or `$executeRaw` INSERT) | one statement |
+| `setSeqNums` | `updateMany`, then reject when `count === 0` (C3) | `update` throws P2025 on a missing row and adds a `RETURNING` read through the DateStyle-dependent parser |
+| `setMessage` | `$executeRaw` `INSERT ... ON CONFLICT ... DO UPDATE` | `upsert` on the composite id is a native single `ON CONFLICT` only while Prisma's eligibility rules hold; pin it with a test that checks the emitted SQL, or use raw SQL |
+| `getMessages` | `findMany` with `orderBy: { msgseqnum: 'asc' }`, or `$queryRaw` | numeric column, so numeric order |
+| `reset` | `$executeRaw` with the data-modifying CTE | one statement, no checkout |
+
+`$queryRawUnsafe` returns rows only, never a count: use `$executeRaw` (it
+returns the affected row count) for every write you must check.
+
+**Traps found in the trial**, each silent:
+
+- The model API qualifies table names with the schema from the Prisma
+  schema (`"public"` by default) and ignores `search_path`: pass `schema` to
+  `PrismaPg` (and keep `search_path` for the raw statements in step).
+- `NUMERIC` comes back as a `Decimal`, not a string or a number: convert
+  with `Number(d.toString())` and validate (contract K4).
+- Under a non-ISO `DateStyle` the model API returns an **Invalid Date**
+  without an error; a raw `to_char()` read is immune. Read `creation_time`
+  through `to_char` (SKILL.md "Data model"), or pin `datestyle` in the pool's
+  `options` and read it back at connect (contract I2: the URL can override
+  `options`).
+- The advice "never a JS `Date`" in `upstream-schemas.md` 7.1 is for raw
+  `pg`, which formats a `Date` in the process's time zone. adapter-pg
+  formats a `Date` with the UTC getters, and the model API accepts only a
+  `Date`. The constraint that remains on upstream's tables is whole seconds:
+  truncate the milliseconds (`new Date(Math.floor(t.getTime() / 1000) *
+  1000)`).
+- Prisma 7 compiles each query shape on first use (5-18 ms, about 1 ms
+  after). Run every statement shape once during warm-up, before
+  `Initiator.create()`.
+- There is no per-query timeout or cancel outside a transaction: the
+  server-side `statement_timeout`/`lock_timeout` in the pool's `options` are
+  the only limits (and are right anyway, contract I2).
+- `PrismaPg` handles pool errors only between `$connect()` (or the first
+  query) and `$disconnect()`: own the pool and attach `pool.on('error')` and
+  a per-client listener when you construct it (contract I9).
+- The G3 lock needs a dedicated connection, which Prisma cannot give outside
+  a transaction: open a plain `pg.Client` for it (contract G3).
+
+Checklist mechanics that assume a hand-written driver layer map like this:
+3.6 "wrap its `execute`" means the `pg.Pool` subclass's `query()` (or a
+proxy, 3.7); 3.8(c) has no reset transaction to hit when `reset` is one
+statement, so run it during warm-up instead; 1.13 and 3.5(a) for an adapter
+that connects when constructed: construct it against a healthy server, then
+take the server away.
 
 ## Known defects (found by running it against upstream's stores, 2026-10-23)
 

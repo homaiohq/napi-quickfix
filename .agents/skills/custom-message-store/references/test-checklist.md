@@ -196,7 +196,9 @@ in `contract.md`, is the minimal version of 2.1-2.2.)
   (`await ini.stop(); await acc.stop()`). Expect the initiator's
   `getExpectedSenderNum()` to be 4 before the stop (Logon=1, orders 2 and 3);
   after the stop the adapter row must hold `nextSenderMsgSeqNum = 5` (the
-  Logout took 4) and messages 1..4. Start a second pair over the SAME adapter:
+  Logout took 4), `nextTargetMsgSeqNum = 3` (the acceptor's Logon and Logout;
+  the acceptor's own row holds `nextTargetMsgSeqNum = 5`) and messages 1..4.
+  Start a second pair over the SAME adapter:
   `getExpectedSenderNum()` is 5 before logon; send one more message; it arrives
   with `MsgSeqNum = 6` (test "ResetOnLogon=N: a restart continues seqnums from
   the adapter ..." and the SQL adapter test's `loopback()`: `sender2 == 7` after
@@ -336,7 +338,9 @@ an array your listener fills) instead of asserting on it right after
 - **3.4 Nothing hangs the process.** With a hung `setMessage` and no `stop()`,
   the process still exits once the timeout released the engine thread. Run it
   in a child process (`node:child_process` `fork()` of a small script that
-  builds the pair, parks a send and returns; the parent asserts the child's
+  builds the pair, calls `engine.unref()` on both engines (an engine keeps
+  the process alive until it is stopped), parks a send and returns; the
+  parent asserts the child's
   exit within the timeout plus a margin, and kills it otherwise). Then the same
   with an explicit `process.exit(1)` while the send is parked: it must exit at
   once.
@@ -348,12 +352,18 @@ an array your listener fills) instead of asserting on it right after
   flight: the call must NOT reject before the server is back (the engine times
   it out: `'storeError'` "timed out"); after the thaw it settles, and the row
   then holds what the engine's later calls wrote, never the frozen write's
-  value over a newer one.
+  value over a newer one. (c) At COMMIT, PostgreSQL with synchronous
+  replication: set `synchronous_standby_names` to a standby that does not
+  exist and reload the configuration: a write must stay pending
+  (`statement_timeout` does not apply), the engine times it out, and it
+  settles once the setting is cleared. `[trial2]`: still pending at 7 s with
+  a 2 s `statement_timeout` (contract I2).
 - **3.6 A late `setMessage` must not overwrite a newer one (D7).** The stall
   has to sit BELOW the candidate's own ordering, in its driver: wrapping the
   candidate in the `faulty()` wrapper above would park the call before the candidate's
   FIFO ever sees it. Wrap the candidate's backend call (its `execute`, its pool
-  client, ...) so the first write whose parameters contain `11=A` waits on a
+  client, the `query()` of the pool an ORM was given, ...; or use the proxy of
+  3.7) so the first write whose parameters contain `11=A` waits on a
   Promise you release by hand; `storeTimeoutMs: 300`. Then:
   `send(A)` resolves `false` (timeout); `send(B)` (any result); release A;
   `send(C)` resolves `true`; afterwards the row for A's seqnum must hold the
@@ -383,12 +393,25 @@ an array your listener fills) instead of asserting on it right after
   `PossDupFlag=Y`; the row moved from `12/4` back to `5/3`, then "expecting 12
   but received 8"). Ending the backend and confirming it gone before
   rejecting (contract I2) passed both.
+
+  Run it with the PRODUCTION connection string and network path, not a
+  loopback default: the kill step fails open when what it matches differs
+  from what the server holds. `[trial2]`: an extra `application_name`
+  predicate matched nothing once the URL set `?application_name=`, or the
+  name was over 63 bytes or non-ASCII (5/5 late commits); a proxy rewriting
+  `BackendKeyData` as PgBouncer does made the pid-only recipe confirm "gone"
+  5 ms after the rejection, and the write committed. Add two connect-time
+  checks to the run: with `?options=-c statement_timeout=0` in the URL, and
+  through a pooler if one is anywhere near production, the adapter must
+  refuse to start (contract I2).
 - **3.8 The server ends a connection at any moment (I9).** Run
   `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE
   usename = '<store role>' AND pid <> pg_backend_pid()` (or your server's
   equivalent) (a) with the pool idle, (b) during the adapter's warm-up or
   replenish (loop it every few ms while `Initiator.create()` runs), (c) between
-  two statements of a `reset()` transaction, (d) with sends in flight. The
+  two statements of a `reset()` transaction (when `reset` is one statement,
+  during warm-up again), (d) with sends in flight, (e) the lock connection
+  of G3, which 3.11 follows up. The
   process must survive every case (no uncaught `'error'`), the in-flight calls
   reject or settle late, and the sessions come back. `[trial]`: an adapter
   listening on the pool only crashed in 11 of 13 runs of (b).
@@ -403,7 +426,30 @@ an array your listener fills) instead of asserting on it right after
 - **3.10 Shutdown against a frozen server (I7).** Freeze the server
   (`docker pause`), then run your shutdown path (`await engine.stop()`, then
   the pool's `end()`): the process must exit within your grace period.
-  `[trial]`: `pg`'s `pool.end()` waited for the thaw, 3/3.
+  `[trial]`: `pg`'s `pool.end()` waited for the thaw, 3/3. Then thaw and look
+  at the rows: a write the shutdown rejected may have committed (`[trial2]`:
+  both Logout INSERTs), and the adapter must have logged the backends it
+  could not end (contract I7).
+- **3.11 The lock is lost while the session is healthy (G3).** With two
+  sessions logged on, end the lock connection's backend
+  (`pg_terminate_backend`, or restart the server) and keep sending. The
+  adapter must re-take both locks within a second without any reload, and
+  refuse the sessions' writes until it has. Then, while the first process
+  runs, start a second process on the same sessions: its preload must be
+  refused, both right after the kill and after the re-take. Repeat with the
+  lock connection black-holed instead (a proxy that holds its bytes, or a
+  firewall drop): `keepAlive` must detect it. `[trial2]`, without the
+  re-take: the locks went 2 → 0, a second process took them, logged on and
+  overwrote stored messages the first had sent (3/3), and the first saw no
+  error.
+- **3.12 A deleted session row across a restart (B3).** With the session
+  logged on and some messages stored, delete its `sessions` row and restart
+  the process: if the adapter refuses a vanished row, the preload must
+  reject (messages exist, no row), not return `null`. `[trial2]`: an adapter
+  that only remembered rows in memory renumbered after the restart (56-57
+  messages under reused numbers, about 50 sends never delivered, 3/3).
+  Recreate the row by hand (contract B3, operator recovery): the session logs
+  back on.
 
 ## 4. Interop (only when targeting QuickFIX C++ tables)
 

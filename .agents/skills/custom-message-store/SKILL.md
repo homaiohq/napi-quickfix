@@ -1,7 +1,7 @@
 ---
 name: custom-message-store
 description: >-
-  Implement a custom MessageStoreAdapter for the napi-quickfix binding (@homaiohq/napi-quickfix) so FIX session state (next sequence numbers, creation time, sent messages for resends) is persisted in the user's own backend. Use whenever the user wants to "implement a message store", "write a MessageStoreAdapter", "persist FIX session state / sequence numbers in Postgres / MySQL / MariaDB / SQL Server / SQLite / MongoDB / Redis / DynamoDB / any database", "reuse / migrate from a QuickFIX C++ database" (the tables of its PostgreSQLStore, MySQLStore or OdbcStore), share those tables with a C++ engine during a cutover or as a standby, or asks what load / create / setSeqNums / setMessage / getMessages / reset / close must do, or how upserts, gaps, write ordering, late or timed-out writes on a connection pool, poison or close() behave; also when reviewing an existing adapter, or debugging resends that deliver the wrong message, lose messages or reuse sequence numbers. Self-contained: the store contract as sourced rules, the upstream column mapping (DDL linked, not copied), per-backend guidance checked against upstream's own stores, a worked SQL adapter, and a test checklist.
+  Implement a custom MessageStoreAdapter for the napi-quickfix binding (@homaiohq/napi-quickfix) so FIX session state (next sequence numbers, creation time, sent messages for resends) is persisted in the user's own backend. Use whenever the user wants to "implement a message store", "write a MessageStoreAdapter", "persist FIX session state / sequence numbers in Postgres / MySQL / MariaDB / SQL Server / SQLite / MongoDB / Redis / DynamoDB / any database", or through an ORM (Prisma, Drizzle, TypeORM, Sequelize, Knex), "reuse / migrate from a QuickFIX C++ database" (the tables of its PostgreSQLStore, MySQLStore or OdbcStore), share those tables with a C++ engine during a cutover or as a standby, or asks what load / create / setSeqNums / setMessage / getMessages / reset / close must do, or how upserts, gaps, write ordering, late or timed-out writes on a connection pool, poison or close() behave; also when reviewing an existing adapter, or debugging resends that deliver the wrong message, lose messages or reuse sequence numbers. Self-contained: the store contract as sourced rules, the upstream column mapping (DDL linked, not copied), per-backend guidance checked against upstream's own stores, a worked SQL adapter, and a test checklist.
 ---
 
 # Custom message store for napi-quickfix
@@ -45,7 +45,8 @@ also checked by running upstream's own `PostgreSQLStore`/`MySQLStore`/
 `OdbcStore` against PostgreSQL 16, MySQL 8.4 and SQL Server 2022
 (`upstream-schemas.md` "Verification"), and the adapter guidance by a
 PostgreSQL adapter written from this skill alone and run against a live
-counterparty and injected faults (issue #35 on the repository).
+counterparty and injected faults (issue #35 on the repository), then by a
+second one written through Prisma 7 (issue #36).
 
 Reference files next to this one:
 
@@ -63,8 +64,10 @@ Reference files next to this one:
    deployment (then the layout, column names and timestamp format are fixed,
    see `upstream-schemas.md`); whether the driver is synchronous (embedded
    SQLite) or socket-based; whether one adapter serves several engines or
-   processes; expected message rate. For an existing SQL deployment also
-   find out, or check yourself: the server version, the key columns'
+   processes; whether the application reaches the database through an ORM
+   (Prisma: see "Through an ORM" below) or a pooler (PgBouncer: the store
+   must bypass it, contract I2); expected message rate. For an existing SQL
+   deployment also find out, or check yourself: the server version, the key columns'
    collation (can CompIDs differ only by case?), the largest message, whether
    messages carry non-ASCII text, PostgreSQL's `DateStyle`, and whether a C++
    engine keeps using the tables (cutover, standby). Each of these changes the
@@ -84,8 +87,9 @@ Reference files next to this one:
    against `MapMessageStore`, then the loopback scenarios, then failure
    injection. Do not skip 1.6 (gap and ordering), 1.11 (time zone), 1.15-1.18
    (the logic checks), 3.3 (bounded hang), 3.6-3.7 (late write ordering, late
-   commits) or, for a socket driver, 3.8-3.10 (connections ended by the
-   server, threadpool, shutdown).
+   commits; with the production connection string) or, for a socket driver,
+   3.8-3.12 (connections ended by the server, threadpool, shutdown, a lost
+   lock, a deleted row across a restart).
 7. **Review** against the pitfalls list at the end of this file.
 
 ## The interface (`dist/esm/store.d.ts` in the package, `src/store.ts` in the repository)
@@ -177,8 +181,10 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   A malformed state is a `TypeError` at startup, an `IOException` later; a
   preload rejection reaches the `create()` caller as your own error object.
   A renumbering after a vanished row loses every message stored while
-  logged out: alarm on it, and consider rejecting a later `load()` that finds
-  no row for a session the adapter has already seen (B3).
+  logged out: alarm on it (rate-limited), and consider rejecting a later
+  `load()` that finds no row for a session the adapter has already seen, and
+  a first `load()` that finds no row but finds messages, which is the same
+  deletion seen across a restart (B3).
 - **`setSeqNums` (C).** Both numbers, every call, one write by primary key;
   fatal on failure (poison). Resolve after commit. **No monotonic guard**: the
   numbers go down too (`reset`, `session.setNext*()`); last write wins (C6).
@@ -212,9 +218,14 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   your ack and sends after that. Upstream's floor is "survives a process
   crash" (`fflush`, no `fsync`); surviving a host crash depends on the
   server's flush settings (`synchronous_commit`, `innodb_flush_log_at_trx_commit`,
-  `appendfsync`), a deliberate trade. Sync methods are allowed. One engine per
-  session row (a per-session advisory lock taken at the preload catches a
-  second process at startup, G3). Inbound processing stays at-least-once whatever you do
+  `appendfsync`), a deliberate trade; a synchronous standby also makes every
+  commit wait for it, with no timeout. Sync methods are allowed. One engine per
+  session row: a per-session advisory lock on a dedicated, warmed lock
+  connection, taken at the preload, re-taken from the event loop the moment
+  that connection drops, every write refused while it is not held (a
+  healthy session never reloads, so "re-take at the next `load()`" never
+  runs), and a key format shared by every adapter on the tables (G3).
+  Inbound processing stays at-least-once whatever you do
   (`fromApp` runs before the number is written): dedupe in the app (G5).
 - **Threads (H).** Per-session calls are serialised by the engine, except a
   call that timed out (D7); your method runs on the event loop while an engine
@@ -224,7 +235,8 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   takes several slots per connection while every parked send holds one. Size
   `UV_THREADPOOL_SIZE` above your maximum in-flight sends plus a reconnect
   margin, and bound the sends below it: with the default 4 slots, 6 sends in
-  flight across a database restart never recovered (H4). Never await an
+  flight across a database restart never recovered (H4). The kill and lock
+  connections count too: open them at warm-up and keep them. Never await an
   engine operation on the same session from inside a store method.
 - **Errors (I).** Throw or reject as soon as the outcome is known; never
   settle an unknown one (below). `storeTimeoutMs` (default 30 s)
@@ -234,11 +246,17 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   (`statement_timeout`, `lock_timeout`). **Settle only a final outcome**: reject
   at once when nothing was sent or the server answered with an error; when a
   statement was sent and no answer came (a client-side timeout, a dropped
-  connection), its outcome is unknown and it can still commit: end the backend
-  from another connection and confirm it is gone before rejecting, and stay
-  pending while the server is unreachable (I2). A client-side query timeout
-  "above the server's, as a backstop" is exactly the bug: against a frozen
-  server it rejects, and the statement commits after the thaw.
+  connection, a socket destroyed at shutdown), its outcome is unknown and it
+  can still commit: end the backend from another connection and confirm it is
+  gone before rejecting, and stay pending while the server is unreachable
+  (I2). A client-side query timeout "above the server's, as a backstop" is
+  exactly the bug: against a frozen server it rejects, and the statement
+  commits after the thaw. The kill-and-confirm step fails open when it
+  matches nothing: key it on the backend's `(pid, backend_start)` read from
+  the server, no other predicate, never through a pooler (which rewrites the
+  pid), and read the effective timeouts back at connect (a URL's `options=`
+  replaces yours). Nothing bounds a COMMIT waiting for a synchronous
+  standby; budget every round trip of a call, not every statement.
   Poison = the session's writes fail until the next call after all late
   writes settled has reloaded through `load()`. A reload that succeeds at once
   (a plain rejection) lifts it with the session still up; while it cannot, the
@@ -278,7 +296,9 @@ SQLite; no SQL Server):
 Read `creation_time` through a fixed format and parse it strictly as UTC: `pg`
 otherwise builds a local-time `Date` from a `TIMESTAMP` column, and
 `creation_time::text` follows the server's `DateStyle` (under `'SQL, DMY'` it
-is `22/10/2026 ...`). Write whole seconds as UTC text, never a JS `Date`.
+is `22/10/2026 ...`). Write whole seconds as UTC text, never a JS `Date`
+through raw `pg` (which formats it in the process's time zone; an ORM such
+as Prisma formats it in UTC, and then only the whole seconds matter).
 Convert `NUMERIC`/`BIGINT` results back to `number` and validate. MySQL/MariaDB
 and SQL Server need different statements, column-size and collation checks,
 and (SQL Server) a byte-preserving message encoding: `upstream-schemas.md`
@@ -393,12 +413,20 @@ engine.on('storeError', (sessionID, method, error, poisoned) => {
 - Give the driver connect/acquire timeouts and a SERVER-side statement limit
   (`statement_timeout`, `lock_timeout`), so failures are rejections (settled)
   rather than timeouts (unsettled, which delay recovery). They add up: one
-  call costs checkout/connect + statement (+ the kill-and-confirm step of an
-  unknown outcome), and that sum must stay below `storeTimeoutMs`. No
+  call costs checkout/connect + every round trip it makes (`load()`'s lock
+  check included) + the kill-and-confirm step of an unknown outcome, and that
+  sum must stay below `storeTimeoutMs` (contract I2 has a worked budget). No
   client-side query timeout as a backstop; on an unknown outcome follow
-  contract I2 (PostgreSQL: `pg_terminate_backend(client.processID)` from
-  another connection, poll `pg_stat_activity` until the pid is gone, then
-  reject).
+  contract I2 (PostgreSQL: at connect, read `pid, backend_start` from
+  `pg_stat_activity WHERE pid = pg_backend_pid()`; on an unknown outcome,
+  `pg_terminate_backend` that `(pid, backend_start)` from another, already
+  open connection, poll `pg_stat_activity` until it is gone, then reject).
+- **Check the connection at connect, refuse to start on a mismatch**:
+  `pg_backend_pid()` equals `client.processID` (else a pooler sits in
+  between: connect the store directly to PostgreSQL), and the effective
+  `statement_timeout`, `lock_timeout`, `DateStyle`, `search_path` equal what
+  you configured (an `options=` in the connection URL replaces your
+  `options`), contract I2.
 - **Threadpool**: set `UV_THREADPOOL_SIZE` above the maximum number of
   in-flight sends plus a margin for reconnects (in the environment, or as the
   first statement of the entry module), and bound in-flight `sendToTarget()`
@@ -408,20 +436,28 @@ engine.on('storeError', (sessionID, method, error, poisoned) => {
 - **Connections**: give the store its own pool, not the application's: the
   short `statement_timeout`/`lock_timeout` the store needs (seconds) would
   cut the application's long queries, and the application's load would delay
-  the store's checkouts. Warm it before `Initiator.create()` (check out N
-  clients and release them) and keep the connections open (`pg-pool`:
+  the store's checkouts. Warm it before `Initiator.create()` (hold N clients
+  at once, then release them: `pg-pool` reuses an idle client before it
+  opens one, so N checkouts in a row open one connection) and keep the
+  connections open (`pg-pool`:
   `idleTimeoutMillis: 0`; its default closes idle clients after 10 s, so a
   quiet session reconnects inside a store call, and its `min` opens nothing
   by itself). Servers still drop connections (restart, failover,
   `idle_session_timeout`, PgBouncer): replenish from the event loop, outside
-  store calls.
+  store calls. Check clients out explicitly rather than through
+  `pool.query()`, which destroys the client on any error, a statement
+  timeout included (contract H4).
 - **Error events**: `pool.on('error', ...)`, AND `client.on('error', ...)` on
   every client you hold checked out (a transaction, a warm-up, a replenish, a
   dedicated connection): `pg-pool` removes its own listener from a client
   while it is checked out, and an unhandled `'error'` is an uncaught exception
   that kills every FIX session of the process (contract I9).
+  `pool.on('connect', (c) => c.on('error', ...))` covers every client.
 - **Shutdown**: `pg`'s `pool.end()` waits without limit for a frozen server;
-  bound it with a grace period and `process.exit()` (contract I7).
+  bound it with a grace period and `process.exit()` (contract I7). A
+  statement whose socket you destroyed there may still commit after the
+  thaw: an unknown outcome, logged, and ended (I2) before the sessions start
+  again on the same rows.
 - `await engine.stop()` before `Initiator.create({ store: sameAdapter })`
   again; `close()` runs before `stop()` resolves, so the order is guaranteed.
 - Let the application own the pool's lifetime; `close()` is per session.
@@ -464,6 +500,29 @@ export function serialisePerSession(inner: MessageStoreAdapter): MessageStoreAda
   the backend is done with the statement (a server answer, or a backend you
   ended and saw gone; contract I2), never on a client-side timeout that
   rejects while the server still commits.
+
+### Through an ORM
+
+An ORM's API hides what contract I2 needs: the connection a statement went
+to, and whether the server answered. Through Prisma 7 (issue #36) a lost
+connection is P2010 with no SQLSTATE and no pid is reachable, so a store
+written only against Prisma's API settles unknown outcomes. Decide first:
+
+- **Recommended: the ORM for the application, plain `pg` for the store**, on
+  its own `pg.Pool`, as in this file. The store is seven statements.
+- **Or the ORM over a pool you own**: a `pg.Pool` subclass whose `query()`
+  implements kill-and-confirm, handed to `new PrismaPg(pool, { schema })`,
+  one statement per method, never `$transaction` (it goes through
+  `pool.connect()`, around your `query()`, and its `timeout` is no
+  deadline), and a startup check that statements really reach your
+  `query()`. The lock of G3 still needs a plain `pg.Client`.
+
+Either way own the pool and its error listeners: `PrismaPg` handles pool
+errors only between `$connect()` and `$disconnect()`. The table of calls and
+the silent traps (schema qualification, `Decimal`, Invalid Date under a
+non-ISO `DateStyle`, `update` vs `updateMany`, `upsert` eligibility,
+query-shape warm-up) are in `references/sql-adapter-reference.md` "Through
+an ORM".
 
 ## Pitfalls checklist
 
@@ -527,11 +586,26 @@ Before declaring the adapter done, confirm each of these explicitly:
     server ending a connection at any moment never crashes the process
     (test 3.8).
 24. The store has its own pool, with idle connections kept open, warmed before
-    `create()`, replenished from the event loop; `pool.end()` cannot hold the
-    process forever (test 3.10).
+    `create()` by holding N clients at once, replenished from the event loop;
+    `pool.end()` cannot hold the process forever, and a statement whose
+    socket the shutdown destroyed is treated as an unknown outcome (test
+    3.10).
 25. On PostgreSQL, `reset` is one statement (a data-modifying CTE), not a
     client-side transaction.
 26. The messages table is access-restricted (it holds Logon passwords), and
     the store database does not log statements.
-27. A reload whose `load()` finds no row is alarmed on (or rejected, B3), and
-    a second process on the same sessions is refused at startup (G3).
+27. A reload whose `load()` finds no row is alarmed on, rate-limited, or
+    rejected; if rejected, so is a first `load()` that finds no row but
+    finds messages (B3, test 3.12).
+28. A second process on the same sessions is refused at startup AND while
+    running: the lock connection is opened at warm-up with `keepAlive` and
+    `idle_session_timeout = 0`, a lost lock is re-taken from the event loop
+    and the session's writes are refused until it is, a reload verifies the
+    lock, and the lock key follows G3's convention (test 3.11).
+29. Kill-and-confirm cannot match nothing by mistake: `(pid,
+    backend_start)` read from the server, no other predicate, no pooler in
+    the path, effective timeouts read back at connect (test 3.7 run with the
+    production connection string).
+30. Through an ORM: no `$transaction`, every write reports a row count, and
+    unknown outcomes are handled under the ORM, in a pool you own (or the
+    store does not use the ORM at all).
