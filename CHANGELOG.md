@@ -9,7 +9,7 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
-Bundles **QuickFIX v1.16.0** (statically linked, with one upstream fix carried: see
+Bundles **QuickFIX v1.16.0** (statically linked, with two upstream fixes carried: see
 "Fixed").
 
 ### Added
@@ -124,6 +124,20 @@ Bundles **QuickFIX v1.16.0** (statically linked, with one upstream fix carried: 
   tick also retried `load()` several times on the engine's single network thread,
   stalling every other session of the engine for as long. The build now carries the
   one-line upstream fix (no Logon without a connection).
+- An initiator session could stay disconnected for good, while every `sendToTarget()`
+  on it kept resolving `true` (stored, never delivered), when it was disconnected
+  while handling inbound data (a peer's Logout, a `RejectLogon`, a failed store write)
+  in the same pass of the network loop as another session's due reconnect. A QuickFIX
+  v1.16.0 bug with any store: the dropped connection's socket was closed at once but
+  its disconnect only processed on the next pass, so the reconnect was given the same
+  socket number and the queued disconnect tore down the new connection instead, never
+  marking the dropped session as disconnected (so it was never redialled, and
+  `logon()` did not help). Any engine with two or more sessions was exposed; a
+  `MessageStoreAdapter` call that stalls the network thread past `ReconnectInterval`
+  and then fails (a timed-out `setSeqNums`) made it near-certain. An acceptor could
+  hand the socket number to a new inbound connection the same way. The build now
+  carries a fix to QuickFIX's `SocketMonitor`: a dropped socket is closed only once
+  its disconnect has been processed.
 - The npm package shipped every `CMakeLists.txt` of a local build tree
   (`build/_deps/quickfix-*/**`, `build-tsan/_deps/...`) when packed from a working
   tree: the `files` entry matched at any depth. It now names the root file only.
@@ -131,7 +145,7 @@ Bundles **QuickFIX v1.16.0** (statically linked, with one upstream fix carried: 
 ### Known QuickFIX limitations
 
 Two file-descriptor leaks found by the same audit are in QuickFIX itself and are not
-patched by this binding (it carries a single upstream fix, see "Fixed" and
+patched by this binding (it carries two upstream fixes, see "Fixed" and
 `ARCHITECTURE.md`):
 
 - An `Acceptor` whose `start()` fails because its port is already bound leaks the

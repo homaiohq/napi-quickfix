@@ -89,14 +89,18 @@ Watch the configure step: it should log a git checkout of the **new** tag. If
 the fetch itself fails (bad tag, network), fix that before anything else — the
 tag may not exist or you normalized it wrong.
 
-The configure step also applies the one upstream fix the build carries (the
-`m_pResponder` guard on `generateLogon()` in `Session::next()`, see the block
-after `FetchContent_MakeAvailable` in `CMakeLists.txt`). If it fails with "the
-line the no-responder Logon patch applies to was not found", read the new
-`src/C++/Session.cpp`: if upstream now has an equivalent guard, delete the
-block (and say so in the CHANGELOG's provenance line); otherwise re-anchor it.
-Either way the regression test "a peer's Logout disconnects the initiator once"
-in `test/session.test.ts` must still pass.
+The configure step also applies the two upstream fixes the build carries
+(`qf_patch()` calls after `FetchContent_MakeAvailable` in `CMakeLists.txt`):
+the `m_pResponder` guard on `generateLogon()` in `Session::next()`, and the
+deferred `socket_close()` in `SocketMonitor_UNIX.cpp`/`SocketMonitor_WIN32.cpp`
+(`drop()` no longer closes, `block()` closes after `onError()`, the destructor
+closes drops still queued). If the configure fails with "the line the <name>
+patch applies to was not found exactly once", read that file in the new
+release: if upstream now has an equivalent fix, delete that `qf_patch()` call
+(all three SocketMonitor hunks go together) and say so in the CHANGELOG's
+provenance line; otherwise re-anchor it on one whole line. Either way the
+regression tests must still pass: "a peer's Logout disconnects the initiator
+once" in `test/session.test.ts`, and `test/reconnect.test.ts`.
 
 Once the fetch has landed, regenerate the typed `FIELD` table and the value
 groups (`MsgType`, `Side`, `ExecType`, ... plus the `VALUES` tree) from the new

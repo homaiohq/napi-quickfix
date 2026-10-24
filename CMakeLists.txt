@@ -28,38 +28,72 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(quickfix)
 
-# Carry one upstream fix until QuickFIX ships it: never generate a Logon for a
-# session that has no connection. Session::disconnect() only queues the socket
-# for SocketMonitor::drop(), and SocketInitiator::onStart() calls onTimeout()
-# after every block(), before the drop is processed, so a session just
-# disconnected by an inbound message (a peer's Logout, a store failure) is
-# ticked once more with no responder and sentLogon cleared: Session::next()
-# generates a Logon, sendRaw() persists it under a fresh MsgSeqNum and send()
-# drops it, and the real onDisconnect() then fires onLogout a second time.
-# test/session.test.ts covers it.
-#
-# Applied here, at configure time, rather than as a FetchContent
-# PATCH_COMMAND: that step is skipped for a source tree restored from a cache
-# or given through FETCHCONTENT_SOURCE_DIR_QUICKFIX. Idempotent, and the file
-# is rewritten only when it changes (no needless rebuild). When the pin moves,
-# the anchor must still be found or the configure fails: drop the patch if the
-# new release has the guard.
-set(_qf_session_cpp "${quickfix_SOURCE_DIR}/src/C++/Session.cpp")
-set(_qf_unpatched "if (m_state.shouldSendLogon() && isLogonTime(now)) {")
-set(_qf_patched "if (m_state.shouldSendLogon() && isLogonTime(now) && m_pResponder) {")
-file(READ "${_qf_session_cpp}" _qf_source)
-string(FIND "${_qf_source}" "${_qf_patched}" _qf_at)
-if(_qf_at EQUAL -1)
-  string(FIND "${_qf_source}" "${_qf_unpatched}" _qf_at)
-  if(_qf_at EQUAL -1)
-    message(FATAL_ERROR
-      "${_qf_session_cpp}: the line the no-responder Logon patch applies to "
-      "was not found. See the comment above this check in CMakeLists.txt.")
+# Upstream fixes carried until QuickFIX ships them, applied to the fetched
+# sources at configure time rather than as a FetchContent PATCH_COMMAND: that
+# step is skipped for a source tree restored from a cache or given through
+# FETCHCONTENT_SOURCE_DIR_QUICKFIX. Each edit replaces one whole anchor line
+# (single-line anchors survive a CRLF checkout), is idempotent, and rewrites
+# the file only when it changes (no needless rebuild). When the pin moves, every
+# anchor must still be found exactly once or the configure fails: drop the edit
+# if the new release has the fix, otherwise re-anchor it.
+function(qf_patch file what unpatched patched)
+  set(_path "${quickfix_SOURCE_DIR}/src/C++/${file}")
+  file(READ "${_path}" _source)
+  string(FIND "${_source}" "${patched}" _at)
+  if(NOT _at EQUAL -1)
+    return()
   endif()
-  string(REPLACE "${_qf_unpatched}" "${_qf_patched}" _qf_source "${_qf_source}")
-  file(WRITE "${_qf_session_cpp}" "${_qf_source}")
-  message(STATUS "QuickFIX: patched Session.cpp (no Logon without a responder)")
-endif()
+  string(FIND "${_source}" "${unpatched}" _at)
+  string(FIND "${_source}" "${unpatched}" _last REVERSE)
+  if(_at EQUAL -1 OR NOT _at EQUAL _last)
+    message(FATAL_ERROR
+      "${_path}: the line the ${what} patch applies to was not found exactly "
+      "once. See the comment above qf_patch() in CMakeLists.txt.")
+  endif()
+  string(REPLACE "${unpatched}" "${patched}" _source "${_source}")
+  file(WRITE "${_path}" "${_source}")
+  message(STATUS "QuickFIX: patched ${file} (${what})")
+endfunction()
+
+# 1. Never generate a Logon for a session that has no connection.
+# Session::disconnect() only queues the socket for SocketMonitor::drop(), and
+# SocketInitiator::onStart() calls onTimeout() after every block(), before the
+# drop is processed, so a session just disconnected by an inbound message (a
+# peer's Logout, a store failure) is ticked once more with no responder and
+# sentLogon cleared: Session::next() generates a Logon, sendRaw() persists it
+# under a fresh MsgSeqNum and send() drops it, and the real onDisconnect() then
+# fires onLogout a second time. test/session.test.ts covers it.
+qf_patch(Session.cpp "no-responder Logon"
+  "if (m_state.shouldSendLogon() && isLogonTime(now)) {"
+  "if (m_state.shouldSendLogon() && isLogonTime(now) && m_pResponder) {")
+
+# 2. Close a dropped socket only once its onError() has been delivered.
+# SocketMonitor::drop() closes the fd at once but only queues it for the next
+# block(). Anything that opens a socket in between gets the lowest free fd --
+# the dropped one: SocketInitiator::onStart() runs onTimeout() after every
+# block(), and a reconnect due there files the new socket under that number in
+# m_pendingConnections. The queued onDisconnect(fd) then tears down the new
+# connection (the pending entry wins, SocketInitiator.cpp:201-206) and never
+# calls setDisconnected() for the dropped session, which stays in
+# Initiator::m_connected and is never redialled: its sends are stored, never
+# delivered. A SocketAcceptor's accept() can reuse the fd the same way. Any
+# disconnect raised while handling data (a peer's Logout, a RejectLogon, a store
+# IOException) in the same pass as another session's due reconnect hits it; a
+# store call that stalls the network thread past ReconnectInterval makes it
+# near-certain. The fd now stays open, unmonitored, until block() has delivered
+# its onError(), and the destructor closes drops still queued. Both platform
+# files are patched (only one is compiled). test/reconnect.test.ts covers it.
+foreach(_qf_monitor SocketMonitor_UNIX.cpp SocketMonitor_WIN32.cpp)
+  qf_patch(${_qf_monitor} "deferred close: drop()"
+    "    socket_close(s);"
+    "    // socket_close(s) deferred to block(), after onError(s): see CMakeLists.txt")
+  qf_patch(${_qf_monitor} "deferred close: block()"
+    "    strategy.onError(*this, m_dropped.front());"
+    "    strategy.onError(*this, m_dropped.front()); socket_close(m_dropped.front());")
+  qf_patch(${_qf_monitor} "deferred close: destructor"
+    "  socket_close(m_signal);"
+    "  for (; m_dropped.size(); m_dropped.pop()) { socket_close(m_dropped.front()); } socket_close(m_signal);")
+endforeach()
 
 # Give musl the same clock as glibc. QuickFIX picks its clock in
 # src/C++/FieldTypes.cpp:
