@@ -404,6 +404,18 @@ the next logon). A graceful `stop()` in flight therefore sends no Logout, and
 the exit waits for QuickFIX's `LogoutTimeout` (2 s by default) before the
 session drops. Pending promises never settle, and no adapter `close()` is called.
 
+**Session schedule and venues.** QuickFIX resets a session (both sequence
+numbers back to 1, stored messages deleted) whenever its store's creation time
+falls in an earlier session period than now, at startup as well as while
+running. A daily `StartTime`/`EndTime` window, like the Quick start's,
+therefore restarts the numbering every day, across a restart too, and a
+counterparty that resets only weekly answers the next `34=1` Logon with a
+Logout. Match the counterparty's schedule: `NonStopSession=Y`, or a weekly
+window (`StartDay`/`EndDay`) aligned with its reset. Some venues also drop a
+resent order (`PossDupFlag=Y`) silently, with no reject: throw `DoNotSend`
+from `toApp` for resent order messages, so QuickFIX gap-fills them, and
+resubmit them as new orders.
+
 ### TLS (stunnel-style) for initiators
 
 QuickFIX's own `SSLSocketInitiator` needs OpenSSL compiled into the engine, and
@@ -639,7 +651,26 @@ engine will own (and `create()` for one it has never seen) before constructing
 the engine, which needs that state synchronously; they also accept `'file'` and
 `'memory'`, so there is one async entry point for every store. A ready-made
 `MapMessageStore` (an in-memory `Map` per session) is exported as the reference
-implementation and a test double.
+implementation and a test double. A preload call that rejects or throws
+rejects `create()` with the adapter's own error, unchanged (not a
+`QuickFixError`), as does a constructor-time `reset()`; a timeout rejects with
+a `QuickFixError` (`fixErrorName: 'IOException'`), a malformed `load()`
+result with a `TypeError`.
+
+`getMessages()` never sees an open-ended range: QuickFIX clamps a
+ResendRequest's `EndSeqNo` (`0` from FIX 4.2 on, `999999` up to 4.2, or past
+the last number sent) to the last number sent before calling it. `reset()`
+must be idempotent: besides the engine's retries (below), an initiator with
+`ResetOnLogon=Y` calls it twice for each Logon, before and after `toAdmin`.
+
+**Credentials in the store.** Every outbound message is persisted, Logons
+included, so a `Password` (554) or `RawData` (96) that your `toAdmin` adds is
+stored in clear, by QuickFIX's file store as well, and printed by the session
+log (`log: 'file'` / `'screen'`). Restrict who can read the store, its backups
+and the database's statement logs. QuickFIX never resends an admin message (a
+resend gap-fills it, as it does a missing row), so an adapter may skip storing
+Logons; a row it does store must stay intact, since QuickFIX parses every row
+it reads back and, by default, checks its body length and checksum.
 
 Writing your own adapter? The repository (not the npm package) has an agent
 skill,
@@ -667,7 +698,7 @@ pool thread. Two rules follow:
   queries without it, but (re)connecting uses it: `dns.lookup`, and `pg`'s
   SCRAM-SHA-256 authentication (WebCrypto) takes several slots per
   connection. Size `UV_THREADPOOL_SIZE` above your in-flight sends plus a
-  margin for reconnects.
+  margin for reconnects: it is a liveness bound, not a latency one (below).
 - **Bound your sends** (await them, or cap them with a semaphore): each
   in-flight `sendToTarget()` may be parked in a store write, and the session
   control calls queue behind them on the same pool.
@@ -675,6 +706,30 @@ pool thread. Two rules follow:
   method (`session.logout()`, `sendToTarget(msg, thatSession)`, `engine.stop()`):
   it waits on the mutex the thread parked in your method holds. The timeout
   surfaces it as an `IOException` and poisons the store.
+
+**Threadpool sizing is a liveness requirement.** Once parked sends hold every
+slot, each reconnect handshake times out waiting for one, the adapter never
+gets a connection back, and every other threadpool user in the process
+starves with it. Count every connection the adapter opens to recover (pool
+replacements, and any side connection, e.g. one that confirms a kill or holds
+a lock), and don't rely on a warmed pool: servers drop connections (restart,
+failover, idle timeouts). One field trial, `pg` with SCRAM-SHA-256 across a
+database restart, 3 runs per cell (runs that recovered; time to the first
+successful send once the database was back):
+
+| Sends in flight | `UV_THREADPOOL_SIZE=4` | `UV_THREADPOOL_SIZE=8` |
+| --- | --- | --- |
+| 3 | 3/3, 0.4-0.7 s | 3/3, ≤ 0.46 s |
+| 5 | 1/3, 15.5 s | 3/3, ≤ 0.74 s |
+| 6 | 0/3 | 3/3, ≤ 0.74 s |
+| 8 | 0/3 | 3/3, 5.6-23.7 s |
+
+**Latency budget.** An outbound message costs two adapter calls back to back
+(`setMessage`, then `setSeqNums`; only the second with `PersistMessages=N`),
+an inbound one a `setSeqNums`, all under the session's mutex, which the
+network thread needs to process that session's traffic. Budget `HeartBtInt`
+against twice your per-call latency: at 3 s per call, a send holds the
+session for 6 s.
 
 **Timeout.** `storeTimeoutMs` (default 30 s) bounds every adapter call: how
 long an engine thread waits on one, and how long `create()` and `stop()` wait
@@ -708,6 +763,17 @@ the session log.
   per session), and settle a Promise only once the database is done with the
   statement (a server-side `statement_timeout`, not a client-side query timeout
   that rejects while the statement still commits).
+- **`false` is not always *not sent*.** It is when the `'storeError'` method
+  is `setMessage` and the write did not land late (above). When it is
+  `setSeqNums`, the message was already stored (with `PersistMessages=N`
+  nothing is stored or resent): if the failed write committed anyway, the
+  reload finds the number past it, and the peer's ResendRequest for that gap
+  delivers the message with `PossDupFlag=Y` (`toApp` sees it again and can
+  still throw `DoNotSend`). Treat that `false` as unknown and
+  reconcile on the counterparty's reports. Nor does `true` mean delivered: a
+  send made while the session is logged out is stored, and goes out only as a
+  resend the peer asks for after the next logon. `'storeError'` comes through
+  its own queue, so it can arrive after the failed send's Promise has settled.
 - `setSeqNums` and `reset` failing, timing out or settling **late** (after the
   timeout already failed the call), and `load` (a `refresh`) failing or timing
   out, **poison** the session's store. The engine cannot know whether a rejected
@@ -764,7 +830,15 @@ the session log.
   `load()` returns `null` means the session's row is gone. As QuickFIX's own
   SQL stores do in `refresh()`, the numbering restarts: the engine calls
   `create()` with `1/1` and a new creation time, and the cache follows once it
-  resolved (a failing `create()` poisons the store).
+  resolved (a failing `create()` poisons the store). The peer then sees
+  numbers it has already received: it logs the session out ("MsgSeqNum too
+  low") until the numbers catch up, and sends that resolve `true` meanwhile
+  are stored under numbers below the one the peer expects, which it never asks
+  for, so they are lost. Treat a missing row as an alarm. An adapter that
+  would rather keep the session down rejects a reload's `load()` that finds no
+  row (the store stays poisoned). A restart turns the next `load()` into a
+  first one, which `create()`s `1/1` just the same, so such an adapter also
+  refuses a first `load()` that finds no row but finds stored messages.
 - Sequence numbers cross as JS `number`s, exact only up to **2^53-1**
   (`Number.MAX_SAFE_INTEGER`). A `load()` result above that is refused
   (`create()` rejects with `TypeError`, a reload fails with `IOException`),
@@ -779,8 +853,12 @@ the session log.
 adapter cannot hold it up. A graceful `stop()` lets in-flight writes complete
 (each bounded by the timeout, at most one per session) before the engine logs
 its sessions out; if the Logout itself cannot be persisted, QuickFIX's own 10 s
-logout grace applies on top. Once the sessions are destroyed the adapter's
-`close()` is called for each session (each bounded by the timeout; a failure
+logout grace applies on top. The Logouts are written one session after another
+on the engine's single network thread, so with a stalled adapter their
+timeouts add up across sessions (a field trial measured 15.3 s for two
+sessions on a frozen database at `storeTimeoutMs: 5000`). Once the sessions
+are destroyed the adapter's `close()` is called for each session, in parallel
+(each bounded by the timeout; a failure
 is a `'storeError'`, never a rejection), and `stop()` settles after it, so
 `await engine.stop(); await Initiator.create({ store: sameAdapter })` never
 races `close()` against `load()`. `close()` is also called when `create()`
@@ -807,6 +885,10 @@ This is the key distinction to understand:
   *after* the corresponding handler runs. Event listeners **cannot** mutate a
   message or reject it — use `handlers` for that. An engine built with a
   message store adapter also emits `'storeError'` (see "Message store").
+
+During a resend, QuickFIX calls `toApp` for a resent message before `toAdmin`
+for the SequenceReset-GapFill that precedes it on the wire, so handler and
+event order is not wire order there; the session log is.
 
 ### Rejections
 
@@ -881,15 +963,16 @@ import { ExecType, OrdStatus, SecurityType } from '@homaiohq/napi-quickfix/value
 ### Errors
 
 Errors thrown by native calls are `Error`s with `name === 'QuickFixError'`,
-carrying a `fixError` discriminator (a stable string such as `'ConfigError'`,
-`'FieldNotFound'`, `'InvalidMessage'`, `'IncorrectTagValue'`) plus a `detail`
-string, so you can branch on the failure kind:
+carrying a `fixErrorName` discriminator (a stable string such as
+`'ConfigError'`, `'FieldNotFound'`, `'InvalidMessage'`, `'IncorrectTagValue'`),
+`fixError` (QuickFIX's own wording, e.g. `'Field not found: 11'`, not for
+comparisons) and a `detail` string, so you can branch on the failure kind:
 
 ```ts
 try {
   dictionary.validate(msg);
 } catch (err) {
-  if (err.name === 'QuickFixError' && err.fixError === 'FieldNotFound') {
+  if (err.name === 'QuickFixError' && err.fixErrorName === 'FieldNotFound') {
     // handle a missing required field
   }
 }
