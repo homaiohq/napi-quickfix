@@ -594,18 +594,21 @@ void JsMessageStoreFactory::OnSettled(const std::shared_ptr<Shared>& shared,
 // JS thread: a timed-out call settled after its waiter was released with
 // IOException (OnSettled), or was dropped unrun (CallJs). Only the fatal
 // writes track this (the poison cannot lift before the write has landed):
-// setSeqNums, reset, and the create() a reload issues for a missing row; a
-// late setMessage/getMessages/load is discarded.
+// setSeqNums, reset, and the create() a reload issues for a missing row; and
+// a reload's load(), so no other reload starts while it may still be running
+// (see Gate()), its result discarded unreported. A late setMessage/
+// getMessages is discarded.
 void JsMessageStoreFactory::SettledLate(const std::shared_ptr<Shared>& shared,
                                         Method method, const FIX::SessionID& id,
                                         const std::string& how) {
   if (method != Method::kSetSeqNums && method != Method::kReset &&
-      method != Method::kCreate) {
+      method != Method::kCreate && method != Method::kLoad) {
     return;
   }
   if (JsMessageStore* store = Lookup(id)) {
     store->OnLateSettlement(method);
   }
+  if (method == Method::kLoad) return;
   if (shared->factory != nullptr) {
     shared->factory->ReportError(id, method, how, /*poisoned=*/true, /*late=*/true);
   }
@@ -715,7 +718,7 @@ void JsMessageStore::Gate(const char* what) const {
   if (unsettled_ > 0) {
     throw FIX::IOException(std::string("message store ") + what +
                            ": store poisoned (" + lastError_ +
-                           "), a timed-out write has not settled yet");
+                           "), a timed-out call has not settled yet");
   }
   if (reloadInFlight_) {
     throw FIX::IOException(std::string("message store ") + what +
@@ -788,8 +791,12 @@ JsMessageStore::Factory::Outcome JsMessageStore::RetryReset(
 // does -- m_cache.reset(now), then populateCache() INSERTs a 1/1 row
 // (PostgreSQLStore.cpp:107-127) -- the session's numbering restarts at 1/1
 // with a new creation time, persisted through create() before the cache takes
-// it. A timed-out create() is an unsettled write like a timed-out setSeqNums.
-// On failure `failed` names the method that failed and nothing is applied.
+// it. A timed-out create() is an unsettled write like a timed-out setSeqNums;
+// a timed-out load() is unsettled too, not because it writes but so that a
+// stalled adapter costs one timeout, not one per store call (each getter and
+// write would start a reload of its own and park the network thread on it),
+// and never holds more than one of them. On failure `failed` names the
+// method that failed and nothing is applied.
 JsMessageStore::Factory::Outcome JsMessageStore::Reload(Factory::Method& failed) const {
   Factory::Request req;
   req.method = Factory::Method::kLoad;
@@ -797,6 +804,10 @@ JsMessageStore::Factory::Outcome JsMessageStore::Reload(Factory::Method& failed)
   Factory::Outcome o = factory_.Call(req);
   if (o.status != Factory::Status::kOk) {
     failed = Factory::Method::kLoad;
+    if (o.status == Factory::Status::kTimedOut) {
+      std::lock_guard<std::mutex> lock(mtx_);
+      ++unsettled_;
+    }
     return o;
   }
   Factory::State state = o.state;
@@ -907,7 +918,8 @@ FIX::SEQNUM JsMessageStore::getNextTargetMsgSeqNum() const EXCEPT(FIX::IOExcepti
 // checkSessionTime() on the connect path, where the initiator swallows the
 // exception with the session stuck "pending" for good and the acceptor has
 // no handler at all. While poisoned it still drives one reload attempt per
-// tick (that is what retries a dead adapter on an idle session); if that
+// tick (that is what retries a failing adapter on an idle session; none
+// while a timed-out one is unsettled, see Reload()); if that
 // fails the cached time is returned and the sender getter and the writes,
 // which do throw, take the session down at its next send or inbound message.
 FIX::UtcTimeStamp JsMessageStore::getCreationTime() const EXCEPT(FIX::IOException) {
@@ -1065,7 +1077,7 @@ void JsMessageStore::refresh() EXCEPT(FIX::IOException) {
     if (o.status == Factory::Status::kOk || o.status == Factory::Status::kAborted) {
       return;
     }
-    // Reload() already counted a timed-out create() as unsettled.
+    // Reload() already counted a timed-out load()/create() as unsettled.
     Poison(failed, o.error, /*unsettled=*/false);
   } catch (const FIX::IOException&) {
   }
@@ -1097,8 +1109,8 @@ std::string JsMessageStore::LastError() const {
   return lastError_;
 }
 
-// Not clamped at 0: the waiter counts its timed-out write (Poison(), or
-// Reload()/RetryReset() for create()/reset) only after Call() returned, so a
+// Not clamped at 0: the waiter counts its timed-out call (Poison(), or
+// Reload()/RetryReset() for load()/create()/reset) only after Call() returned, so a
 // settlement racing that window arrives first and takes the counter to -1;
 // the increment then brings it back to 0. Every kExpired fatal call is
 // counted exactly once (CallDirect() never times out; teardown's ForceFulfil()

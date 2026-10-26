@@ -41,9 +41,10 @@
 //     sendRaw()'s try, so nothing stamped from its cache reaches the wire:
 //     the session's sends fail). Poison lifts once every timed-out write
 //     has settled (so a late write has landed) and the next call of any
-//     kind has reloaded the cache through load(); at most one reload is in
-//     flight, and a failed reload keeps the store poisoned for the next
-//     attempt. After a plain rejection that next call (the network thread's
+//     kind has reloaded the cache through load(); a failed reload keeps the
+//     store poisoned for the next attempt, and a timed-out one counts as
+//     unsettled too, so a stalled adapter costs one timeout, not one per
+//     call, until its load() settles. After a plain rejection that next call (the network thread's
 //     next tick at the latest) usually lifts it with the session still up.
 //     While it cannot lift, every inbound message ends in an
 //     incrNextTargetMsgSeqNum() that throws, so QuickFIX disconnects the
@@ -374,9 +375,10 @@ class JsMessageStore : public FIX::MessageStore {
   mutable std::mutex mtx_;  // C
   mutable FIX::MemoryStore cache_;
   mutable bool poisoned_ = false;
-  // Timed-out setSeqNums/reset/create calls whose Promise has not settled
-  // yet: the poison cannot lift while one is pending (its write may still
-  // land). May read -1 for a moment (see OnLateSettlement()).
+  // Timed-out setSeqNums/reset/create calls, and reload load()s, whose
+  // Promise has not settled yet: the poison cannot lift while one is pending
+  // (a write may still land; a reload would stack on a stalled one). May
+  // read -1 for a moment (see OnLateSettlement()).
   mutable int unsettled_ = 0;
   // A reset() that failed: Gate() retries it (RetryReset()) instead of
   // reloading. Implies poisoned_.

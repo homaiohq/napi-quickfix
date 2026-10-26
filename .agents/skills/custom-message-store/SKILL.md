@@ -240,8 +240,8 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
   engine operation on the same session from inside a store method.
 - **Errors (I).** Throw or reject as soon as the outcome is known; never
   settle an unknown one (below). `storeTimeoutMs` (default 30 s)
-  bounds every call (`0` disables it); a timed-out `setSeqNums`/`reset` blocks
-  recovery until it settles (never settles: poisoned until `stop()`), so give
+  bounds every call (`0` disables it); a timed-out `setSeqNums`/`reset` (or
+  reload `load()`) blocks recovery until it settles (never settles: poisoned until `stop()`), so give
   the driver shorter timeouts than `storeTimeoutMs`, enforced by the server
   (`statement_timeout`, `lock_timeout`). **Settle only a final outcome**: reject
   at once when nothing was sent or the server answered with an error; when a

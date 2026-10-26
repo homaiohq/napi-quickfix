@@ -1089,7 +1089,7 @@ describe('MessageStoreAdapter: failure policy', () => {
     }
   });
 
-  test('poisoned store with a dead adapter: calls fail immediately, one reload attempt per timeout', { timeout: 60_000 }, async () => {
+  test('poisoned store with a stalled load(): one reload, then calls fail immediately until it settles', { timeout: 60_000 }, async () => {
     const port = await freePort();
     const iniStore = new ControlledStore();
     const { acc, ini, storeErrors } = await makePair(port, { iniStore, storeTimeoutMs: 500 });
@@ -1097,49 +1097,47 @@ describe('MessageStoreAdapter: failure policy', () => {
       await logonBoth(acc, ini);
       const session = ini.getSession(INI_ID)!;
       // Poison through a rejection (settled: the poison may lift), then
-      // make every reload hang.
+      // park every reload.
       iniStore.set('setSeqNums', 'reject');
       assert.equal(await sendToTarget(newOrder('p'), INI_ID), false);
       assert.ok(await waitUntil(() => storeErrors.some((e) => e.method === 'setSeqNums' && e.poisoned), T));
-      iniStore.mode = (m) => (m === 'load' ? 'hang' : 'ok');
-      const loadsBefore = iniStore.count('load');
-      const t0 = Date.now();
-      // The network thread's ticks and the reconnects each hit the store:
-      // only one reload can be in flight, so over this window the adapter
-      // sees about one load() per timeout, not one per call.
+      iniStore.mode = (m) => (m === 'load' ? 'defer' : 'ok');
+      // A reload is a load(), or the retry of a failed reset (a reconnect's
+      // ResetOnLogon=Y reset fails on the poisoned store and is left pending).
+      const reloads = () => iniStore.count('load') + iniStore.count('reset');
+      const reloadsBefore = reloads();
+      // The network thread's ticks and the reconnects each hit the store,
+      // three getters per pass. The first reload times out and stays
+      // unsettled: no store call starts another (each would park the
+      // network thread, and every other session on it, for a timeout) until
+      // the stalled one has settled.
+      assert.ok(await waitUntil(() => reloads() > reloadsBefore, T), 'a reload was attempted');
       await sleep(3000);
-      const loads = iniStore.count('load') - loadsBefore;
-      assert.ok(loads >= 2 && loads <= 8, `reload attempts in 3 s with a 500 ms timeout: ${loads}`);
+      assert.equal(reloads() - reloadsBefore, 1, 'one reload attempt while it is unsettled');
+      assert.equal(iniStore.parked.length, 1);
+      assert.ok(storeErrors.some((e) => e.method === 'load' && e.message.includes('timed out')), 'the timed-out reload is reported');
       assert.throws(() => session.getExpectedSenderNum(), isIOException);
-      // A setter from JS runs on a worker that waits for the session-state
-      // mutex, then runs its own reload attempt under it (one timeout; the
-      // "reload in flight" fast-fail cannot apply to a thread that holds the
-      // mutex, since every reload runs under it). The wait is longer than
-      // the one attempt in flight at t1: the network thread makes several
-      // store calls back to back per pass -- on a reconnect, setResponder()
-      // -> checkSessionTime() -> getCreationTime(), next() -> checkSessionTime()
-      // again, generateLogon() -> reset() (ResetOnLogon=Y), shouldSendReset()
-      // -> getExpectedSenderNum() (throws) -- each a full-timeout attempt that
-      // re-takes the mutex within microseconds, and std::mutex is not FIFO,
-      // so the worker loses that handoff k times (measured: k = 0 or 2). The
-      // bound is therefore per attempt, not a fixed count: the remainder of
-      // the attempt in flight at t1 (at most one timeout; it was counted
-      // before t1), plus one timeout for every load() the adapter saw while
-      // the setter was pending (the k barged attempts and the setter's own),
-      // plus slop for the timer and thread wake-ups. The absolute cap is the
-      // 10 s check below.
+      // A setter from JS runs on a worker under the session-state mutex: it
+      // fails at once, no network-thread reload holds that mutex any more.
       const t1 = Date.now();
-      const loadsAtT1 = iniStore.count('load');
       await assert.rejects(() => session.setNextTargetMsgSeqNum(5), isIOException);
       const setterMs = Date.now() - t1;
-      const loadsWhilePending = iniStore.count('load') - loadsAtT1;
-      assert.ok(loadsWhilePending >= 1, 'the setter ran a reload attempt of its own');
-      assert.ok(
-        setterMs < (1 + loadsWhilePending) * 500 + 500,
-        `setter settled in ${setterMs} ms with ${loadsWhilePending} reload attempt(s) while pending (500 ms timeout)`,
-      );
-      assert.ok(storeErrors.filter((e) => e.method === 'load').length >= 1, 'reload failures are reported');
-      assert.ok(Date.now() - t0 < 10_000);
+      assert.ok(setterMs < 500, `setter failed in ${setterMs} ms, under one timeout (500 ms)`);
+      assert.equal(reloads() - reloadsBefore, 1, 'the setter started no reload');
+      // The stalled load() settles (its result is discarded): the next call
+      // reloads and the poison lifts.
+      iniStore.mode = () => 'ok';
+      iniStore.parked.shift()!.resolve();
+      const lifted = () => {
+        try {
+          session.getExpectedSenderNum();
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      assert.ok(await waitUntil(lifted, T), 'the poison lifted');
+      assert.equal(reloads() - reloadsBefore, 2, 'lifted by a fresh reload once the stalled one settled');
     } finally {
       await stopBoth(acc, ini, true);
     }

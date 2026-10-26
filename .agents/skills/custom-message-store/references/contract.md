@@ -843,10 +843,13 @@ thread (`Call()`), and in the calls the TS layer awaits itself (`load()`/
 `create()` at preload, a constructor-time `reset()`, `close()`;
 `[store.ts]` `withTimeout()`). For
 `setSeqNums`/`reset` a timed-out call is an UNSETTLED write: the store cannot
-be reloaded, hence cannot recover, until that Promise settles. Sources:
+be reloaded, hence cannot recover, until that Promise settles. So is a
+reload's timed-out `load()`: no other reload starts until it settles. Sources:
 `[js_message_store.cpp]` `Call()` (`kTimedOut`), `Gate()` (`unsettled_ > 0` →
-"a timed-out write has not settled yet"); `[store.test]` "setSeqNums timeout
-then late resolve ..." (`'no reload before the late write settled'`).
+"a timed-out call has not settled yet"); `[store.test]` "setSeqNums timeout
+then late resolve ..." (`'no reload before the late write settled'`),
+"poisoned store with a stalled load(): one reload, then calls fail
+immediately until it settles".
 **Settle only when the outcome is final.** The engine's protection against
 late writes (no reload while a timed-out `setSeqNums`/`reset` is unsettled,
 I4) and the per-session FIFO (D7) both trust your Promise: once it has
@@ -1011,8 +1014,9 @@ sequence-number write disconnects it at once. `'storeError'` fires with
 `[store.test]` "a send whose setSeqNums rejects once: poisoned, healed by the
 next call's reload, no disconnect, the seqnum is reused".
 Poison lifts in two steps: once every timed-out write has settled, the next
-store call of any kind first reloads the state through `load()` (one reload in
-flight at a time), then proceeds; QuickFIX reconciles with the peer at the next
+store call of any kind first reloads the state through `load()` (a timed-out
+`load()` is itself unsettled: no other reload starts until it settles), then
+proceeds; QuickFIX reconciles with the peer at the next
 logon (resend request, or redelivery with `PossDupFlag=Y`). A failed `reset` is
 the exception: that step is the reset itself, retried as `reset(id, {the
 creationTime of the latest failed reset, 1, 1})` until it succeeds (a later
@@ -1020,13 +1024,14 @@ creationTime of the latest failed reset, 1, 1})` until it succeeds (a later
 `reset()`), never a `load()` (which
 would bring back the numbers QuickFIX meant to discard). A message stamped
 while poisoned, whose sender number the lifting reload then moved, is refused
-(non-poisoning `'storeError'`, not sent). A timed-out `setSeqNums`/`reset` that
-never settles keeps the session poisoned until the engine is stopped (I2).
+(non-poisoning `'storeError'`, not sent). A timed-out `setSeqNums`/`reset`, or
+reload `load()`, that never settles keeps the session poisoned until the
+engine is stopped (I2).
 Sources: `[README]` "Failure policy"; `[js_message_store.cpp]` `Gate()`,
 `RetryReset()`, `CheckStamp()`; `[store.test]` "ResetOnDisconnect=Y +
 rejecting reset() ...", "ResetOnLogon=Y + a reset() that rejects once ..." and
-"poisoned store with a dead adapter: calls fail immediately, one reload attempt
-per timeout". For the adapter this means: during an outage, reject fast
+"poisoned store with a stalled load(): one reload, then calls fail
+immediately until it settles". For the adapter this means: during an outage, reject fast
 every call that reached nothing (a refused connection, a failed checkout) and
 keep pending the ones whose outcome is unknown (I2); on
 recovery, make `load()` and `reset()` work first; `reset()` must be idempotent

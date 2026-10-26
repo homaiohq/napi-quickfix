@@ -729,8 +729,10 @@ the session log.
   `getExpected*()` getters throw `IOException` until it lifts. **Poison lifts in
   two steps**, whatever `RefreshOnLogon` says: once every timed-out write has
   settled (so a late write has landed), the next store call of any kind first
-  reloads the state through `load()` (one reload in flight at a time, so a dead
-  adapter costs one timeout per attempt, not per call), then proceeds. A
+  reloads the state through `load()`, then proceeds. A reload whose `load()`
+  times out counts as unsettled too: no other reload starts until it has
+  settled, so a stalled adapter parks the engine's thread for one timeout, not
+  one per store call, and never has more than one reload of a session pending. A
   failed `reset` is the exception: reloading would bring back the numbers
   QuickFIX meant to discard, so the reset itself is retried (`reset()` with
   the original creation time) until it succeeds, and only then does the
@@ -741,11 +743,11 @@ the session log.
   request, or redelivery with `PossDupFlag=Y`). An inbound message whose
   sequence-number write failed after `fromApp` ran is therefore delivered
   **again** with `PossDupFlag=Y` on reconnect: standard FIX dedupe, not a
-  sequence-number inconsistency. A timed-out `setSeqNums`/`reset` whose
-  Promise **never** settles keeps the session poisoned until the engine is
-  stopped (no reload, `refresh()` included, can lift it while that write may
-  still land): give your driver timeouts shorter than `storeTimeoutMs`, so it
-  rejects instead.
+  sequence-number inconsistency. A timed-out `setSeqNums`/`reset` (or reload
+  `load()`) whose Promise **never** settles keeps the session poisoned until
+  the engine is stopped (no reload, `refresh()` included, can lift it while
+  that write may still land): give your driver timeouts shorter than
+  `storeTimeoutMs`, so it rejects instead.
 - `reset()` and `refresh()` never raise into QuickFIX, which runs them on
   paths without a handler (`ResetOnDisconnect=Y` inside its own error handler,
   `RefreshOnLogon=Y` on the connect path); they poison and report instead.
