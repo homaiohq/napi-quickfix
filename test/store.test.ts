@@ -661,12 +661,14 @@ describe('MessageStoreAdapter: failure policy', () => {
     }
   });
 
-  test('a never-settling store call: graceful stop() settles once the timeout released it and the process exits on its own', { timeout: 40_000 }, async () => {
+  test('a never-settling store call: graceful stop() is bounded by the timeout plus the logout grace and the process exits on its own', { timeout: 40_000 }, async () => {
     const { result, ms } = await runChild('graceful-stop-hang', 30_000);
     assert.equal(result.parked, 1, 'the store call was parked when stop() was called');
-    // One call hangs; the Logout the stop sends persists normally once the
-    // timeout (500 ms) has released the parked thread.
-    assert.ok((result.stopMs as number) < 500 + 4000, `graceful stop() settled in ${result.stopMs} ms (timeout 500)`);
+    // One setMessage(N) hangs. The Logout the stop sends takes N too, once the
+    // timeout (500 ms) has released the parked thread, and set(N) is refused
+    // while the hung write could still land over it: as in the 'dead' case
+    // below, QuickFIX's 10 s logout grace bounds the stop.
+    assert.ok((result.stopMs as number) < 500 + 10_000 + 5000, `graceful stop() settled in ${result.stopMs} ms (timeout 500)`);
     assert.ok(ms < 20_000, `the child exited on its own in ${ms} ms`);
   });
 
@@ -890,7 +892,7 @@ describe('MessageStoreAdapter: failure policy', () => {
     }
   });
 
-  test('setMessage timeout: not fatal; the late settlement is discarded', { timeout: 30_000 }, async () => {
+  test('setMessage timeout: not fatal; the late settlement is reported, not poisoning', { timeout: 30_000 }, async () => {
     const port = await freePort();
     const iniStore = new ControlledStore();
     // HeartBtInt=60: no heartbeat can take `before` or hit the deferred setMessage.
@@ -907,14 +909,58 @@ describe('MessageStoreAdapter: failure policy', () => {
       assert.ok(await waitUntil(() => storeErrors.length >= 1, T));
       assert.deepEqual(storeErrors.map((e) => [e.method, e.poisoned]), [['setMessage', false]]);
       assert.equal(session.getExpectedSenderNum(), before);
-      // The write lands late: an upsert of a row the next send rewrites.
+      // The write lands late (reported: set(before) is accepted again), before
+      // the retry: an upsert of a row the next send rewrites.
       iniStore.parked.shift()!.resolve();
       iniStore.mode = () => 'ok';
       assert.equal(await sendToTarget(newOrder('next'), INI_ID), true);
       assert.ok(await waitUntil(() => received.length === 1, T));
       assert.equal(received[0].seq, before);
       assert.equal(iniStore.row(INI_ID).messages.get(before)?.includes('11=next'), true, 'the upsert replaced the late row');
-      assert.equal(storeErrors.length, 1, 'a late setMessage is not reported');
+      assert.deepEqual(storeErrors.map((e) => [e.method, e.poisoned]), [['setMessage', false], ['setMessage', false]]);
+      assert.match(storeErrors[1].message, /settled after the timeout.*accepted again.*\(late\)/);
+    } finally {
+      await stopBoth(acc, ini);
+    }
+  });
+
+  test('a timed-out setMessage(N) holds back set(N) until it settled: a resend of N delivers what went out as N', { timeout: 30_000 }, async () => {
+    // ControlledStore keeps no per-session order, like a connection pool: a
+    // timed-out setMessage(N, A) can commit after the retry's setMessage(N, B).
+    // Row N would then hold A, whose send resolved false, and a resend of N
+    // would deliver it instead of B. The engine refuses set(N) until A settled.
+    const port = await freePort();
+    const iniStore = new ControlledStore();
+    // HeartBtInt=60: no heartbeat can take N or hit the parked write.
+    const { acc, ini, received, storeErrors } = await makePair(port, { iniStore, ini: { HeartBtInt: '60' }, storeTimeoutMs: 300 });
+    try {
+      await logonBoth(acc, ini);
+      const session = ini.getSession(INI_ID)!;
+      const N = session.getExpectedSenderNum();
+      iniStore.set('setMessage', 'defer', (args) => String(args[2]).includes('\x0111=A\x01'));
+      assert.equal(await sendToTarget(newOrder('A'), INI_ID), false, 'setMessage(N, A) timed out');
+      const sentB = await sendToTarget(newOrder('B'), INI_ID);
+      // A's write lands after B's attempt; a macrotask later its late
+      // settlement has reached the engine.
+      iniStore.parked.shift()!.resolve();
+      await nextMacrotask();
+      if (!sentB) assert.equal(await sendToTarget(newOrder('B'), INI_ID), true, 'set(N) accepted once A settled');
+      assert.ok(await waitUntil(() => received.some((r) => r.clOrdID === 'B'), T));
+      assert.equal(received.find((r) => r.clOrdID === 'B')!.seq, N, 'B went out as N');
+      // The peer asks for N again: lower its expected target, then the next
+      // message (N+1) is too high and triggers ResendRequest(N, 0).
+      await acc.getSession(ACC_ID)!.setNextTargetMsgSeqNum(N);
+      assert.equal(await sendToTarget(newOrder('T'), INI_ID), true);
+      assert.ok(await waitUntil(() => received.some((r) => r.clOrdID === 'T'), T));
+      const resent = received.filter((r) => r.seq === N && r.possDup === 'Y').map((r) => r.clOrdID);
+      assert.deepEqual(resent, ['B'], 'the resend of N delivered B, not the failed A');
+      assert.equal(sentB, false, 'set(N) was refused while setMessage(N, A) was unsettled');
+      assert.ok(
+        storeErrors.some((e) => e.method === 'setMessage' && !e.poisoned && e.message.includes('has not settled')),
+        'the refusal is a non-poisoning storeError naming why',
+      );
+      assert.ok(storeErrors.every((e) => !e.poisoned), 'nothing poisoned the store');
+      assert.equal(session.isLoggedOn(), true);
     } finally {
       await stopBoth(acc, ini);
     }

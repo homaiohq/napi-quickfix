@@ -317,8 +317,8 @@ throws, `sendRaw()` catches the `IOException` and returns `false`
 (`[QF Session.cpp:603-606]`), nothing was sent, and the next send reuses the
 number. Sources: `[store.test]` "setMessage rejection: send reports false,
 seqnum unchanged, session survives, retry reuses the seqnum" and "setMessage
-timeout: not fatal; the late settlement is discarded" ("the upsert replaced the
-late row"). The same number also comes back (derived from the same code):
+timeout: not fatal; the late settlement is reported, not poisoning" ("the
+upsert replaced the late row"). The same number also comes back (derived from the same code):
 after a crash between `setMessage(n)` and `setSeqNums(n+1)` (two separate
 calls, `[QF Session.cpp:661-667]`), the restarted engine still has `n` as its
 next number and writes it again; after `session.setNextSenderMsgSeqNum()`
@@ -340,30 +340,37 @@ message on the wire whose row is not durable cannot be resent after a crash.
 
 **D5. `setMessage` is NEVER fatal.** A failure is reported (`'storeError'` with
 `poisoned: false`), the send resolves `false`, the session stays up. A
-settlement after the timeout is discarded by the engine (not reported), but
-the write itself still lands in your backend, possibly AFTER the retry's
-write: see D7. Sources: `[README]` "Failure policy"; `[js_message_store.cpp]`
-`set()` → `Forward(r, /*fatal=*/false)`, `OnSettled()` returns early for any
-method other than `kSetSeqNums`/`kReset`/`kCreate` (the `create()` a reload
-issues for a missing row); `[store.test]` "setMessage timeout:
-not fatal; the late settlement is discarded" (`storeErrors.length == 1`, "a
-late setMessage is not reported").
+timed-out call may still land in your backend; until its Promise settles, the
+engine refuses the next write of the same seqnum (that send resolves `false`
+too, with a non-poisoning `'storeError'`), so the late write cannot land after
+the retry's (D7). The settlement is reported as late, not poisoned. Sources:
+`[README]` "Failure policy"; `[js_message_store.cpp]` `set()` →
+`CheckUnsettledSet()`, `Forward(r, /*fatal=*/false)` counts a timed-out
+`setMessage` per seqnum, `SettledLate()` balances it; `[store.test]`
+"setMessage timeout: not fatal; the late settlement is reported, not
+poisoning", "a timed-out setMessage(N) holds back set(N) until it settled: a
+resend of N delivers what went out as N".
 
 **D6. With `PersistMessages=N` the engine never calls `setMessage()`** and answers
 resend requests with `SequenceReset-GapFill` (`[QF Session.cpp:384-391]`).
 Implement it anyway; it is the default.
 
-**D7. For one session, writes must take effect in the order the engine issued
-them, including a write the engine already gave up on.** The engine serialises
-its calls per session (H1), but a timed-out call is not counted for
-`setMessage` (only `setSeqNums`/`reset`, and the `create()` a reload issues
-for a missing row, hold back recovery, I2), so the next
-call can start while the late one is still running. On a connection POOL the
-two run on different connections and the older one can commit last. Then the
-row for `n` no longer holds what went out as `n`: a resend of `n` (say the
-connection dropped right after B was written, and the peer asks for `n` on
-reconnect) delivers A, a message your application saw fail, with
-`PossDupFlag=Y`, and B is never redelivered. (Not to be confused with the
+**D7. A write the engine already gave up on must be over when its Promise
+settles; keeping one session's writes in call order is still good practice.**
+The engine serialises its calls per session (H1), but a timed-out call can
+still be running when the next one starts. On a connection POOL the two run
+on different connections and the older one can commit last. For `setMessage`
+that would leave the row for `n` holding the wrong message: a resend of `n`
+(say the connection dropped right after B was written, and the peer asks for
+`n` on reconnect) would deliver A, a message your application saw fail, with
+`PossDupFlag=Y`, and B would never be redelivered. The engine prevents it: it
+counts a timed-out `setMessage(n)` until its Promise settles and refuses
+`set(n)` meanwhile (the retry's send resolves `false` with a non-poisoning
+`'storeError'`), so B is written only after A has settled and overwrites it
+(D5; `[store.test]` "a timed-out setMessage(N) holds back set(N) ..."). That
+protection is only as good as your settlement: a Promise that rejects while
+the statement is still alive on the server (a client-side timeout) lets B go
+ahead and A commit after it (I2). (Not to be confused with the
 documented case where a send that resolved `false` is still delivered later:
 a `setSeqNums` that landed after its timeout, `[store.test]` "setSeqNums
 timeout then late resolve ...". There the number belongs to that one message
@@ -372,10 +379,13 @@ number and the store keeps the wrong one.) `[probe]` (`test-checklist.md` 3.6):
 `setMessage(2, A)` parked past `storeTimeoutMs: 300` → `send(A)` resolved
 `false`; `send(B)` succeeded and B went out as 2; A's write then landed; a
 resend from 2 delivered **A** (`PossDupFlag=Y`) to the acceptor's `fromApp`.
-Upsert semantics alone do not prevent this; ordering does (`[README]`
-"Failure policy", corrected after this probe: "Keep one session's writes in
-call order"; revisions up to `4dc1231` called a late `setMessage` "simply a
-late upsert"). Any one of these does:
+That probe predates the engine's refusal of `set(n)`, which now makes it pass
+with any adapter that settles honestly. Upsert semantics alone did not prevent
+it; ordering did (revisions up to `4dc1231` called a late `setMessage` "simply a
+late upsert"). Ordering also covers what the refusal does not: a late write
+landing after a later `reset()` or `close()` of the session (below), or after
+a new engine took over through the same adapter instance. Any one of these
+keeps the order:
 
 - a per-session FIFO in the adapter: each call for a session starts after the
   previous call for that session has settled (a Promise chain keyed by
@@ -741,8 +751,8 @@ adapter both sides: 20 messages in order, acceptor store calls never overlap"
 
 **H2. The one overlap: a late settlement.** A call that timed out may still be
 executing when the next call for the same session arrives. For `setMessage`
-nothing in the engine stops the newer call, and on a pool the OLDER write can
-land last (D7: serialise per session); for `setSeqNums`/`reset` the engine
+the engine refuses the next write of the same seqnum until the late one has
+settled (D7), but other calls go ahead; for `setSeqNums`/`reset` the engine
 stays poisoned until the late write has settled, then reloads (I4). A call
 whose timeout passed while it still waited for the event loop is never
 handed to your adapter at all: only a call your method already received can
@@ -984,7 +994,7 @@ goes away poisons every session until it returns or is removed from
 | `load` (refresh / reload) | store poisoned (or stays poisoned), `'storeError'` | discarded |
 | `create` (a reload found no row, B3) | **poison** | **poison**, "late" |
 | `setSeqNums` | **poison** | **poison**, reported as "late" |
-| `setMessage` | not fatal: send resolves `false`, `'storeError'` | discarded by the engine, but the write still lands in your backend: keep it ordered (D7) |
+| `setMessage` | not fatal: send resolves `false`, `'storeError'` | reported as "late", not poisoned; until then the next write of that seqnum is refused (D7) |
 | `getMessages` | not fatal: engine disconnects, peer re-requests | discarded |
 | `reset` | **poison**; never thrown into QuickFIX; constructor-time: `create()` rejects | **poison**, "late" |
 | `close` | `'storeError'` only; `stop()` still resolves (a timeout included) | discarded |

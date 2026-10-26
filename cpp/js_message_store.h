@@ -34,7 +34,18 @@
 // Failure policy (README "Message store"; the rationale is the spike report):
 //   * setMessage / getMessages: any failure -> IOException, never fatal
 //     (sendRaw returns false and the seqnum is reused; a resend request is
-//     answered by a disconnect and the peer re-requests).
+//     answered by a disconnect and the peer re-requests). A setMessage(N)
+//     that timed out may still commit, after the retry's write for N on a
+//     connection pool, and a resend of N would then deliver the message whose
+//     send failed: until it has settled (or was dropped unrun), set(N) is
+//     refused like a non-fatal failure (IOException inside sendRaw()'s try,
+//     non-poisoning 'storeError'), so the next message waits for it. Only
+//     set(N): every other number is a different row, and the seqnum cannot
+//     move past N without a reset, a setter or a reload (persist() throws
+//     before its increment). A late write landing after a reset() leaves an
+//     old row at N >= the next sender seqnum, which no resend serves and the
+//     new numbering's set(N) overwrites once it may. The late settlement is
+//     reported (late, not poisoned).
 //   * setSeqNums / reset: a rejection, a timeout or a late settlement
 //     poisons the store; refresh (load): a rejection or timeout does too. A
 //     poisoned store fails every write at once with IOException (inside
@@ -185,6 +196,7 @@ class JsMessageStoreFactory : public FIX::MessageStoreFactory {
   struct Channel : SyncChannel<Outcome> {
     Method method = Method::kLoad;
     FIX::SessionID id;
+    FIX::SEQNUM seq = 0;  // Request::a: setMessage's seqnum
   };
 
   // Construct on the JS thread. `bridge` is the TS-side bridge object;
@@ -274,9 +286,11 @@ class JsMessageStoreFactory : public FIX::MessageStoreFactory {
                         std::uint64_t channelId, bool fulfilled,
                         Napi::Value value);
   // JS thread: a timed-out call settled late or was dropped unrun (`how`
-  // says which, for the report): balance the store's poison bookkeeping.
+  // says which, for the report): balance the store's bookkeeping (poison, or
+  // the unsettled setMessage of `seq`).
   static void SettledLate(const std::shared_ptr<Shared>& shared, Method method,
-                          const FIX::SessionID& id, const std::string& how);
+                          const FIX::SessionID& id, FIX::SEQNUM seq,
+                          const std::string& how);
   static Outcome ParseResult(Napi::Env env, Method method, Napi::Value value);
   void DeliverReport(Napi::Env env, const CallData& data);
 
@@ -332,8 +346,8 @@ class JsMessageStore : public FIX::MessageStore {
   std::string LastError() const;
 
   // JS thread, from the factory: a write that had timed out has settled, or
-  // was dropped before the adapter saw it.
-  void OnLateSettlement(Factory::Method method);
+  // was dropped before the adapter saw it (`seq`: setMessage's seqnum).
+  void OnLateSettlement(Factory::Method method, FIX::SEQNUM seq);
 
  private:
   Factory::State Snapshot() const;  // under C
@@ -372,6 +386,10 @@ class JsMessageStore : public FIX::MessageStore {
   // reload moved the cache between fill() and persist()): reports a
   // non-poisoning 'storeError' and throws IOException.
   void CheckStamp(FIX::SEQNUM seq) const;
+  // Refuse set(seq) while an earlier setMessage(seq) that timed out has not
+  // settled (its write could still land over this one): reports a
+  // non-poisoning 'storeError' and throws IOException.
+  void CheckUnsettledSet(FIX::SEQNUM seq) const;
 
   Factory& factory_;
   FIX::SessionID id_;
@@ -383,6 +401,11 @@ class JsMessageStore : public FIX::MessageStore {
   // (a write may still land; a reload would stack on a stalled one). May
   // read -1 for a moment (see OnLateSettlement()).
   mutable int unsettled_ = 0;
+  // Timed-out setMessage calls whose Promise has not settled, counted per
+  // seqnum: set(N) is refused while unsettledSets_[N] > 0 (CheckUnsettledSet()).
+  // Not part of the poison. An entry may read -1 for a moment, like
+  // unsettled_; it is erased at 0.
+  mutable std::map<FIX::SEQNUM, int> unsettledSets_;
   // A reset() that failed: Gate() retries it (RetryReset()) instead of
   // reloading. Implies poisoned_.
   mutable bool pendingReset_ = false;

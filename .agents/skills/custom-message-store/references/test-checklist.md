@@ -372,7 +372,10 @@ an array your listener fills) instead of asserting on it right after
   `[probe]` behind D7 ran this with a pool-like double (no ordering): the row
   held A and the acceptor's `fromApp` received A with `PossDupFlag=Y`. With a
   per-session FIFO, `send(B)` failed (queued behind A), A then B landed in
-  order, `send(C)` succeeded, and the row held C.
+  order, `send(C)` succeeded, and the row held C. Since then the engine
+  refuses `set(n)` until A has settled, so `send(B)` fails and the check
+  passes without a FIFO too; it still catches an adapter whose Promise
+  settles before A is final (3.7).
 - **3.7 A statement the client gave up on must not commit after newer writes
   (I2, D7).** 3.6 stalls inside your process; this one stalls on the wire,
   where a client-side timeout cannot see it. Put a TCP proxy between the

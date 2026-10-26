@@ -319,6 +319,7 @@ JsMessageStoreFactory::Outcome JsMessageStoreFactory::Call(const Request& req) {
   auto ch = std::make_shared<Channel>();
   ch->method = req.method;
   ch->id = req.id;
+  ch->seq = req.a;
   std::uint64_t channelId = 0;
   if (!shared_->pending.Register(ch, channelId)) {
     return Failed(Status::kAborted, "engine tearing down");
@@ -424,7 +425,8 @@ void JsMessageStoreFactory::CallJs(Napi::Env env, Napi::Function,
   // Nor for a call whose waiter gave up while it sat in the queue (the loop
   // was busy): the engine has moved on, maybe retried it, and a stale
   // setMessage run now could commit over the retry's row for the same
-  // seqnum. Dropped, it counts as a late settlement that wrote nothing.
+  // seqnum (set() refuses that retry until this one is settled: dropping it
+  // settles it). Dropped, it counts as a late settlement that wrote nothing.
   bool expired = false;
   self->shared_->pending.WithChannel(
       data->channelId, [&](const std::shared_ptr<Channel>& ch) {
@@ -433,7 +435,7 @@ void JsMessageStoreFactory::CallJs(Napi::Env env, Napi::Function,
         return expired;  // nothing will settle it: erase here
       });
   if (expired) {
-    SettledLate(self->shared_, data->req.method, data->req.id,
+    SettledLate(self->shared_, data->req.method, data->req.id, data->req.a,
                 "timed out before the adapter was called; not run");
     return;
   }
@@ -550,6 +552,7 @@ void JsMessageStoreFactory::OnSettled(const std::shared_ptr<Shared>& shared,
   if (channelId == kNoChannel) return;
   Method method = Method::kLoad;
   FIX::SessionID id;
+  FIX::SEQNUM seq = 0;
   bool late = false;
   Outcome o;
   if (fulfilled) {
@@ -573,6 +576,7 @@ void JsMessageStoreFactory::OnSettled(const std::shared_ptr<Shared>& shared,
   shared->pending.WithChannel(channelId, [&](const std::shared_ptr<Channel>& ch) {
     method = ch->method;
     id = ch->id;
+    seq = ch->seq;
     switch (ch->TryFulfil(std::move(o))) {
       case Channel::Fulfilment::kFulfilled:
       case Channel::Fulfilment::kAlreadyDone:
@@ -584,32 +588,35 @@ void JsMessageStoreFactory::OnSettled(const std::shared_ptr<Shared>& shared,
     return false;
   });
   if (!late) return;
-  SettledLate(shared, method, id,
+  SettledLate(shared, method, id, seq,
               std::string(fulfilled ? "settled" : "rejected") +
                   " after the timeout had already failed the call");
 }
 
 // JS thread: a timed-out call settled after its waiter was released with
-// IOException (OnSettled), or was dropped unrun (CallJs). Only the fatal
-// writes track this (the poison cannot lift before the write has landed):
-// setSeqNums, reset, and the create() a reload issues for a missing row; and
-// a reload's load(), so no other reload starts while it may still be running
-// (see Gate()), its result discarded unreported. A late setMessage/
-// getMessages is discarded.
+// IOException (OnSettled), or was dropped unrun (CallJs). The fatal writes
+// track this (the poison cannot lift before the write has landed):
+// setSeqNums, reset, and the create() a reload issues for a missing row; so
+// does a reload's load(), so no other reload starts while it may still be
+// running (see Gate()), its result discarded unreported; and setMessage,
+// whose seqnum set() refuses until then (CheckUnsettledSet()), reported
+// without poison. A late getMessages is discarded.
 void JsMessageStoreFactory::SettledLate(const std::shared_ptr<Shared>& shared,
                                         Method method, const FIX::SessionID& id,
-                                        const std::string& how) {
-  if (method != Method::kSetSeqNums && method != Method::kReset &&
-      method != Method::kCreate && method != Method::kLoad) {
-    return;
-  }
+                                        FIX::SEQNUM seq, const std::string& how) {
+  if (method == Method::kGetMessages) return;
   if (JsMessageStore* store = Lookup(id)) {
-    store->OnLateSettlement(method);
+    store->OnLateSettlement(method, seq);
   }
   if (method == Method::kLoad) return;
-  if (shared->factory != nullptr) {
-    shared->factory->ReportError(id, method, how, /*poisoned=*/true, /*late=*/true);
+  if (shared->factory == nullptr) return;
+  if (method == Method::kSetMessage) {
+    shared->factory->ReportError(
+        id, method, how + "; set(" + std::to_string(seq) + ") is accepted again",
+        /*poisoned=*/false, /*late=*/true);
+    return;
   }
+  shared->factory->ReportError(id, method, how, /*poisoned=*/true, /*late=*/true);
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +689,28 @@ void JsMessageStore::CheckStamp(FIX::SEQNUM seq) const {
       std::to_string(seq) + " but the next sender seqnum is now " +
       std::to_string(next) +
       " (a reload or a sequence-number setter moved it after the stamp); refused, not sent";
+  factory_.ReportError(id_, Factory::Method::kSetMessage, why, /*poisoned=*/false,
+                       /*late=*/false);
+  Throw(Factory::Method::kSetMessage, why);
+}
+
+// A setMessage(seq) that timed out may still commit (the adapter runs it on
+// another pool connection than the retry's): landing after this write, it
+// would leave row `seq` holding the message whose send failed, and a resend
+// of `seq` would deliver that one instead of the message sent as `seq`.
+// Refused like a non-fatal adapter failure until it has settled (OnSettled())
+// or was dropped unrun (CallJs()): the send resolves false and the next one
+// takes the same seqnum.
+void JsMessageStore::CheckUnsettledSet(FIX::SEQNUM seq) const {
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto it = unsettledSets_.find(seq);
+    if (it == unsettledSets_.end() || it->second <= 0) return;
+  }
+  const std::string why =
+      "set(" + std::to_string(seq) + "): an earlier setMessage(" + std::to_string(seq) +
+      ") timed out and has not settled; its write could still land over this one"
+      " (a resend would deliver the failed message); refused, not sent";
   factory_.ReportError(id_, Factory::Method::kSetMessage, why, /*poisoned=*/false,
                        /*late=*/false);
   Throw(Factory::Method::kSetMessage, why);
@@ -849,6 +878,12 @@ JsMessageStore::Factory::Outcome JsMessageStore::Forward(Factory::Request req,
       if (fatal) {
         Poison(req.method, o.error, /*unsettled=*/o.status == Factory::Status::kTimedOut);
       } else {
+        if (o.status == Factory::Status::kTimedOut &&
+            req.method == Factory::Method::kSetMessage) {
+          // Counted before the throw, still under SS (see OnLateSettlement()).
+          std::lock_guard<std::mutex> lock(mtx_);
+          if (++unsettledSets_[req.a] == 0) unsettledSets_.erase(req.a);
+        }
         factory_.ReportError(id_, req.method, o.error, /*poisoned=*/false,
                              /*late=*/false);
       }
@@ -862,6 +897,7 @@ bool JsMessageStore::set(FIX::SEQNUM seq, const std::string& msg)
   CheckSafeSeq(seq, Factory::Method::kSetMessage, "set");
   Gate("setMessage");
   CheckStamp(seq);
+  CheckUnsettledSet(seq);
   Factory::Request r;
   r.method = Factory::Method::kSetMessage;
   r.a = seq;
@@ -1108,14 +1144,21 @@ std::string JsMessageStore::LastError() const {
 }
 
 // Not clamped at 0: the waiter counts its timed-out call (Poison(), or
-// Reload()/RetryReset() for load()/create()/reset) only after Call() returned, so a
-// settlement racing that window arrives first and takes the counter to -1;
-// the increment then brings it back to 0. Every kExpired fatal call is
-// counted exactly once (CallDirect() never times out; teardown's ForceFulfil()
-// leaves nothing late; one dropped unrun by CallJs() is settled there), so
-// the count is exact once both have run.
-void JsMessageStore::OnLateSettlement(Factory::Method /*method*/) {
+// Reload()/RetryReset() for load()/create()/reset, Forward() for setMessage)
+// only after Call() returned, so a settlement racing that window arrives first
+// and takes the counter to -1; the increment then brings it back to 0. Safe:
+// the waiter holds SS throughout, so no store call reads the counter
+// meanwhile. Every kExpired tracked call is counted exactly once (CallDirect()
+// never times out; teardown's ForceFulfil() leaves nothing late, and the store
+// dies with the engine; one dropped unrun by CallJs() is settled there), so
+// the count is exact once both have run. setMessage counts per seqnum in
+// unsettledSets_, outside the poison.
+void JsMessageStore::OnLateSettlement(Factory::Method method, FIX::SEQNUM seq) {
   std::lock_guard<std::mutex> lock(mtx_);
+  if (method == Factory::Method::kSetMessage) {
+    if (--unsettledSets_[seq] == 0) unsettledSets_.erase(seq);
+    return;
+  }
   --unsettled_;
 }
 

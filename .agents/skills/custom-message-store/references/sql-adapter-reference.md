@@ -503,9 +503,9 @@ in any copy:
    `setSeqNums`, no driver timeouts.
 7. **No per-session ordering on a pool.** Wired as above to `pool.query()` /
    `pool.execute()`, each statement may take a different connection, so a
-   `setMessage` the engine already timed out can commit after the retry's
-   `setMessage` for the same seqnum, and the row then holds a message that
-   never went out under that number (contract D7). Wrap the returned adapter
+   write the engine already timed out can commit after a newer one (the
+   engine itself holds back the retry of a timed-out `setMessage`, but not a
+   `reset()` or `close()` that follows it; contract D7). Wrap the returned adapter
    in `serialisePerSession()` (SKILL.md "Wiring"), or give each session its
    own connection. The `node:sqlite` wiring is synchronous and therefore
    already ordered.

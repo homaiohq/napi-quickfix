@@ -23,7 +23,9 @@ Bundles **QuickFIX v1.16.0** (statically linked, with two upstream fixes carried
   also accept `'file'`/`'memory'`. `storeTimeoutMs` (default 30 s, `0` disables) bounds
   how long an engine thread waits on one adapter call. Failures reach the engine as
   `IOException` and are reported through the new `'storeError'` event: `setMessage`/
-  `getMessages` failures are never fatal; `setSeqNums`/`reset` rejections, timeouts and
+  `getMessages` failures are never fatal (a timed-out `setMessage` holds back the next
+  write of its sequence number until it has settled, so its late commit cannot replace
+  the retry's message and be resent in its place); `setSeqNums`/`reset` rejections, timeouts and
   late settlements (and `load` failures) poison the session's store until it has been
   reloaded: a reload that succeeds at the next store call lifts it with the session
   still up, otherwise the session is taken down at its next inbound message and
@@ -46,8 +48,7 @@ Bundles **QuickFIX v1.16.0** (statically linked, with two upstream fixes carried
   rounded value. `MapMessageStore` (in-memory
   reference implementation) is exported; README "Message store" has the threading and
   latency contract (bound in-flight sends; an adapter must not depend on the libuv
-  threadpool; keep one session's writes in call order, since a timed-out `setMessage`
-  can still commit after the retry's write on a connection pool).
+  threadpool; keep one session's writes in call order).
 - `.agents/skills/custom-message-store` (in the repository, not the npm package): an
   agent skill for writing a custom `MessageStoreAdapter` (the contract as sourced rules,
   the column mapping onto QuickFIX v1.16.0's `sessions`/`messages` tables for interop

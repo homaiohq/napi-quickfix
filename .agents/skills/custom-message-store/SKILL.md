@@ -191,10 +191,11 @@ Numbered rules with sources are in `references/contract.md`; this is the index.
 - **`setMessage` (D).** An upsert: the same seqnum is rewritten after a failed
   or timed-out send, after a crash between the two writes, after a lowered
   sender number. Never fatal. Called before the message hits the wire, so no
-  batching or deferral. **Per-session writes must land in call order, even
-  one the engine already timed out**: on a pool, a late `setMessage(n, A)` can
-  commit after the retry's `setMessage(n, B)`, and a resend then delivers A,
-  a message the application saw fail (D7; fix: the FIFO wrapper in "Wiring").
+  batching or deferral. **Settle only once the write is final**: the engine
+  refuses the retry's `setMessage(n, B)` until a timed-out `setMessage(n, A)`
+  has settled, so a late A cannot replace B, unless your Promise rejected
+  while A's statement was still alive (D7, I2). Keeping per-session writes in
+  call order (the FIFO wrapper in "Wiring") is still good practice.
   Store every message (admin ones too, unsent ones too) under exactly the
   number given; the engine trusts tag 34 inside the string (D8).
 - **`getMessages` (E).** Inclusive `[begin, end]`, ascending **numerically**,

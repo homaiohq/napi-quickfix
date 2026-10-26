@@ -753,18 +753,26 @@ the session log.
   is reused by the next send: hence the upsert), and a failed `getMessages`
   makes the engine disconnect so the peer reconnects and re-requests — QuickFIX's
   own behaviour. A call whose timeout passes before your method was even
-  invoked (the event loop was busy) is never run. A `setMessage` that settles
-  after its timeout is not reported, but its write still lands, and nothing
-  holds back the session's next call
-  meanwhile: on a connection pool the late write can commit *after* the retry's
-  write for the same sequence number, and a later resend of that number then
-  delivers the message whose send resolved `false`. Keep one session's writes
-  in call order (a per-session queue in front of the adapter, or one connection
-  per session), and settle a Promise only once the database is done with the
-  statement (a server-side `statement_timeout`, not a client-side query timeout
-  that rejects while the statement still commits).
+  invoked (the event loop was busy) is never run. A `setMessage` that timed
+  out may still commit, and on a connection pool *after* the retry's write for
+  the same sequence number, so that a later resend of that number would
+  deliver the message whose send resolved `false`. The engine therefore
+  refuses the next write of that number until the timed-out one has settled:
+  those sends resolve `false` too, with a `'storeError'` (not poisoned) saying
+  why, heartbeats included, so a session whose late write never settles is
+  eventually dropped by the peer. The settlement is reported too (its message
+  ends in `(late)`), and the next send then goes through and overwrites
+  whatever the late write left. Keeping one session's writes in call order
+  (a per-session queue in front of the adapter, or one connection per
+  session) is still good practice: it also orders a late write before a later
+  `reset()` or `close()`. Settle a Promise only once the database is done with
+  the statement (a server-side `statement_timeout`, not a client-side query
+  timeout that rejects while the statement still commits): the engine trusts
+  the settlement.
 - **`false` is not always *not sent*.** It is when the `'storeError'` method
-  is `setMessage` and the write did not land late (above). When it is
+  is `setMessage`: a late write of it is overwritten by the next send of that
+  number before any resend can serve it (unless the application moves the
+  sender number past it with `setNextSenderMsgSeqNum()`). When it is
   `setSeqNums`, the message was already stored (with `PersistMessages=N`
   nothing is stored or resent): if the failed write committed anyway, the
   reload finds the number past it, and the peer's ResendRequest for that gap
@@ -852,7 +860,8 @@ the session log.
 **`stop()`.** `stop(true)` fails every pending store call first, so a stalled
 adapter cannot hold it up. A graceful `stop()` lets in-flight writes complete
 (each bounded by the timeout, at most one per session) before the engine logs
-its sessions out; if the Logout itself cannot be persisted, QuickFIX's own 10 s
+its sessions out; if the Logout itself cannot be persisted (nor can it while a
+timed-out `setMessage` of its number is unsettled), QuickFIX's own 10 s
 logout grace applies on top. The Logouts are written one session after another
 on the engine's single network thread, so with a stalled adapter their
 timeouts add up across sessions (a field trial measured 15.3 s for two

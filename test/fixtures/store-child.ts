@@ -77,9 +77,10 @@ const t0 = Date.now();
 
 if (mode === 'graceful-stop-hang' || mode === 'graceful-stop-dead') {
   // A store call that never settles must not stall a graceful stop() beyond
-  // the per-call timeout, nor keep the process alive afterwards. 'dead':
-  // EVERY call hangs, so the Logout the stop sends cannot be persisted
-  // either and QuickFIX's own 10 s logout grace is what bounds the stop.
+  // the per-call timeout plus QuickFIX's own 10 s logout grace, nor keep the
+  // process alive afterwards. The Logout the stop sends cannot be persisted:
+  // 'dead': EVERY call hangs; 'hang': only the first, but the Logout takes its
+  // seqnum, refused while the hung setMessage is unsettled.
   const { acc, ini, store } = await loggedOnPair();
   let hung = 0;
   store.set('setMessage', 'hang', () => mode === 'graceful-stop-dead' || hung++ === 0);
