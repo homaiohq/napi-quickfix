@@ -117,7 +117,10 @@
 // Lock order (ARCHITECTURE §5): SS -> {LOOP, C} where C is the store's cache
 // mutex, a leaf never held across a JS call; SS -> R (Session::s_mutex, leaf)
 // for the session-log event; never LOOP -> SS outside construction/
-// destruction.
+// destruction. Initiator::m_mutex (IM) -> SS -> LOOP too: the initiator's
+// connect path holds IM across Session::setResponder() (refresh(),
+// getCreationTime(), reset()), so never LOOP -> IM either (the engine-level
+// isLoggedOn() reads the session flags instead, see initiator_wrap.cpp).
 #ifndef NAPI_QUICKFIX_JS_MESSAGE_STORE_H
 #define NAPI_QUICKFIX_JS_MESSAGE_STORE_H
 

@@ -73,7 +73,11 @@ Bundles **QuickFIX v1.16.0** (statically linked, with two upstream fixes carried
   synchronously (`TypeError`/`RangeError`); `SessionNotFound` is now a rejection, which
   a `'logout'` listener fired by `stop()` can see if the write lands after the engine
   was destroyed. The getters, state queries and option getters/setters stay
-  synchronous.
+  synchronous. So does `Initiator.isLoggedOn()` with no argument, which now reads each
+  session's state instead of taking the engine mutex that QuickFIX holds while a
+  connecting session reads the store (`RefreshOnLogon=Y`, a connect outside the session
+  period): with the adapter, polling it froze the event loop for `storeTimeoutMs` (for
+  good with `0`) on each reconnect and left the session's store poisoned.
 
 ### Fixed
 

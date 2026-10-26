@@ -473,11 +473,14 @@ Napi::Value AcceptorWrap::Stop(const Napi::CallbackInfo& info) {
 }
 
 // isLoggedOn(sessionID?): with no argument, true if ANY session of this engine
-// is logged on (FIX::Initiator/Acceptor::isLoggedOn); with a SessionID, true
-// only if THAT session belongs to this engine and is logged on. Always false
-// before start() and once stop() has settled; while a graceful stop() is in
-// progress it still reports the live state (the engine is only destroyed when
-// the stop() promise settles).
+// is logged on (FIX::Acceptor::isLoggedOn); with a SessionID, true only if
+// THAT session belongs to this engine and is logged on. Always false before
+// start() and once stop() has settled; while a graceful stop() is in progress
+// it still reports the live state (the engine is only destroyed when the
+// stop() promise settles). Unlike FIX::Initiator's (see InitiatorWrap::
+// IsLoggedOn), FIX::Acceptor::isLoggedOn() takes no lock: it reads every
+// session's FIX::Session::isLoggedOn() flags, and FIX::Acceptor has no engine
+// mutex that a thread parked on the JS loop could hold.
 Napi::Value AcceptorWrap::IsLoggedOn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   const bool hasId = info.Length() >= 1 && !info[0].IsUndefined();

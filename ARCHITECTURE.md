@@ -320,8 +320,8 @@ flowchart TD
   RES --> CALL
 ```
 
-Synchronous, non-blocking members stay sync: `isLoggedOn()`, `getSessions()`, `getSession()`, `ref()`, `unref()`,
-and the entire pure layer (`Message`, `SessionID`, `SessionSettings`, `DataDictionary`). On GC and on environment
+Synchronous, non-blocking members stay sync: `isLoggedOn()` (it reads the sessions' flags, never the engine mutex;
+see "Lock order" below), `getSessions()`, `getSession()`, `ref()`, `unref()`, and the entire pure layer (`Message`, `SessionID`, `SessionSettings`, `DataDictionary`). On GC and on environment
 teardown (the loop drained, a Worker ending), a cleanup hook deactivates the bridge and force-stops the engine
 **before** the TSFN is torn down, so a live session never crashes on shutdown.
 
@@ -486,10 +486,19 @@ The locks and the two scheduling resources that behave like locks, with the orde
 | `C` | `JsMessageStore`'s cache mutex (a leaf, never held across a JS call) |
 
 ```
-E → R ;  POOL → G → S → SS → {LOOP, C} ;  SS → LOOP ;  SS → R (session-log event) ;
-never LOOP → SS outside engine construction/destruction ;  never C → anything ;
-an adapter's hot path → never POOL
+E → R ;  E → SS → LOOP (initiator connect path) ;  POOL → G → S → SS → {LOOP, C} ;  SS → LOOP ;
+SS → R (session-log event) ;  never LOOP → SS outside engine construction/destruction ;
+never LOOP → E ;  never C → anything ;  an adapter's hot path → never POOL
 ```
+
+`E → SS` is the initiator's: `Initiator::connect()` holds `Initiator::m_mutex` across `doConnect()` → the
+`SocketConnection` constructor → `getSession(id, responder)` → `Session::setResponder()`, whose `refresh()`
+(`RefreshOnLogon=Y`), `getCreationTime()` and, outside the session period, `reset()` are store calls. So the JS
+thread never takes `E`: the no-argument `engine.isLoggedOn()` reads each session's `FIX::Session::isLoggedOn()`
+flags (no lock) instead of calling `FIX::Initiator::isLoggedOn()`, which locks `E`; calling it was a loop freeze of
+one `storeTimeoutMs` per reconnect attempt (`test/store-lock-order.test.ts`). `FIX::Acceptor` has no engine mutex.
+The JS thread takes `E` only in the engine constructor (no network thread yet) and in `Teardown()`'s `stop(force)`,
+after both bridges were deactivated (nothing waits on `LOOP` any more).
 
 `SS` is held by "a QuickFIX or libuv thread": the engine's network thread, a `sendToTarget` worker running
 `Session::sendRaw`, a `SessionOpWorker`, or the stop worker (`Initiator::stop()` → `logout()`). With a JS store each

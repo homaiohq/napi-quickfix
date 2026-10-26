@@ -516,11 +516,21 @@ Napi::Value InitiatorWrap::Stop(const Napi::CallbackInfo& info) {
 }
 
 // isLoggedOn(sessionID?): with no argument, true if ANY session of this engine
-// is logged on (FIX::Initiator/Acceptor::isLoggedOn); with a SessionID, true
-// only if THAT session belongs to this engine and is logged on. Always false
-// before start() and once stop() has settled; while a graceful stop() is in
-// progress it still reports the live state (the engine is only destroyed when
-// the stop() promise settles).
+// is logged on; with a SessionID, true only if THAT session belongs to this
+// engine and is logged on. Always false before start() and once stop() has
+// settled; while a graceful stop() is in progress it still reports the live
+// state (the engine is only destroyed when the stop() promise settles).
+//
+// Both forms read FIX::Session::isLoggedOn() (plain flags, no lock), and the
+// no-argument form does NOT call FIX::Initiator::isLoggedOn(), which takes
+// Initiator::m_mutex: the network thread holds that mutex in
+// Initiator::connect() across SocketConnection's getSession() ->
+// Session::setResponder(), whose refresh() / getCreationTime() / reset() wait
+// on the JS event loop with a JS message store. Taking it here would close
+// LOOP -> Initiator::m_mutex -> LOOP: the loop frozen until the store call
+// times out (for good with storeTimeoutMs: 0), the session left poisoned.
+// getSession() is an unlocked lookup in a map only the constructor and the
+// destructor write, both on this thread.
 Napi::Value InitiatorWrap::IsLoggedOn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   const bool hasId = info.Length() >= 1 && !info[0].IsUndefined();
@@ -532,7 +542,13 @@ Napi::Value InitiatorWrap::IsLoggedOn(const Napi::CallbackInfo& info) {
   }
   NQ_TRY(env) {
     if (id == nullptr) {
-      return Napi::Boolean::New(env, initiator_->isLoggedOn());
+      for (const FIX::SessionID& sid : sessionIDs_) {
+        FIX::Session* session = initiator_->getSession(sid);
+        if (session != nullptr && session->isLoggedOn()) {
+          return Napi::Boolean::New(env, true);
+        }
+      }
+      return Napi::Boolean::New(env, false);
     }
     FIX::Session* session = initiator_->getSession(id->SessionID());
     return Napi::Boolean::New(env,
