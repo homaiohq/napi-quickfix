@@ -41,7 +41,12 @@ Bundles **QuickFIX v1.16.0** (statically linked, with two upstream fixes carried
   `storeTimeoutMs` also bounds the calls `create()`/`stop()` await (preload,
   constructor-time `reset()`, `close()`).
   `stop(true)` fails pending store calls first; a graceful `stop()` lets them complete
-  and calls `close()` per session before settling. Sequence numbers above 2^53-1
+  and calls `close()` per session before settling. A write a stopped engine gave up on
+  (timed out, or failed by `stop()`) is tracked until it settles: the session's next
+  `create()` in the process waits for it (bounded by `storeTimeoutMs`, then rejects
+  with `IOException`) instead of loading a row it could still overwrite, `close()` runs
+  only after the engine's own pending writes, and each one that settles after `stop()`
+  is reported as a late, non-poisoning `'storeError'`. Sequence numbers above 2^53-1
   (`Number.MAX_SAFE_INTEGER`) are refused in both directions: a `load()` result above it
   fails, and a write of one (a counterparty's `SequenceReset` can ask for it) is reported
   as a non-poisoning `'storeError'` and disconnects the session instead of persisting a

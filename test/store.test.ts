@@ -27,7 +27,7 @@ import {
   type QuickFixError,
 } from '../dist/esm/index.js';
 import { acceptorCfg, initiatorCfg, freePort, waitForEvent, waitUntil } from './helpers.js';
-import { ControlledStore, RecordingMapStore, utcClock, withSettings } from './store-adapters.js';
+import { ControlledStore, RecordingMapStore, fifo, utcClock, withSettings } from './store-adapters.js';
 
 // The JS message store (MessageStoreAdapter) through the loopback harness:
 // an Acceptor and an Initiator over localhost, one or both persisting through
@@ -367,6 +367,18 @@ HeartBtInt=30
       );
       assert.ok(Date.now() - t0 < 5_000, `${method}: bounded by the timeout`);
       assert.equal(doesSessionExist(INI_ID), false, `${method}: no session was created`);
+      if (method === 'create') {
+        // The hung create() may still write: the session's next create()
+        // waits for it (a hung read is not waited for), then rejects.
+        await assert.rejects(
+          () => Initiator.create({ settings: SessionSettings.fromString(initiatorCfg(port)), store: new ControlledStore(), storeTimeoutMs: 300, log: 'none' }),
+          (err: unknown) =>
+            isIOException(err) &&
+            (err as Error).message ===
+              `message store create: ${INI_ID.toString()}: a create() from an earlier engine of this session is still pending after 300 ms; not loading the session while it may still write`,
+        );
+      }
+      store.release();
     }
 
     // The constructor-time reset() (a session constructed outside its
@@ -385,6 +397,7 @@ HeartBtInt=30
         }),
       timedOut('reset'),
     );
+    hangReset.release();
     assert.equal(doesSessionExist(ACC_ID), false, 'the engine was torn down');
 
     // A hanging close(): stop() still settles, and reports it.
@@ -640,7 +653,7 @@ describe('MessageStoreAdapter: failure policy', () => {
   test('a never-settling store call: stop(true) returns at once and the parked send settles', { timeout: 30_000 }, async () => {
     const port = await freePort();
     const iniStore = new ControlledStore(undefined, 1);
-    const { acc, ini } = await makePair(port, { iniStore, storeTimeoutMs: 20_000 });
+    const { acc, ini, storeErrors } = await makePair(port, { iniStore, storeTimeoutMs: 20_000 });
     try {
       await logonBoth(acc, ini);
       iniStore.set('setMessage', 'hang');
@@ -656,7 +669,17 @@ describe('MessageStoreAdapter: failure policy', () => {
       assert.ok(Date.now() - t0 < 5000, 'stop(true) did not wait for the timeout');
       const outcome = await Promise.race([parked, sleep(3000).then(() => 'still-pending')]);
       assert.ok(outcome === 'resolved:false' || outcome.startsWith('rejected:'), outcome);
+      // close() is not run under the abandoned write; it runs once that
+      // settled, which the stopped engine reports.
+      assert.deepEqual(iniStore.closed, [], 'close() waits for the abandoned setMessage');
+      iniStore.release();
+      assert.ok(await waitUntil(() => iniStore.closed.length === 1, T), 'close() ran once it settled');
+      assert.deepEqual(
+        storeErrors.filter((e) => e.message.includes('abandoned')),
+        [{ method: 'setMessage', message: 'message store setMessage: abandoned at teardown; rejected after stop: hung setMessage released (late)', poisoned: false }],
+      );
     } finally {
+      iniStore.release();
       await stopBoth(acc, ini, true);
     }
   });
@@ -1308,6 +1331,219 @@ describe('MessageStoreAdapter: failure policy', () => {
       assert.ok(await waitUntil(() => !session!.isLoggedOn(), T));
     } finally {
       await stopBoth(acc, ini, true);
+    }
+  });
+});
+
+// A call an engine gave up on (timed out, or aborted by stop()) may still
+// commit after the engine is gone. With a fresh adapter instance per engine
+// over the same database -- the common `create({ store: new Store(pool) })`
+// pattern -- even a per-session FIFO adapter cannot order it before the next
+// engine's preload, so the binding does: create() waits for the session's
+// stragglers (bounded by storeTimeoutMs), and the stopped engine reports
+// each one as it settles.
+describe('MessageStoreAdapter: calls a stopped engine abandoned', () => {
+  const crossCfg = { ResetOnLogon: 'N', HeartBtInt: '60', LogonTimeout: '2', ReconnectInterval: '1' };
+
+  /** A memory-store acceptor recording the orders and the Logout texts it sends. */
+  async function counterparty(port: number) {
+    const received: Received[] = [];
+    const logoutTexts: string[] = [];
+    const acc = await Acceptor.create({
+      settings: SessionSettings.fromString(withSettings(acceptorCfg(port), { ResetOnLogon: 'N' })),
+      store: 'memory',
+      log: 'none',
+      handlers: {
+        fromApp(msg: Message) {
+          received.push({
+            seq: Number(msg.getHeaderField(FIELD.MsgSeqNum)),
+            possDup: safeHeader(msg, FIELD.PossDupFlag),
+            clOrdID: msg.getFieldIfSet(FIELD.ClOrdID) ?? '',
+            text: '',
+          });
+        },
+        toAdmin(msg: Message) {
+          if (safeHeader(msg, FIELD.MsgType) === MsgType.Logout) logoutTexts.push(msg.getFieldIfSet(FIELD.Text) ?? '');
+        },
+      },
+    });
+    await acc.start();
+    return { acc, received, logoutTexts };
+  }
+
+  /** An initiator over its own FIFO adapter instance on the shared `backing` store. */
+  function initiator(port: number, backing: MapMessageStore, storeTimeoutMs: number) {
+    const store = new ControlledStore(backing);
+    const created = Initiator.create({
+      settings: SessionSettings.fromString(withSettings(initiatorCfg(port), crossCfg)),
+      store: fifo(store),
+      storeTimeoutMs,
+      log: 'none',
+    });
+    return { store, created };
+  }
+
+  /** `p`'s state after `ms`: still pending, or how it settled. */
+  async function stateAfter(p: Promise<unknown>, ms: number): Promise<string> {
+    return Promise.race([
+      p.then(
+        () => 'resolved',
+        () => 'rejected',
+      ),
+      sleep(ms).then(() => 'pending'),
+    ]);
+  }
+
+  for (const force of [true, false]) {
+    test(`a setSeqNums abandoned by ${force ? 'stop(true)' : 'a graceful stop()'} lands before the next engine loads: the restart is not "MsgSeqNum too low"`, { timeout: 60_000 }, async () => {
+      const port = await freePort();
+      const { acc, received, logoutTexts } = await counterparty(port);
+      const backing = new MapMessageStore();
+      const engines: Engine[] = [];
+      try {
+        // Engine 1: the incr of p1 times out (the store is poisoned) and is
+        // still running in the adapter when the engine stops.
+        const e1 = initiator(port, backing, 300);
+        const ini1 = await e1.created;
+        engines.push(ini1);
+        const errors1: StoreErrorSeen[] = [];
+        ini1.on('storeError', (_id, method, err, poisoned) => errors1.push({ method, message: err.message, poisoned }));
+        await logonBoth(acc, ini1);
+        const s0 = ini1.getSession(INI_ID)!.getExpectedSenderNum();
+        e1.store.set('setSeqNums', 'defer', (args) => args[1] === s0 + 1);
+        assert.equal(await sendToTarget(newOrder('p1'), INI_ID), false, 'the incr timed out');
+        assert.ok(await waitUntil(() => e1.store.parked.length === 1, T));
+        const p1 = e1.store.parked.shift()!;
+        await ini1.stop(force);
+        assert.ok(await waitUntil(() => !acc.isLoggedOn(), T));
+
+        // Engine 2, a new adapter instance on the same rows. Engine 1's write
+        // lands as late as the binding lets it: during create() if create()
+        // waits for it, else once engine 2 has logged on and sent.
+        const e2 = initiator(port, backing, 5_000);
+        e2.created.then((e) => engines.push(e), () => {});
+        const waited = await stateAfter(e2.created, 400);
+        const loadsWhileWaiting = e2.store.count('load');
+        if (waited === 'pending') p1.resolve();
+        const ini2 = await e2.created;
+        const loaded = ini2.getSession(INI_ID)!.getExpectedSenderNum();
+        await logonBoth(acc, ini2);
+        for (const tag of ['a', 'b', 'c']) assert.equal(await sendToTarget(newOrder(tag), INI_ID), true, `send ${tag}`);
+        assert.ok(await waitUntil(() => ['a', 'b', 'c'].every((t) => received.some((r) => r.clOrdID === t)), T));
+        if (waited !== 'pending') {
+          p1.resolve();
+          assert.ok(await waitUntil(() => e1.store.inflight === 0, T));
+        }
+        const next = ini2.getSession(INI_ID)!.getExpectedSenderNum();
+        const row = backing.rows.get(INI_ID.toString())!.state.nextSenderMsgSeqNum;
+
+        // Engine 3 restarts from the row after engine 2 crashed (stop(true)).
+        await ini2.stop(true);
+        assert.ok(await waitUntil(() => !acc.isLoggedOn(), T));
+        const texts0 = logoutTexts.length;
+        const ini3 = await initiator(port, backing, 300).created;
+        engines.push(ini3);
+        let loggedOn = false;
+        ini3.once('logon', () => (loggedOn = true));
+        await ini3.start();
+        assert.ok(await waitUntil(() => loggedOn || logoutTexts.length > texts0, T));
+        const text = logoutTexts.slice(texts0).join(' | ');
+        assert.doesNotMatch(text, /too low/i);
+        assert.equal(loggedOn, true, `engine 3 logged on (acceptor Logout: ${text})`);
+        assert.equal(row, next, 'the row did not regress under engine 2');
+
+        assert.equal(waited, 'pending', "create() waited for the previous engine's abandoned setSeqNums");
+        assert.equal(loadsWhileWaiting, 0, 'nothing was loaded meanwhile');
+        assert.equal(loaded, s0 + 1, 'loaded after the late write landed');
+        // Engine 1's emitter hears about it (late, not poisoning).
+        assert.ok(await waitUntil(() => errors1.some((e) => e.message.includes('abandoned')), T), JSON.stringify(errors1));
+        assert.deepEqual(
+          errors1.filter((e) => e.message.includes('abandoned')),
+          [{ method: 'setSeqNums', message: 'message store setSeqNums: abandoned at teardown; settled after stop (late)', poisoned: false }],
+        );
+      } finally {
+        for (const e of engines.reverse()) await e.stop(true).catch(() => {});
+        await acc.stop(true).catch(() => {});
+      }
+    });
+  }
+
+  test('a stop(true) refused while start() is in flight abandons nothing: the engine\'s writes are not reported', { timeout: 30_000 }, async () => {
+    const port = await freePort();
+    const iniStore = new ControlledStore(undefined, 1);
+    const { acc, ini, storeErrors } = await makePair(port, { iniStore });
+    try {
+      await acc.start();
+      const logon = waitForEvent(ini, 'logon', 'initiator logon', T);
+      const started = ini.start();
+      await assert.rejects(ini.stop(true), /already in progress/);
+      await started;
+      await logon;
+      assert.equal(await sendToTarget(newOrder('after'), INI_ID), true);
+      await sleep(100);
+      assert.deepEqual(storeErrors, []);
+    } finally {
+      await stopBoth(acc, ini, true);
+    }
+  });
+
+  test('a setMessage abandoned by stop(true) is no ghost order: create() rejects while it is pending, then loads once it landed', { timeout: 60_000 }, async () => {
+    const port = await freePort();
+    const { acc, received } = await counterparty(port);
+    const backing = new MapMessageStore();
+    const engines: Engine[] = [];
+    try {
+      const e1 = initiator(port, backing, 300);
+      const ini1 = await e1.created;
+      engines.push(ini1);
+      await logonBoth(acc, ini1);
+      const s0 = ini1.getSession(INI_ID)!.getExpectedSenderNum();
+      e1.store.set('setMessage', 'defer', (args) => String(args[2]).includes('\x0111=p1\x01'));
+      assert.equal(await sendToTarget(newOrder('p1'), INI_ID), false, 'the setMessage timed out: p1 was not sent');
+      assert.ok(await waitUntil(() => e1.store.parked.length === 1, T));
+      const p1 = e1.store.parked.shift()!;
+      await ini1.stop(true);
+      assert.ok(await waitUntil(() => !acc.isLoggedOn(), T));
+
+      // Still pending past storeTimeoutMs: create() rejects.
+      const early = await initiator(port, backing, 300).created.then(
+        async (e) => {
+          await e.stop(true);
+          return undefined;
+        },
+        (err: unknown) => err,
+      );
+      // As above: engine 1's write lands during create() if it waits, else
+      // once engine 2 has logged on and sent.
+      const e2 = initiator(port, backing, 5_000);
+      e2.created.then((e) => engines.push(e), () => {});
+      const waited = await stateAfter(e2.created, 400);
+      if (waited === 'pending') p1.resolve();
+      const ini2 = await e2.created;
+      const loaded = ini2.getSession(INI_ID)!.getExpectedSenderNum();
+      await logonBoth(acc, ini2);
+      assert.equal(await sendToTarget(newOrder('a'), INI_ID), true);
+      assert.ok(await waitUntil(() => received.some((r) => r.clOrdID === 'a'), T));
+      if (waited !== 'pending') {
+        p1.resolve();
+        assert.ok(await waitUntil(() => e1.store.inflight === 0, T));
+      }
+      // The peer asks for everything from s0 again: with engine 2's Logon
+      // stored at s0 (it replaced p1's row), s0 is gap-filled.
+      await acc.getSession(ACC_ID)!.setNextTargetMsgSeqNum(s0);
+      assert.equal(await sendToTarget(newOrder('trigger'), INI_ID), true);
+      assert.ok(await waitUntil(() => received.some((r) => r.clOrdID === 'trigger'), T));
+      assert.deepEqual(received.filter((r) => r.clOrdID === 'p1'), [], 'the peer never receives the order whose send failed');
+
+      assert.ok(early !== undefined, 'create() rejected while the setMessage was pending');
+      isIOException(early);
+      assert.match((early as Error).message, /^message store setMessage: /);
+      assert.ok((early as Error).message.includes(INI_ID.toString()), (early as Error).message);
+      assert.equal(waited, 'pending', "create() waited for the previous engine's abandoned setMessage");
+      assert.equal(loaded, s0);
+    } finally {
+      for (const e of engines.reverse()) await e.stop(true).catch(() => {});
+      await acc.stop(true).catch(() => {});
     }
   });
 });

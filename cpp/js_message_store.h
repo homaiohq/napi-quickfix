@@ -124,6 +124,15 @@
 //     otherwise freeze every session of the engine and make a graceful
 //     stop() (Initiator::stop() -> logout() takes SS) and process exit wait
 //     on it forever.
+//   * Teardown abandons a call, it cannot cancel it: Deactivate() wakes every
+//     waiter and marks every registered channel done, a timed-out one
+//     included, so a Promise that settles afterwards is dropped by OnSettled
+//     and the poison/unsettled_ fence ends with the engine, while the
+//     adapter's write may still commit. The fence past the engine lives in
+//     the TS binding (StoreBinding, src/store.ts), which sees every adapter
+//     Promise: it tracks each write until it settles, so the session's next
+//     create() waits for it, close() runs after it, and one that settles
+//     after stop() is reported ('storeError', late) on the stopped engine.
 //
 // Lock order (ARCHITECTURE §5): SS -> {LOOP, C} where C is the store's cache
 // mutex, a leaf never held across a JS call; SS -> R (Session::s_mutex, leaf)

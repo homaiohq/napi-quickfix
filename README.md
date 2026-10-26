@@ -876,6 +876,24 @@ the engine is stopped before the rejection). An engine dropped without
 `stop()` is torn down at process exit without calling `close()` (see
 "Process exit").
 
+A write the engine stopped waiting for (it timed out, or `stop()` failed it)
+may still be running in the adapter when the engine is gone, and commit
+later. The binding keeps track of every adapter write until its Promise
+settles, so that it cannot land under the session's next engine: `create()`
+first waits for the session's pending writes, bounded by its
+`storeTimeoutMs`, and rejects with an `IOException` naming the session and
+the method if one is still pending (it may still write; a write that never
+settles keeps the session from being created again in this process). Each
+one that settles after `stop()` is reported on the stopped engine as a
+`'storeError'` with `poisoned: false` ("abandoned at teardown; settled after
+stop (late)"). A session's `close()` waits for the engine's own pending
+writes first (bounded by the timeout; at the bound it is not called, and
+that is a `'storeError'`); after `stop(true)`, which does not wait, it runs
+once they settled, and the next `create()` waits for it too. The tracking is
+per JS realm (the main thread or one Worker) and per process: a write left
+behind by a crashed or killed process is not fenced (see the store skill's
+contract).
+
 ### Handlers vs. events
 
 This is the key distinction to understand:

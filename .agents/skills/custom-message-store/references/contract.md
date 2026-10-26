@@ -403,7 +403,11 @@ A version column cannot replace either: `setMessage` receives no generation
 to compare. Ordering is also all you need: do not add a fencing token, a
 writer id, a wall-clock or counter condition on top of the FIFO. They guard
 against two engines owning one session, which G3 already rules out
-operationally, and each adds failure modes of its own: a clock behind the
+operationally. (A stopped engine's write still in flight is ordered before the
+next engine of the session by the binding itself, within one process, even
+across adapter instances: the next `create()` waits for it, I7. A write left
+in flight by a process that died is not; no adapter-side rule here closes
+that.) Each adds failure modes of its own: a clock behind the
 previous writer's refuses every legitimate write (poison), a conditional
 `load()` becomes a write. (Observed in this skill's own evaluation runs, where
 fences were added unasked; derived.) The FIFO only orders what your Promises
@@ -1084,11 +1088,15 @@ rather than return normally (A8).
 **I7. Teardown.** `stop(true)` fails every pending store call at once;
 a graceful `stop()` lets in-flight writes complete (bounded by the timeout).
 Once the engine is deactivated the bridge refuses to START new adapter calls,
-but a Promise you already returned may still settle afterwards: make `close()`
-and your pool shutdown tolerant of a statement that is still in flight.
+but a Promise you already returned may still settle afterwards. The binding
+tracks every write Promise until it settles: a session's `close()` runs only
+once the engine's own pending writes for it settled (bounded by the timeout;
+at the bound it is skipped and reported), and the session's next `create()` in
+the process waits for them too (bounded, then it rejects). Your pool shutdown,
+which the binding does not see, must still tolerate a statement in flight.
 Sources: `[README]` "`stop()`"; `[ARCH]` §4b "Teardown"; `[store.test]` "a
 never-settling store call: stop(true) returns at once and the parked send
-settles".
+settles", "MessageStoreAdapter: calls a stopped engine abandoned".
 
 Bound your pool shutdown too: `pg`'s `Client.end()` (and so `pool.end()`)
 waits, without a limit, for the server to close the socket, so with a frozen
@@ -1180,8 +1188,10 @@ to mask the password: a changed byte fails BodyLength/CheckSum on a resend
 ## J. `close()`
 
 **J1. Optional.** When present it is called once PER SESSION after `stop()` has
-destroyed the engine's sessions, before the `stop()` Promise settles; no store
-call for that session follows. It is also called when `Initiator.create()` /
+destroyed the engine's sessions and the engine's own writes for that session
+have settled, before the `stop()` Promise settles; no store call for that
+session follows. Exception: after `stop(true)`, a session with a write still
+pending is closed once it settled, after `stop()` returned (I7). It is also called when `Initiator.create()` /
 `Acceptor.create()` rejects AFTER constructing the engine (a constructor-time
 `reset()` failed or timed out: `createEngine()` runs `stop(true)` before
 rejecting), so `close()` can run for an engine the application never received.
@@ -1199,7 +1209,8 @@ application own the pool's lifetime. (Derived from J1.)
 
 **J4. A `close()` failure is reported** as `'storeError'` (`method: 'close'`,
 `poisoned: false`) and never fails `stop()`; a `close()` that hangs delays it
-by `storeTimeoutMs` at most (`0`: indefinitely). Source: `[store.ts]`
+by `storeTimeoutMs` at most (`0`: indefinitely), on top of up to
+`storeTimeoutMs` spent waiting for the session's pending writes (I7). Source: `[store.ts]`
 `closeAll()`, `withTimeout()`.
 
 ---

@@ -62,6 +62,18 @@ export class ControlledStore implements MessageStoreAdapter {
     return this.calls.filter((c) => c === method).length;
   }
 
+  readonly #hung: Array<() => void> = [];
+
+  /**
+   * Reject every 'hang' call so far (nothing applied, `inflight` unchanged).
+   * A hung write stays pending for its session in this process, and the next
+   * create() of that session waits for it: a test that hangs one releases it
+   * before the session is created again.
+   */
+  release(): void {
+    for (const reject of this.#hung.splice(0)) reject();
+  }
+
   #run<T>(method: MessageStoreMethod, args: unknown[], fn: () => T): Promise<T> {
     this.calls.push(method);
     const mode = this.mode(method, args);
@@ -72,7 +84,9 @@ export class ControlledStore implements MessageStoreAdapter {
     };
     switch (mode) {
       case 'hang':
-        return new Promise<T>(() => {});
+        return new Promise<T>((_resolve, reject) => {
+          this.#hung.push(() => reject(new Error(`hung ${method} released`)));
+        });
       case 'defer':
         return new Promise<T>((resolve, reject) => {
           this.parked.push({
@@ -174,6 +188,35 @@ export class RecordingMapStore extends MapMessageStore {
   close(_id: SessionID): void {
     this.calls.push('close');
   }
+}
+
+/**
+ * The per-session FIFO the skill's contract (D7) requires of a compliant
+ * adapter: each call for a session starts once the previous one settled.
+ * close() goes through it too, so it drains the in-flight writes first. The
+ * ordering is per wrapper instance: two instances over the same backing
+ * store (one per engine) do not order each other's calls.
+ */
+export function fifo(a: MessageStoreAdapter): MessageStoreAdapter {
+  const chains = new Map<string, Promise<unknown>>();
+  const run = <T>(id: SessionID, fn: () => T | Promise<T>): Promise<T> => {
+    const k = id.toString();
+    const p = (chains.get(k) ?? Promise.resolve()).then(fn, fn) as Promise<T>;
+    chains.set(
+      k,
+      p.catch(() => {}),
+    );
+    return p;
+  };
+  return {
+    load: (id) => run(id, () => a.load(id)),
+    create: (id, s) => run(id, () => a.create(id, s)),
+    setSeqNums: (id, s, t) => run(id, () => a.setSeqNums(id, s, t)),
+    setMessage: (id, n, m) => run(id, () => a.setMessage(id, n, m)),
+    getMessages: (id, b, e) => run(id, () => a.getMessages(id, b, e)),
+    reset: (id, s) => run(id, () => a.reset(id, s)),
+    close: (id) => run(id, () => a.close?.(id)),
+  };
 }
 
 /**

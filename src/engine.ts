@@ -59,7 +59,9 @@ export interface CreateEngineOptions extends Omit<EngineOptions, 'store'> {
    * With an adapter: how long one adapter call may take before it is failed
    * with `IOException`, in milliseconds: every call an engine thread waits
    * on, and the ones `create()` and `stop()` await (`load()`/`create()` at
-   * preload, a constructor-time `reset()`, `close()`). Default `30_000`;
+   * preload, a constructor-time `reset()`, `close()`), and, before the
+   * preload, `create()`'s wait for the writes an earlier engine of one of its
+   * sessions left pending (it rejects with `IOException` past it). Default `30_000`;
    * `0` disables the timeout, accepting that a stalled adapter then stalls
    * every session of the engine, a graceful `stop()` and process exit with
    * it. See the README for the trade-off. Passing it with `'file'`/`'memory'`
@@ -299,7 +301,12 @@ export abstract class Engine extends EventEmitter {
    * `storeTimeoutMs`, one per session at most) and calls the adapter's
    * `close()` for every session before settling (each bounded by
    * `storeTimeoutMs` too; a failure or timeout is a `'storeError'`, never a
-   * rejection); `stop(true)` fails every pending store call first.
+   * rejection); `stop(true)` fails every pending store call first. A write
+   * the engine gave up on may still be running in the adapter: a session's
+   * `close()` waits for it (bounded by `storeTimeoutMs`; after `stop(true)`
+   * it runs once the write settled, past the settlement of `stop()`), the
+   * session's next `create()` waits for it too, and its settlement is
+   * reported as a late `'storeError'` (README: "Message store", `stop()`).
    *
    * @param force When `true`, aborts immediately instead of draining gracefully.
    *
@@ -310,14 +317,29 @@ export abstract class Engine extends EventEmitter {
    */
   stop(force?: boolean): Promise<void> {
     if (this.#stopping) return this.#stopping;
-    const stopping = this.#native.stop(force).then(async () => {
+    const native = this.#native.stop(force);
+    // stop(true) has just failed every pending store call (the native side
+    // deactivated its store bridge synchronously): whatever the adapter still
+    // runs is abandoned from here on. A graceful stop keeps the store serving
+    // until the engine is destroyed, i.e. until `native` settles. A refused
+    // stop(true) (a start() in flight) leaves the engine running with its
+    // store serving: attach again, or every write it completes would be
+    // reported as abandoned. (A stop() that threw part-way also lands there,
+    // its store aborted: a write it abandoned then settles unreported, the
+    // lesser harm.)
+    if (force && this.#store) {
+      this.#store.detach();
+      native.catch(() => this.#store?.detach(false));
+    }
+    const stopping = native.then(async () => {
       // The engine is destroyed: no store call can follow. Let the adapter
       // release what it holds per session, once (a stop() joining this one
       // -- from the 'logout' listener it fired, say -- shares this promise;
       // a stop() after settlement is a no-op that must not close() again).
       if (this.#store && !this.#closed) {
         this.#closed = true;
-        await this.#store.closeAll(this.getSessions());
+        this.#store.detach();
+        await this.#store.closeAll(this.getSessions(), force === true);
       }
     });
     this.#stopping = stopping;
