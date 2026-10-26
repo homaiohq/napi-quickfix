@@ -29,6 +29,9 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
   [README "Message store"](./README.md#message-store).
 - `SessionSettings.getSessions(connectionType?)`: only the sessions an engine of that
   type would create.
+- `scripts/tsan.sh` and a ThreadSanitizer CI job over the suite, failing on a race in
+  this addon's code or a QuickFIX race not known to be upstream's
+  (`scripts/tsan-gate.py`), and refusing a build the sanitizer did not instrument.
 
 ### Changed
 

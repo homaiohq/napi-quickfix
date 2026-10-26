@@ -30,5 +30,8 @@ Makefile
 *.log
 .DS_Store
 
+# ThreadSanitizer build (scripts/tsan.sh)
+build-tsan/
+
 # Claude Code worktrees
 /.claude/worktrees/
