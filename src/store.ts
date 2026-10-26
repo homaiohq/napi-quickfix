@@ -118,6 +118,16 @@ export class MapMessageStore implements MessageStoreAdapter {
   getMessages(id: SessionID, begin: number, end: number): string[] {
     const messages = this.#row(id).messages;
     const out: string[] = [];
+    // Walk the range, not the whole map: a resend asks for a few seqnums out
+    // of every message ever stored. A range wider than the map (a caller's
+    // open-ended end) falls back to sorting what is there.
+    if (end - begin < messages.size) {
+      for (let seq = begin; seq <= end; seq++) {
+        const msg = messages.get(seq);
+        if (msg !== undefined) out.push(msg);
+      }
+      return out;
+    }
     for (const seq of [...messages.keys()].sort((a, b) => a - b)) {
       if (seq >= begin && seq <= end) out.push(messages.get(seq)!);
     }

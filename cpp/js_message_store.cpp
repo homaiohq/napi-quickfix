@@ -118,7 +118,6 @@ const char* JsMessageStoreFactory::MethodName(Method m) {
     case Method::kSetMessage: return "setMessage";
     case Method::kGetMessages: return "getMessages";
     case Method::kReset: return "reset";
-    case Method::kClose: return "close";
   }
   return "";
 }
@@ -219,7 +218,7 @@ int JsMessageStoreFactory::ReadTimeout(Napi::Env env, Napi::Value v) {
   constexpr double kMaxInt = 2147483647.0;
   if (!std::isfinite(d) || std::floor(d) != d || d < 0 || d > kMaxInt) {
     throw Napi::RangeError::New(
-        env, "storeTimeoutMs must be a non-negative integer (0 disables the timeout)");
+        env, "storeTimeoutMs must be an integer from 0 to 2147483647 (0 disables the timeout)");
   }
   return static_cast<int>(d);
 }
@@ -503,7 +502,6 @@ JsMessageStoreFactory::Outcome JsMessageStoreFactory::Invoke(
     args.push_back(SessionIDWrap::NewInstance(env, req.id));
     switch (method) {
       case Method::kLoad:
-      case Method::kClose:
         break;
       case Method::kCreate:
       case Method::kReset:

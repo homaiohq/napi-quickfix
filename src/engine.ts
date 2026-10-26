@@ -234,8 +234,13 @@ export abstract class Engine extends EventEmitter {
     if (!isMessageStoreAdapter(store)) {
       throw new TypeError("store must be 'file', 'memory' or a MessageStoreAdapter");
     }
-    if (storeTimeoutMs !== undefined && (!Number.isInteger(storeTimeoutMs) || storeTimeoutMs < 0)) {
-      throw new RangeError('storeTimeoutMs must be a non-negative integer (0 disables the timeout)');
+    // Capped like the native check: above 2^31-1 a timer fires after 1 ms
+    // (TimeoutOverflowWarning), failing every preload call as "timed out".
+    if (
+      storeTimeoutMs !== undefined &&
+      (!Number.isInteger(storeTimeoutMs) || storeTimeoutMs < 0 || storeTimeoutMs > 2_147_483_647)
+    ) {
+      throw new RangeError('storeTimeoutMs must be an integer from 0 to 2147483647 (0 disables the timeout)');
     }
     const timeoutMs = storeTimeoutMs ?? 30_000;
     const ids = options.settings.getSessions(connectionType);

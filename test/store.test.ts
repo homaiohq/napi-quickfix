@@ -151,6 +151,20 @@ async function runChild(mode: string, timeoutMs: number) {
   return { result: JSON.parse(line.slice('result '.length)) as Record<string, unknown>, ms: Date.now() - t0 };
 }
 
+describe('MapMessageStore', () => {
+  test('getMessages returns the stored messages of the range in order, skipping gaps, however wide the range', () => {
+    const store = new MapMessageStore();
+    store.create(INI_ID, { creationTime: new Date(), nextSenderMsgSeqNum: 1, nextTargetMsgSeqNum: 1 });
+    for (const seq of [5, 1, 3, 2]) store.setMessage(INI_ID, seq, `m${seq}`);
+    assert.deepEqual(store.getMessages(INI_ID, 2, 3), ['m2', 'm3']); // narrower than the map
+    assert.deepEqual(store.getMessages(INI_ID, 2, 4), ['m2', 'm3']);
+    assert.deepEqual(store.getMessages(INI_ID, 1, 5), ['m1', 'm2', 'm3', 'm5']); // as wide as the map
+    assert.deepEqual(store.getMessages(INI_ID, 0, 1e9), ['m1', 'm2', 'm3', 'm5']);
+    assert.deepEqual(store.getMessages(INI_ID, 6, 9), []);
+    assert.deepEqual(store.getMessages(INI_ID, 3, 2), []);
+  });
+});
+
 describe('MessageStoreAdapter: construction', () => {
   test('new Initiator({ store: adapter }) is a TypeError pointing at create(); create() accepts the built-ins too', async () => {
     const port = await freePort();
@@ -161,10 +175,13 @@ describe('MessageStoreAdapter: construction', () => {
     });
     assert.throws(() => new Acceptor({ settings, store: {} as unknown as 'memory', log: 'none' }), TypeError);
     await assert.rejects(() => Initiator.create({ settings, store: 'memory', storeTimeoutMs: 1, log: 'none' }), TypeError);
-    await assert.rejects(
-      () => Initiator.create({ settings, store: new MapMessageStore(), storeTimeoutMs: -1, log: 'none' }),
-      RangeError,
-    );
+    for (const storeTimeoutMs of [-1, 1.5, 2_147_483_648]) {
+      await assert.rejects(
+        () => Initiator.create({ settings, store: new MapMessageStore(), storeTimeoutMs, log: 'none' }),
+        RangeError,
+        `storeTimeoutMs ${storeTimeoutMs}`,
+      );
+    }
     const ini = await Initiator.create({ settings, store: 'memory', log: 'none' });
     assert.ok(ini instanceof Initiator);
     assert.ok(ini.getSession(INI_ID));

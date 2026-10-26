@@ -149,7 +149,7 @@ class JsMessageStoreFactory : public FIX::MessageStoreFactory {
     FIX::SEQNUM nextTarget = 1;
   };
 
-  enum class Method { kLoad, kCreate, kSetSeqNums, kSetMessage, kGetMessages, kReset, kClose };
+  enum class Method { kLoad, kCreate, kSetSeqNums, kSetMessage, kGetMessages, kReset };
   static const char* MethodName(Method m);
 
   struct Request {
@@ -232,7 +232,7 @@ class JsMessageStoreFactory : public FIX::MessageStoreFactory {
   // Engine constructor options (JS thread): `storeStates`, an array of
   // { sessionID, creationTime, nextSenderMsgSeqNum, nextTargetMsgSeqNum }
   // the TS layer preloaded, and `storeTimeoutMs` (undefined -> 30000;
-  // otherwise a non-negative integer, 0 = no timeout). Throw TypeError /
+  // otherwise an integer from 0 to 2^31-1, 0 = no timeout). Throw TypeError /
   // RangeError on a malformed value.
   static std::map<FIX::SessionID, State> ReadSeeds(Napi::Env env, Napi::Value v);
   static int ReadTimeout(Napi::Env env, Napi::Value v);
