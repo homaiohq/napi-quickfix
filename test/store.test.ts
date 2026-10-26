@@ -893,7 +893,8 @@ describe('MessageStoreAdapter: failure policy', () => {
   test('setMessage timeout: not fatal; the late settlement is discarded', { timeout: 30_000 }, async () => {
     const port = await freePort();
     const iniStore = new ControlledStore();
-    const { acc, ini, received, storeErrors } = await makePair(port, { iniStore, storeTimeoutMs: 300 });
+    // HeartBtInt=60: no heartbeat can take `before` or hit the deferred setMessage.
+    const { acc, ini, received, storeErrors } = await makePair(port, { iniStore, ini: { HeartBtInt: '60' }, storeTimeoutMs: 300 });
     try {
       await logonBoth(acc, ini);
       const session = ini.getSession(INI_ID)!;
@@ -1064,7 +1065,8 @@ describe('MessageStoreAdapter: failure policy', () => {
       rejected = true;
       return true;
     });
-    const { acc, ini, received, storeErrors } = await makePair(port, { iniStore });
+    // HeartBtInt=60: no heartbeat, out or in, can take a seqnum or arrive poisoned.
+    const { acc, ini, received, storeErrors } = await makePair(port, { iniStore, ini: { HeartBtInt: '60' } });
     let logouts = 0;
     ini.on('logout', () => logouts++);
     acc.on('logout', () => logouts++);
