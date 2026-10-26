@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "errors.h"
+#include "js_message_store.h"
 #include "quickfix/Exceptions.h"
 #include "quickfix/FieldTypes.h"
 #include "session_id_wrap.h"
@@ -246,7 +247,10 @@ Napi::Value SessionWrap::TimeCheck(const Napi::CallbackInfo& info,
 // incrNextTargetMsgSeqNum. A setter landing inside that window -- from a
 // handler, or while a sendToTarget() / heartbeat is in flight on this
 // session -- is overwritten by the increment that follows, and the wire is
-// left one off from the peer. The setters are meant for a quiescent session
+// left one off from the peer. With a JS message store and PersistMessages=Y,
+// a sender number set after fill() stamped the header but before persist()
+// wrote the message makes that send fail instead (JsMessageStore::CheckStamp
+// refuses it: nothing is sent, and the new number stands). The setters are meant for a quiescent session
 // (before start(), from a 'logout' event, or when the caller knows nothing is
 // in flight); documented on the JS API, not fixable here (m_mutex is
 // private).
@@ -305,11 +309,34 @@ Napi::Value SessionWrap::IsLogonTime(const Napi::CallbackInfo& info) {
 
 // --- sequence numbers --------------------------------------------------------
 
+// With a file/memory store: FIX::Session::getExpected* -> SessionState::
+// getNext* under SessionState::m_mutex, which no thread holds across a wait
+// on the JS loop in that configuration. With a JS store that mutex IS held
+// across such waits (by whichever QuickFIX or libuv thread is in a store
+// call), so the handle bypasses FIX::Session and reads the JsMessageStore
+// cache under the store's own leaf mutex instead; IOException (as a
+// QuickFixError) when the store is poisoned. Both branches run on the JS
+// thread, where stores are created and destroyed, so the store found is
+// alive for the duration of the call.
 Napi::Value SessionWrap::GetExpectedSenderNum(const Napi::CallbackInfo& info) {
-  return IntGet(info, &FIX::Session::getExpectedSenderNum);
+  Napi::Env env = info.Env();
+  NQ_TRY(env) {
+    FIX::Session& session = Resolve();
+    if (JsMessageStore* store = JsMessageStoreFactory::Lookup(id_)) {
+      return Napi::Number::New(env, static_cast<double>(store->CachedNextSender()));
+    }
+    return Napi::Number::New(env, static_cast<double>(session.getExpectedSenderNum()));
+  } NQ_CATCH(env)
 }
 Napi::Value SessionWrap::GetExpectedTargetNum(const Napi::CallbackInfo& info) {
-  return IntGet(info, &FIX::Session::getExpectedTargetNum);
+  Napi::Env env = info.Env();
+  NQ_TRY(env) {
+    FIX::Session& session = Resolve();
+    if (JsMessageStore* store = JsMessageStoreFactory::Lookup(id_)) {
+      return Napi::Number::New(env, static_cast<double>(store->CachedNextTarget()));
+    }
+    return Napi::Number::New(env, static_cast<double>(session.getExpectedTargetNum()));
+  } NQ_CATCH(env)
 }
 Napi::Value SessionWrap::SetNextSenderMsgSeqNum(
     const Napi::CallbackInfo& info) {
@@ -516,9 +543,23 @@ Napi::Value SessionWrap::Logout(const Napi::CallbackInfo& info) {
 }
 
 // Rejects with IOException (as a QuickFixError) if the message store cannot
-// be read.
+// be read, including when stop(true) aborted the read. A JsMessageStore's
+// refresh() never throws into QuickFIX (it poisons instead, see
+// js_message_store.h), so the worker asks it afterwards.
 Napi::Value SessionWrap::Refresh(const Napi::CallbackInfo& info) {
-  return RunOnWorker(info, [](FIX::Session& session) { session.refresh(); });
+  const FIX::SessionID id = id_;
+  return RunOnWorker(info, [id](FIX::Session& session) {
+    session.refresh();
+    if (JsMessageStore::TakeRefreshAborted()) {
+      throw FIX::IOException("message store refresh: engine tearing down");
+    }
+    if (JsMessageStore* store = JsMessageStoreFactory::Lookup(id)) {
+      if (store->Poisoned()) {
+        throw FIX::IOException("message store refresh failed (" +
+                               store->LastError() + ")");
+      }
+    }
+  });
 }
 
 }  // namespace napi_quickfix

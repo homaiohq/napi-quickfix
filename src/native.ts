@@ -123,7 +123,11 @@ export interface NativeSessionIDConstructor {
 
 /** Native `FIX::SessionSettings` wrapper. */
 export interface NativeSessionSettings {
-  getSessions(): NativeSessionID[];
+  /**
+   * Every `[SESSION]`, or with `connectionType` (`'initiator'` | `'acceptor'`)
+   * only those an engine of that type would create (`[DEFAULT]` merged in).
+   */
+  getSessions(connectionType?: string): NativeSessionID[];
 }
 
 /**
@@ -212,11 +216,43 @@ export interface NativeApplicationHandlers {
   fromApp?(message: NativeMessage, sessionID: NativeSessionID): void;
 }
 
+/**
+ * The object a JS-backed message store hands the native `JsMessageStoreFactory`
+ * (`cpp/js_message_store.h`). Every method returns a Promise; the native side
+ * binds its continuations to it (or, on the JS thread, lets the TS binding
+ * collect it). `storeError` is the native side's failure report.
+ */
+export interface NativeStoreBridge {
+  load(sessionID: NativeSessionID): Promise<unknown>;
+  create(sessionID: NativeSessionID, state: NativeStoreStateValue): Promise<unknown>;
+  setSeqNums(sessionID: NativeSessionID, nextSender: number, nextTarget: number): Promise<unknown>;
+  setMessage(sessionID: NativeSessionID, seqNum: number, message: string): Promise<unknown>;
+  getMessages(sessionID: NativeSessionID, begin: number, end: number): Promise<unknown>;
+  reset(sessionID: NativeSessionID, state: NativeStoreStateValue): Promise<unknown>;
+  storeError(sessionID: NativeSessionID, method: string, message: string, poisoned: boolean, late: boolean): void;
+}
+
+/** The state object the native store passes to `create`/`reset`. */
+export interface NativeStoreStateValue {
+  creationTime: Date;
+  nextSenderMsgSeqNum: number;
+  nextTargetMsgSeqNum: number;
+}
+
+/** One preloaded session state (`storeStates` of {@link NativeEngineOptions}). */
+export interface NativeStoreState extends NativeStoreStateValue {
+  sessionID: NativeSessionID;
+}
+
 /** Options passed to the native `InitiatorWrap` / `AcceptorWrap` constructors. */
 export interface NativeEngineOptions {
   settings: NativeSessionSettings;
   handlers?: NativeApplicationHandlers;
-  store?: 'file' | 'memory';
+  /** A bridge object selects the JS-backed store; `storeStates` is then required. */
+  store?: 'file' | 'memory' | NativeStoreBridge;
+  storeStates?: NativeStoreState[];
+  /** Per-call deadline for the JS-backed store; `undefined` = 30000, `0` = none. */
+  storeTimeoutMs?: number;
   log?: 'screen' | 'file' | 'none';
 }
 

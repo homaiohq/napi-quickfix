@@ -163,7 +163,11 @@ export class Session {
    * handler, or while a {@link sendToTarget} promise or a heartbeat is in
    * flight on this session -- is overwritten by the increment, and the
    * session ends up one off from its counterparty (a Resend Request or a
-   * "MsgSeqNum too low" Logout). Set it before {@link Engine.start}, from a
+   * "MsgSeqNum too low" Logout). With a {@link MessageStoreAdapter} (and
+   * `PersistMessages=Y`, the default), a value set after the outbound header
+   * was stamped but before the message was written makes that send fail
+   * instead: `sendToTarget()` resolves `false`, a non-poisoning
+   * `'storeError'` names the mismatch, and the new number stands. Set it before {@link Engine.start}, from a
    * `'logout'` event, or when you know nothing is in flight; never from a
    * handler.
    *
@@ -366,7 +370,8 @@ export class Session {
    * Re-read the session state (sequence numbers etc.) from the message store.
    *
    * @returns Rejects with a {@link QuickFixError}: `IOException` if the store
-   *   cannot be read, `SessionNotFound` once the engine is gone.
+   *   cannot be read (or a `stop(true)` aborted the read), `SessionNotFound`
+   *   once the engine is gone.
    */
   refresh(): Promise<void> {
     return serialise(this.#key, () => this.#native.refresh());

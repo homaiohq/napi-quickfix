@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 import {
   Acceptor,
@@ -23,6 +24,7 @@ import {
   Side,
 } from '../dist/esm/index.js';
 import { acceptorCfg, freePort, initiatorCfg, waitForEvent, waitUntil } from './helpers.js';
+import { ControlledStore } from './store-adapters.js';
 
 // The CJS build of the same package: a distinct `SessionID` class over the
 // same native addon, as a consumer mixing `import` and `require` would get.
@@ -739,6 +741,31 @@ StartDay=Monday
       assert.equal(await session.refresh(), undefined);
       assert.equal(await session.logon(), undefined);
     } finally {
+      await engine.stop();
+    }
+  });
+
+  test('the per-session chain is shared with the CJS build', async () => {
+    // A refresh() parked in the adapter's load() holds the chain. QuickFIX's
+    // logout() takes no lock, so a logout() that skipped the chain would land
+    // at once; through the other build's handle it must still queue behind.
+    const port = await freePort();
+    const store = new ControlledStore();
+    const engine = await Acceptor.create({ settings: SessionSettings.fromString(acceptorCfg(port)), store, log: 'none' });
+    try {
+      const session = engine.getSession(ACC_ID)!;
+      store.set('load', 'defer');
+      const refreshed = session.refresh();
+      assert.ok(await waitUntil(() => store.parked.length === 1, 10_000), 'the refresh() reached load()');
+      const loggedOut = cjs.lookupSession(ACC_ID as unknown as Parameters<typeof cjs.lookupSession>[0])!.logout('cjs');
+      await sleep(200);
+      assert.equal(session.isEnabled(), true, "the CJS logout() waits behind the ESM refresh()");
+      store.parked.shift()!.resolve();
+      await Promise.all([refreshed, loggedOut]);
+      assert.equal(session.isEnabled(), false);
+    } finally {
+      // A failed assertion leaves the load() parked; stop() would wait it out.
+      for (const p of store.parked.splice(0)) p.resolve();
       await engine.stop();
     }
   });
