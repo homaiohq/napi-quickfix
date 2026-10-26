@@ -386,6 +386,12 @@ export interface NativeModule {
   version(): string;
   quickfixParseMsgType(raw: string): string;
   /**
+   * Releases every libuv thread this environment's engines may have parked on
+   * a JS round trip; from then on their handlers are refused. Process exit
+   * only (see below).
+   */
+  prepareExit(): void;
+  /**
    * Runs off the main thread; resolves `true` if accepted for sending.
    *
    * Second argument: an explicit SessionID, or a session qualifier (possibly
@@ -426,3 +432,11 @@ export interface NativeModule {
  * assert it to the contract here — the single localized cast in the codebase.
  */
 export const native = nativeModule as unknown as NativeModule;
+
+// process.exit() and a fatal exception join the libuv threadpool without
+// running the environment cleanup hooks that tear the engines down, so a pool
+// thread parked on a JS round trip (a sendToTarget() in toApp or in a store
+// call, a stop() waiting on a network thread that is) would keep the process
+// from ever exiting. 'exit' is emitted just before that join, on both paths.
+// `on`, not `once`: prepareExit() is idempotent.
+process.on('exit', () => native.prepareExit());

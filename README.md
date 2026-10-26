@@ -394,6 +394,16 @@ the engine owning it has been stopped. A constructor that fails on a later
 (so the ids are not locked out by the failed attempt) and the engine-level log
 QuickFIX had already opened for it.
 
+**Process exit.** `process.exit()`, an uncaught exception or an unhandled
+rejection end the process even while an engine is busy: a `sendToTarget()` in
+a handler round trip or a store call, a `stop()` in flight. From the `'exit'`
+event on, no handler runs and nothing the handlers have not seen is acted on:
+an outbound message (`toAdmin`/`toApp`) is neither stored nor sent, and an
+inbound one (`fromAdmin`/`fromApp`) is not consumed (the peer resends it after
+the next logon). A graceful `stop()` in flight therefore sends no Logout, and
+the exit waits for QuickFIX's `LogoutTimeout` (2 s by default) before the
+session drops. Pending promises never settle, and no adapter `close()` is called.
+
 **Session schedule and venues.** QuickFIX resets a session (both sequence
 numbers back to 1, stored messages deleted) whenever its store's creation time
 falls in an earlier session period than now, at startup as well as while
@@ -741,7 +751,8 @@ engine (one network thread) for that long when the adapter stalls; a shorter
 one fails more calls that would have succeeded, and a timed-out `setSeqNums`
 or `reset` keeps the session's store poisoned until it settles. `0` disables
 it, accepting that a stalled adapter stalls the engine, a graceful `stop()`
-and process exit with it.
+and a natural process exit with it (`process.exit()` is not held up, see
+"Process exit").
 
 **Failure policy.** A rejection, a synchronous throw, a malformed return value
 or a timeout reach the engine as an `IOException`; every one is reported
@@ -859,7 +870,8 @@ rejection), and `stop()` settles after it, so
 races `close()` against `load()`. `close()` is also called when `create()`
 rejects after constructing the engine (a constructor-time `reset()` failed:
 the engine is stopped before the rejection). An engine dropped without
-`stop()` is torn down at process exit without calling `close()`.
+`stop()` is torn down at process exit without calling `close()` (see
+"Process exit").
 
 A write the engine stopped waiting for (it timed out, or `stop()` failed it)
 may still be running in the adapter when the engine is gone, and commit

@@ -3,6 +3,7 @@
 
 #include <napi.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -61,6 +62,9 @@ class ApplicationBridge : public FIX::Application {
     bool threw = false;
     std::string errorName;
     std::string errorMessage;
+    // Set when Deactivate()/Abort() woke the waiter instead of the
+    // trampoline: no handler ran.
+    bool aborted = false;
   };
 
   // Reply channel for a synchronous call (sync_channel.h): shared between
@@ -114,6 +118,15 @@ class ApplicationBridge : public FIX::Application {
   // (which joins the network threads) can't have a callback race into a TSFN
   // that is about to be aborted.
   void Deactivate();
+  // Deactivate() for process exit (PrepareExit, addon_data.h): instead of
+  // passing through, every callback a handler would have seen -- in flight or
+  // later -- throws FIX::IOException, which QuickFIX contains: an outbound
+  // message (toAdmin/toApp) is neither persisted nor sent, and an inbound one
+  // (fromAdmin/fromApp) is not consumed, its session disconnects and the peer
+  // resends it after the next logon. Passing through would send what toApp
+  // might have vetoed, a Logon without the credentials toAdmin adds, and
+  // advance a persistent store past messages the application never saw.
+  void DeactivateForExit();
   void Ref(Napi::Env env);
   void Unref(Napi::Env env);
 
@@ -193,6 +206,12 @@ class ApplicationBridge : public FIX::Application {
 
   // Mark inactive and wake every in-flight caller (pass-through).
   void WakeAllPending();
+
+  // Set by DeactivateForExit(), before it wakes the waiters.
+  std::atomic<bool> exiting_{false};
+  // CallSync's answer when no handler ran: pass-through (a default Result),
+  // or IOException once the process is exiting.
+  Result NoHandler() const;
 };
 
 }  // namespace napi_quickfix

@@ -120,6 +120,7 @@ AcceptorWrap::AcceptorWrap(const Napi::CallbackInfo& info)
   // InitiatorWrap for the rationale.
   env_ = env;
   cleanupHook_ = env.AddCleanupHook(&AcceptorWrap::CleanupEntry, this);
+  AddonData::Get(env).engines.insert(this);
 }
 
 void AcceptorWrap::CleanupEntry(AcceptorWrap* self) {
@@ -131,14 +132,23 @@ AcceptorWrap::~AcceptorWrap() {
   if (!cleanupHookFired_ && !cleanupHook_.IsEmpty() && env_ != nullptr) {
     cleanupHook_.Remove(env_);
   }
+  if (env_ != nullptr) AddonData::Get(env_).engines.erase(this);
   Teardown(true);
   DestroyEngine();
 }
 
+void AcceptorWrap::PrepareExit() {
+  // See InitiatorWrap::PrepareExit.
+  if (jsStore_) jsStore_->Deactivate();
+  if (bridge_) bridge_->DeactivateForExit();
+  gate_->RefuseWhileFrozen();
+}
+
 void AcceptorWrap::Teardown(bool force) {
   // Runs on the MAIN thread. Ordering (see InitiatorWrap::Teardown for detail):
-  //   1. Deactivate the bridge so callbacks during stop() pass through without
-  //      touching the TSFN or waiting on the frozen JS loop (breaks deadlock).
+  //   1. Deactivate the bridge so callbacks during stop() pass through (or are
+  //      refused, after PrepareExit()) without touching the TSFN or waiting on
+  //      the frozen JS loop (breaks deadlock).
   //   2. Join the stop() worker if one is in flight, so the engine is never
   //      destroyed under its FIX::Acceptor::stop() / gate freeze. Hence the
   //      early return is keyed on tornDown_, not on stopped_.

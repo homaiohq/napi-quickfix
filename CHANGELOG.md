@@ -64,6 +64,11 @@ Bundles **QuickFIX v1.16.0** (statically linked, with three upstream fixes carri
 - `worker.terminate()` aborted the whole process when an engine callback was being
   dispatched in the Worker at that moment. The bridge now lets such a callback pass
   through, as it does after the engine's own teardown (see `ARCHITECTURE.md` §4).
+- A process that called `process.exit()`, or died of an uncaught exception or an
+  unhandled rejection, never exited when a `sendToTarget()` or a `stop()` was in flight
+  (a pool thread parked on a JS round trip was never woken). The module now releases
+  those threads from `process.on('exit')`; from then on the exiting engines run no
+  handler and act on nothing a handler has not seen (README "Process exit").
 - An initiator whose session was disconnected by an inbound message (a peer's Logout,
   a failed store write) generated and stored a Logon it never sent (the peer saw a gap)
   and emitted `'logout'` twice. A QuickFIX v1.16.0 bug with any store; the build now
