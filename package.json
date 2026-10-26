@@ -60,7 +60,7 @@
     "dist/",
     "prebuilds/",
     "cpp/",
-    "CMakeLists.txt",
+    "/CMakeLists.txt",
     "src/load-native.cjs",
     "THIRD_PARTY_LICENSES"
   ],

@@ -63,6 +63,8 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
 - `worker.terminate()` aborted the whole process when an engine callback was being
   dispatched in the Worker at that moment. The bridge now lets such a callback pass
   through, as it does after the engine's own teardown (see `ARCHITECTURE.md` §4).
+- The npm package shipped every `CMakeLists.txt` of a local build tree when packed from
+  a working tree. The `files` entry now names the root file only.
 
 ### Known QuickFIX limitations
 
