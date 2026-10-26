@@ -51,12 +51,14 @@
 //     poisoned store fails every write at once with IOException (inside
 //     sendRaw()'s try, so nothing stamped from its cache reaches the wire:
 //     the session's sends fail). Poison lifts once every timed-out write
-//     has settled (so a late write has landed) and the next call of any
-//     kind has reloaded the cache through load(); a failed reload keeps the
+//     has settled (so a late write has landed) and the next write, or the
+//     next getCreationTime(), has reloaded the cache through load() (the
+//     seqnum getters never reload, see below); a failed reload keeps the
 //     store poisoned for the next attempt, and a timed-out one counts as
 //     unsettled too, so a stalled adapter costs one timeout, not one per
-//     call, until its load() settles. After a plain rejection that next call (the network thread's
-//     next tick at the latest) usually lifts it with the session still up.
+//     call, until its load() settles. After a plain rejection that next
+//     reload (the network thread's next tick at the latest, unless
+//     NonStopSession=Y) usually lifts it with the session still up.
 //     While it cannot lift, every inbound message ends in an
 //     incrNextTargetMsgSeqNum() that throws, so QuickFIX disconnects the
 //     session at its next inbound message (a heartbeat at the latest); a
@@ -66,12 +68,37 @@
 //     with the old MsgSeqNum and no ResetSeqNumFlag). It stays pending, and
 //     the reload that lifts the poison is the reset itself, retried with its
 //     original timestamp (refresh() included). The cache takes the reset
-//     numbers at once anyway, as upstream's stores do (cache first): each
-//     read QuickFIX makes on its way to the wire retries the reset on its
-//     own, and they must agree whichever retry succeeds (a Logon's
-//     ResetSeqNumFlag and its MsgSeqNum are two reads). So until the retry
-//     lands, QuickFIX's getters read 1/1 while the adapter's row still holds
-//     the old numbers (JS's getExpected*() throw: the store is poisoned).
+//     numbers at once anyway, as upstream's stores do (cache first), so a
+//     Logon's ResetSeqNumFlag (shouldSendReset()) and its MsgSeqNum (fill())
+//     both read 1, and a retry that lands leaves the cache as it was: the
+//     seqnum getters retry it too (each read is one more chance before the
+//     Logon's persist(), see the next bullet) without ever moving what an
+//     earlier read returned. So until the retry lands, QuickFIX's getters
+//     read 1/1 while the adapter's row still holds the old numbers (JS's
+//     getExpected*() throw: the store is poisoned).
+//   * The seqnum getters never move the cache: while poisoned they retry a
+//     pending reset (above) and nothing else; a reload (load()) happens only
+//     in a write's gate or in getCreationTime(), which QuickFIX reads first
+//     in every network-thread pass over the session (the tick, an inbound
+//     message, setResponder()), before any seqnum read. So the reads of one
+//     pass agree up to its next write (shouldSendReset() and fill(),
+//     verify()'s too-high/too-low checks, nextLogon(), nextResendRequest()),
+//     and a poisoned store costs a reload attempt per pass and per write,
+//     not one per read. A write's reload can still move the cache under an
+//     earlier read, and is checked: set() against the stamp (CheckStamp(),
+//     next bullet), incrNextTargetMsgSeqNum() against the number verify()
+//     accepted the message on, when its own reload moved it: not counted,
+//     non-poisoning 'storeError', and no throw (nextQueued() makes that call
+//     outside any handler), so the cache keeps the moved number and the
+//     peer's next message is too low (Logout + disconnect) or too high
+//     (ResendRequest). A reload by another thread's write in that window
+//     lifts the poison first and goes unnoticed, as a setter's move does
+//     with upstream's stores. With
+//     NonStopSession=Y QuickFIX never reads the creation time, so a poisoned
+//     initiator's reconnect (ResetOnLogon=N, RefreshOnLogon=N) stamps its
+//     Logon from the cache and only persist() reloads: if that moved the
+//     sender seqnum (a late write landed) the Logon is refused and the
+//     attempt ends at LogonTimeout; the next one goes out right.
 //   * A message stamped from the cache while the store was poisoned, whose
 //     persist() then finds the poison lifted by a reload that moved the
 //     sender seqnum, is refused (set(): its MsgSeqNum is no longer the next
@@ -106,10 +133,11 @@
 //     (UnsupportedVersion&) also call generateLogout(), and
 //     Session::next(Message) reads getExpectedTargetNum() in nextQueued()
 //     after its handlers, on every inbound message. The two writes poison and
-//     report instead; the getters still attempt the reload while poisoned,
-//     then return the cached value. With the sender getter never throwing, a
-//     poisoned initiator's Logon fails at persist() after QuickFIX marked it
-//     sent, so that connection attempt ends at LogonTimeout.
+//     report instead; the getters return the cached value (getCreationTime()
+//     after its reload attempt, see above). With the sender getter never
+//     throwing, a poisoned initiator's Logon fails at persist() after
+//     QuickFIX marked it sent, so that connection attempt ends at
+//     LogonTimeout.
 //   * Inside one of QuickFIX's own catch handlers (std::current_exception()
 //     is set), incrNextTargetMsgSeqNum() does not throw either: catch
 //     (UnsupportedVersion&) increments the target seqnum with no guard
@@ -365,8 +393,12 @@ class JsMessageStore : public FIX::MessageStore {
   // the store is poisoned and cannot be reloaded now; otherwise reloads the
   // cache (one reload at a time, through the bridge; a pending reset is
   // retried instead, see RetryReset()) and lifts the poison, or throws if
-  // that failed. `what` names the caller for the message.
-  void Gate(const char* what) const;
+  // that failed. `what` names the caller for the message. `reload` false
+  // (the seqnum getters): only a pending reset is retried, which leaves the
+  // cache as it is; a plain reload is refused (throws).
+  void Gate(const char* what, bool reload = true) const;
+  // The seqnum getters: Gate(reload=false), errors swallowed, then the cache.
+  FIX::SEQNUM CachedSeqNum(const char* what, bool sender) const;
   // load() and apply; a missing row is recreated at 1/1 through create().
   // Not under C. On failure returns the outcome, `failed` names the method.
   Factory::Outcome Reload(Factory::Method& failed) const;

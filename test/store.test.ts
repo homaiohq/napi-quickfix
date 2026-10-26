@@ -815,7 +815,8 @@ describe('MessageStoreAdapter: failure policy', () => {
     test(`ResetOnLogon=Y + a reset() that rejects ${rejections}x: every Logon stamped and sent is 34=1 with 141=Y, the reset never undone by a reload`, { timeout: 30_000 }, async () => {
       // generateLogon() resets, then reads the sender seqnum twice: in
       // shouldSendReset() for ResetSeqNumFlag and in fill() for MsgSeqNum,
-      // each read a getter whose Gate() retries the pending reset on its own.
+      // each read a getter that retries the pending reset on its own (the
+      // one thing a seqnum getter retries: the cache already holds its numbers).
       // Before the fix, one rejection: the read reloaded the old row and lifted
       // the poison, and the Logon left with 34=57 and no 141=Y. Two or three:
       // the flag was decided on the stale cache (57) and the stamp on the reset
@@ -1177,6 +1178,93 @@ describe('MessageStoreAdapter: failure policy', () => {
     }
   });
 
+  test('a poisoned store: the seqnum getters never reload, so a send costs one load() (its write\'s) and the reads before it agree', { timeout: 30_000 }, async () => {
+    const port = await freePort();
+    const iniStore = new ControlledStore();
+    // NonStopSession=Y: QuickFIX never reads the creation time, the one
+    // getter that reloads, so with HeartBtInt=60 the network thread makes no
+    // store call at all on the idle session and every load() below is a send's.
+    const { acc, ini, received, storeErrors } = await makePair(port, {
+      iniStore,
+      ini: { HeartBtInt: '60', NonStopSession: 'Y' },
+    });
+    try {
+      await logonBoth(acc, ini);
+      const session = ini.getSession(INI_ID)!;
+      const seq = session.getExpectedSenderNum();
+      iniStore.set('setSeqNums', 'reject', () => !storeErrors.some((e) => e.method === 'setSeqNums'));
+      assert.equal(await sendToTarget(newOrder('p'), INI_ID), false);
+      assert.ok(await waitUntil(() => storeErrors.some((e) => e.method === 'setSeqNums' && e.poisoned), T));
+      iniStore.set('load', 'reject');
+      // Each send reads the sender seqnum in fill() (a getter: no reload, the
+      // cache), then persist() -> set() reloads once and fails. Before the
+      // getters stopped reloading, fill() made a load() of its own: two per send.
+      const loadsBefore = iniStore.count('load');
+      for (let i = 0; i < 3; i++) {
+        assert.equal(await sendToTarget(newOrder(`q${i}`), INI_ID), false);
+      }
+      assert.equal(iniStore.count('load') - loadsBefore, 3, 'one load() per send: the write\'s, none from the getters');
+      assert.throws(() => session.getExpectedSenderNum(), isIOException);
+      // Adapter back: the next send's write reloads (one load()), lifts the
+      // poison and goes out on the number the failed sends did not consume.
+      iniStore.mode = () => 'ok';
+      const loadsOk = iniStore.count('load');
+      assert.equal(await sendToTarget(newOrder('ok'), INI_ID), true);
+      assert.equal(iniStore.count('load') - loadsOk, 1);
+      assert.ok(await waitUntil(() => received.length === 1, T));
+      assert.deepEqual([received[0].clOrdID, received[0].seq], ['ok', seq]);
+      assert.equal(session.isLoggedOn(), true);
+    } finally {
+      await stopBoth(acc, ini);
+    }
+  });
+
+  test('a poisoned store whose reload moves the target seqnum under an inbound message: not counted on top of the moved number, no throw, the next message disconnects', { timeout: 30_000 }, async () => {
+    const port = await freePort();
+    const iniStore = new ControlledStore();
+    // NonStopSession=Y: no creation-time read, so the inbound message is
+    // verified against the cache (the target getter does not reload) and the
+    // first reload is its incrNextTargetMsgSeqNum()'s.
+    const { acc, ini, storeErrors } = await makePair(port, {
+      iniStore,
+      ini: { HeartBtInt: '60', NonStopSession: 'Y', ResetOnLogon: 'N' },
+    });
+    try {
+      await logonBoth(acc, ini);
+      const session = ini.getSession(INI_ID)!;
+      const target = session.getExpectedTargetNum();
+      iniStore.set('setSeqNums', 'reject', () => !storeErrors.some((e) => e.method === 'setSeqNums'));
+      assert.equal(await sendToTarget(newOrder('p'), INI_ID), false);
+      assert.ok(await waitUntil(() => storeErrors.some((e) => e.method === 'setSeqNums' && e.poisoned), T));
+      // The row moves behind the engine (a late write that landed, an
+      // operator): the reload will bring target+100.
+      const row = iniStore.row(INI_ID).state;
+      iniStore.inner.setSeqNums(INI_ID, row.nextSenderMsgSeqNum, target + 100);
+      let logouts = 0;
+      ini.on('logout', () => logouts++);
+      assert.equal(await sendToTarget(newOrder('in'), ACC_ID), true);
+      // The increment reloads, sees the moved number and does not count the
+      // message: reported, but no throw (nextQueued() makes the same call
+      // outside any handler), so the session stays up on the moved number.
+      const refused = () => storeErrors.find((e) => /moved the next target seqnum/.test(e.message));
+      assert.ok(await waitUntil(() => refused() !== undefined, T), 'the increment was not counted');
+      assert.equal(refused()!.poisoned, false);
+      assert.equal(logouts, 0);
+      assert.doesNotThrow(() => session.getExpectedTargetNum(), 'not poisoned: the reload left cache and row equal');
+      assert.equal(session.getExpectedTargetNum(), target + 100, 'the cache keeps the moved number');
+      assert.equal(iniStore.row(INI_ID).state.nextTargetMsgSeqNum, target + 100);
+      // QuickFIX's own sequence check reconciles: the peer's next message is
+      // too low for the moved number, Logout + disconnect.
+      const logout = waitForEvent(ini, 'logout', 'initiator disconnect', T);
+      assert.equal(await sendToTarget(newOrder('in2'), ACC_ID), true);
+      await logout;
+      assert.equal(iniStore.row(INI_ID).state.nextTargetMsgSeqNum, target + 100, 'the moved number was kept');
+      assert.ok(!iniStore.seqNumWrites.some(([, t]) => t === target + 101), 'never counted on top of it');
+    } finally {
+      await stopBoth(acc, ini, true);
+    }
+  });
+
   test('poisoned store with a stalled load(): one reload, then calls fail immediately until it settles', { timeout: 60_000 }, async () => {
     const port = await freePort();
     const iniStore = new ControlledStore();
@@ -1194,8 +1282,8 @@ describe('MessageStoreAdapter: failure policy', () => {
       // ResetOnLogon=Y reset fails on the poisoned store and is left pending).
       const reloads = () => iniStore.count('load') + iniStore.count('reset');
       const reloadsBefore = reloads();
-      // The network thread's ticks and the reconnects each hit the store,
-      // three getters per pass. The first reload times out and stays
+      // The network thread's ticks and the reconnects each hit the store
+      // (getCreationTime() first, then the writes). The first reload times out and stays
       // unsettled: no store call starts another (each would park the
       // network thread, and every other session on it, for a timeout) until
       // the stalled one has settled.

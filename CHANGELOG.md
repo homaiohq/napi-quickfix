@@ -27,7 +27,8 @@ Bundles **QuickFIX v1.16.0** (statically linked, with two upstream fixes carried
   write of its sequence number until it has settled, so its late commit cannot replace
   the retry's message and be resent in its place); `setSeqNums`/`reset` rejections, timeouts and
   late settlements (and `load` failures) poison the session's store until it has been
-  reloaded: a reload that succeeds at the next store call lifts it with the session
+  reloaded: a reload that succeeds at the next send, inbound message or tick (the
+  next send or heartbeat with `NonStopSession=Y`) lifts it with the session
   still up, otherwise the session is taken down at its next inbound message and
   QuickFIX reconciles with the peer at the next logon; a failed `reset` is retried rather than undone by that reload, so
   the session never goes on with the numbers it meant to discard. `reset()`/`refresh()`

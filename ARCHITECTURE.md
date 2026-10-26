@@ -254,9 +254,15 @@ sequenceDiagram
   the store (every write throws until a reload through `load()` succeeds, after every timed-out write has settled; a
   failed `reset` is instead retried with its original timestamp, since a reload would bring back the numbers QuickFIX
   meant to discard; the cache takes the reset numbers at once, so the several reads one Logon makes, each retrying
-  on its own, cannot disagree on `141=Y` and `34=`). A message stamped from the cache of a poisoned store is refused at `persist()` if the reload
-  that lifted the poison moved the sender seqnum (`CheckStamp()`; `incrNextSenderMsgSeqNum()` with
-  `PersistMessages=N`). Sequence numbers cross the bridge as doubles: `ReadSeq()` refuses a value above
+  on its own, cannot disagree on `141=Y` and `34=`). The seqnum getters never move the cache: while poisoned they
+  retry a pending reset (which leaves the cache as it is) and never reload; a reload happens only in a write or in
+  `getCreationTime()`, which QuickFIX reads first in every network-thread pass (tick, inbound message,
+  `setResponder()`), so the reads of one pass agree up to its next write. A message stamped from the cache of a
+  poisoned store is refused at `persist()` if the reload that lifted the poison moved the sender seqnum
+  (`CheckStamp()`; `incrNextSenderMsgSeqNum()` with `PersistMessages=N`), and an inbound message verified against
+  the cache is not counted if its `incrNextTargetMsgSeqNum()`'s reload moved the target seqnum (reported, never thrown:
+  `nextQueued()` makes that call outside any handler; QuickFIX's sequence checks reconcile at the peer's next
+  message). Sequence numbers cross the bridge as doubles: `ReadSeq()` refuses a value above
   2^53-1 coming back from JS, and `CheckSafeSeq()` refuses one going out (`set()`, `setNext*()`, hence `incr*()`;
   reachable by a counterparty's `SequenceReset` with a 64-bit `NewSeqNo`) before `Forward()`, as a non-poisoning
   `IOException` + `storeError` (nothing reached the adapter), which QuickFIX's handler turns into a disconnect.
@@ -268,7 +274,7 @@ sequenceDiagram
   there, `std::terminate`; the initiator swallows the exception with the session stuck "pending" for good;
   `catch (RejectLogon&)`/`catch (UnsupportedVersion&)` call `generateLogout()` too); and `getNextTargetMsgSeqNum()`
   (`Session::next(Message)` reads it in `nextQueued()` after its handlers, on every inbound message). The writes poison
-  and report; the getters attempt the reload, then return the cache. No stale number reaches the wire:
+  and report; the getters return the cache (`getCreationTime()` after its reload attempt). No stale number reaches the wire:
   `persist()`'s writes still throw inside `sendRaw()`'s `try`. A poisoned initiator's Logon therefore fails at
   `persist()` after `generateLogon()` marked it sent, and the attempt ends at `LogonTimeout`. Inside one of
   QuickFIX's own catch handlers (`std::current_exception()` set) `incrNextTargetMsgSeqNum()` does not throw either:

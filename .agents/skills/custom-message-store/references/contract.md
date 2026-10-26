@@ -1017,7 +1017,8 @@ handlers: the failure is recorded and nothing stamped while poisoned is sent.
 A poisoned initiator's Logon fails the same way, after QuickFIX counted it as
 sent, so that attempt ends at `LogonTimeout`. Whether the session goes down
 depends on the reload below. After a plain rejection (nothing unsettled) the
-next store call reloads, the network thread's next tick at the latest; if that
+next store write or network-thread pass reloads, the network thread's next
+tick at the latest (with `NonStopSession=Y`, the next send or heartbeat); if that
 succeeds the poison lifts with the session still up (the send whose write was
 rejected resolved `false`). While the poison cannot lift (a timed-out write
 still unsettled, or the adapter still failing), every inbound message ends in a

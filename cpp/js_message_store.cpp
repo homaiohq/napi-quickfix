@@ -670,13 +670,16 @@ void JsMessageStore::CheckSafeSeq(FIX::SEQNUM n, Factory::Method method,
 
 // Session::persist() stores the message under the MsgSeqNum fill() stamped,
 // which is the next sender seqnum unless the cache moved in between: on a
-// poisoned store the stamp came from the cache and this call's Gate() then
-// reloaded it (a late write that landed) or retried a pending reset; or a
-// Session.setNextSenderMsgSeqNum() worker took SessionState::m_mutex while
-// sendRaw() ran toApp/toAdmin (sendRaw holds Session::m_mutex, which the
-// setter does not take, see session_wrap.cpp). Stored and sent, the message
-// would carry a number the store no longer agrees with. Refused like a non-fatal adapter failure: IOException inside
-// sendRaw()'s try (nothing is sent) and a non-poisoning 'storeError'.
+// poisoned store the stamp came from the cache (the seqnum getters never
+// reload) and this call's Gate(), or the network thread's getCreationTime()
+// between fill() and persist() (sendRaw() holds Session::m_mutex, not
+// SessionState::m_mutex, across them), then reloaded it (a late write that
+// landed); or a Session.setNextSenderMsgSeqNum() worker took
+// SessionState::m_mutex while sendRaw() ran toApp/toAdmin (the setter does
+// not take Session::m_mutex, see session_wrap.cpp). Stored and sent, the
+// message would carry a number the store no longer agrees with. Refused like
+// a non-fatal adapter failure: IOException inside sendRaw()'s try (nothing is
+// sent) and a non-poisoning 'storeError'.
 void JsMessageStore::CheckStamp(FIX::SEQNUM seq) const {
   FIX::SEQNUM next;
   {
@@ -739,7 +742,7 @@ void JsMessageStore::Poison(Factory::Method method, const std::string& why,
   factory_.ReportError(id_, method, why, /*poisoned=*/true, /*late=*/false);
 }
 
-void JsMessageStore::Gate(const char* what) const {
+void JsMessageStore::Gate(const char* what, bool reload) const {
   std::unique_lock<std::mutex> lock(mtx_);
   if (!poisoned_) return;
   if (unsettled_ > 0) {
@@ -751,6 +754,10 @@ void JsMessageStore::Gate(const char* what) const {
     throw FIX::IOException(std::string("message store ") + what +
                            ": store poisoned (" + lastError_ +
                            "), reload in progress");
+  }
+  if (!reload && !pendingReset_) {
+    throw FIX::IOException(std::string("message store ") + what +
+                           ": store poisoned (" + lastError_ + ")");
   }
   if (factory_.OnJsThread()) {
     throw FIX::IOException(std::string("message store ") + what +
@@ -917,45 +924,52 @@ void JsMessageStore::get(FIX::SEQNUM b, FIX::SEQNUM e,
   out = Forward(r, /*fatal=*/false).strings;
 }
 
+// The two seqnum getters never move the cache (see the header): while
+// poisoned they retry a pending reset, whose numbers the cache already holds
+// (see reset()), and never reload, so every read QuickFIX makes between two
+// writes returns the same number (generateLogon()'s shouldSendReset() and
+// fill(), verify()'s too-high and too-low checks, nextLogon()'s and
+// nextResendRequest()'s comparisons). Reloading is left to the writes and to
+// getCreationTime().
+FIX::SEQNUM JsMessageStore::CachedSeqNum(const char* what, bool sender) const {
+  try {
+    Gate(what, /*reload=*/false);
+  } catch (const FIX::IOException&) {
+  }
+  std::lock_guard<std::mutex> lock(mtx_);
+  return sender ? cache_.getNextSenderMsgSeqNum() : cache_.getNextTargetMsgSeqNum();
+}
+
 // Never throws (see the header): Session::fill() reads it outside sendRaw()'s
 // try, from generateLogout() in Session::reset() on the connect path
 // (setResponder(), no handler on the acceptor) and in QuickFIX's own catch
-// handlers. Like the other getters it still drives a reload attempt while
-// poisoned, then returns the cache. Nothing stamped with it reaches the wire
-// without persist(), whose writes throw inside sendRaw()'s try while the
-// store is poisoned, and set() refuses a stamp a reload has since moved
-// (CheckStamp()).
+// handlers. Nothing stamped with it reaches the wire without persist(),
+// whose writes throw inside sendRaw()'s try while the store is poisoned, and
+// set() refuses a stamp a reload has since moved (CheckStamp()).
 FIX::SEQNUM JsMessageStore::getNextSenderMsgSeqNum() const EXCEPT(FIX::IOException) {
-  try {
-    Gate("getNextSenderMsgSeqNum");
-  } catch (const FIX::IOException&) {
-  }
-  std::lock_guard<std::mutex> lock(mtx_);
-  return cache_.getNextSenderMsgSeqNum();
+  return CachedSeqNum("getNextSenderMsgSeqNum", /*sender=*/true);
 }
 
 // Never throws (see the header): Session::next(Message) reads it through
-// nextQueued() AFTER its catch handlers, on every inbound message. Like
-// getCreationTime() it still drives a reload attempt while poisoned, then
-// falls back to the cache; the inbound path that read it goes on to
-// incrNextTargetMsgSeqNum(), which does throw and takes the session down.
+// nextQueued() AFTER its catch handlers, on every inbound message. The
+// inbound path that read it goes on to incrNextTargetMsgSeqNum(), which does
+// throw while poisoned and takes the session down.
 FIX::SEQNUM JsMessageStore::getNextTargetMsgSeqNum() const EXCEPT(FIX::IOException) {
-  try {
-    Gate("getNextTargetMsgSeqNum");
-  } catch (const FIX::IOException&) {
-  }
-  std::lock_guard<std::mutex> lock(mtx_);
-  return cache_.getNextTargetMsgSeqNum();
+  return CachedSeqNum("getNextTargetMsgSeqNum", /*sender=*/false);
 }
 
 // Never throws (see the header): Session::setResponder() reads it through
 // checkSessionTime() on the connect path, where the initiator swallows the
 // exception with the session stuck "pending" for good and the acceptor has
-// no handler at all. While poisoned it still drives one reload attempt per
-// tick (that is what retries a failing adapter on an idle session; none
-// while a timed-out one is unsettled, see Reload()); if that
-// fails the cached time is returned and the sender getter and the writes,
-// which do throw, take the session down at its next send or inbound message.
+// no handler at all. The one getter that reloads while poisoned: QuickFIX
+// reads it first in every network-thread pass over the session (the tick
+// Session::next(), Session::next(Message), setResponder()), before any seqnum
+// read, so its reload never splits the reads of one pass. It is what retries
+// a failing adapter on an idle session, once per tick (none while a
+// timed-out one is unsettled, see Reload()); QuickFIX skips it with
+// NonStopSession=Y, where the next write retries instead. If it fails the
+// cached time is returned and the writes, which do throw, take the session
+// down at its next send or inbound message.
 FIX::UtcTimeStamp JsMessageStore::getCreationTime() const EXCEPT(FIX::IOException) {
   try {
     Gate("getCreationTime");
@@ -1024,14 +1038,44 @@ void JsMessageStore::incrNextSenderMsgSeqNum() EXCEPT(FIX::IOException) {
 // already been recorded (poison / 'storeError') and the cache keeps the old
 // number; the Logout that handler sent sets sentLogout(), so the logout
 // timeout disconnects the session.
+//
+// The inbound message was checked (verify()) against the target getter,
+// which does not reload; on a store poisoned on entry, this call's reload is
+// the first, and if it moved the target number the message was accepted
+// against a number the store no longer holds. It is then not counted (no
+// write on top of the moved number) and reported (non-poisoning
+// 'storeError'), but this does NOT throw: nextQueued() reaches this call
+// outside any try (Session.cpp:1157 from :1308; SocketConnection catches
+// only InvalidMessage), where a throw is std::terminate, and the two call
+// paths cannot be told apart from here. Nor does it poison: the reload left
+// cache and adapter equal. The cache keeps the moved number, so QuickFIX's
+// own sequence checks reconcile: the peer's next message is too low (Logout
+// + disconnect) or too high (ResendRequest).
 void JsMessageStore::incrNextTargetMsgSeqNum() EXCEPT(FIX::IOException) {
   const bool inHandler = InQuickFixHandler();
   try {
+    bool wasPoisoned;
+    FIX::SEQNUM seen;
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      wasPoisoned = poisoned_;
+      seen = cache_.getNextTargetMsgSeqNum();
+    }
     Gate("incrNextTargetMsgSeqNum");
     FIX::SEQNUM next;
     {
       std::lock_guard<std::mutex> lock(mtx_);
       next = cache_.getNextTargetMsgSeqNum() + 1;
+    }
+    if (wasPoisoned && next != seen + 1) {
+      const std::string why =
+          "the inbound message was checked against MsgSeqNum=" + std::to_string(seen) +
+          " but the reload that lifted the poison moved the next target seqnum to " +
+          std::to_string(next - 1) + "; not counted";
+      LogEvent("Message store: " + why);
+      factory_.ReportError(id_, Factory::Method::kSetSeqNums, why, /*poisoned=*/false,
+                           /*late=*/false);
+      return;
     }
     setNextTargetMsgSeqNum(next);
   } catch (const FIX::IOException&) {

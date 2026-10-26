@@ -790,8 +790,10 @@ the session log.
   `1/1` with the messages gone. A poisoned store fails every write at once, so
   every send fails before it reaches the wire (no stale number is ever sent).
   How long that lasts depends on the reload below: after a plain rejection
-  (nothing left unsettled) the next store call reloads, the network thread's
-  next tick at the latest, and if the reload succeeds the poison lifts with
+  (nothing left unsettled) the next send, inbound message or tick reloads, the
+  network thread's next tick at the latest (with `NonStopSession=Y` QuickFIX's
+  tick does not touch the store, so the next send or heartbeat), and if the
+  reload succeeds the poison lifts with
   the session still up (the send whose write was rejected resolved `false`;
   the next send takes the number the reload found). While the poison cannot
   lift (a timed-out write still unsettled, or the reload failing too), every
@@ -802,8 +804,9 @@ the session log.
   counted it as sent, so that connection attempt ends at `LogonTimeout`. `'storeError'` fires with `poisoned: true`, and the
   `getExpected*()` getters throw `IOException` until it lifts. **Poison lifts in
   two steps**, whatever `RefreshOnLogon` says: once every timed-out write has
-  settled (so a late write has landed), the next store call of any kind first
-  reloads the state through `load()`, then proceeds. A reload whose `load()`
+  settled (so a late write has landed), the next store write, or the
+  network thread's next pass over the session, first reloads the state
+  through `load()`, then proceeds. A reload whose `load()`
   times out counts as unsettled too: no other reload starts until it has
   settled, so a stalled adapter parks the engine's thread for one timeout, not
   one per store call, and never has more than one reload of a session pending. A
