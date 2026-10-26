@@ -94,6 +94,30 @@ flowchart LR
 Key detail: QuickFIX ships headers **flat** in `src/C++/*.h` but code includes them as `quickfix/Message.h`, so
 `CMakeLists.txt` copies them into a generated `quickfix/` include tree at configure time (Windows-safe, no symlinks).
 
+**The two upstream fixes carried.** `CMakeLists.txt` edits the fetched sources (`${quickfix_SOURCE_DIR}/src/C++`)
+at configure time through `qf_patch()`, not through a FetchContent `PATCH_COMMAND`, which is skipped for a source
+tree restored from the CI cache or given through `FETCHCONTENT_SOURCE_DIR_QUICKFIX`. Each edit replaces one whole
+line (a CRLF checkout keeps matching), is idempotent, and fails the configure if its anchor line is gone or not
+unique (a new pin: drop the edit if upstream has the fix, otherwise re-anchor it).
+
+- *No Logon without a connection.* QuickFIX v1.16.0 generates and persists a Logon for an initiator session whose
+  connection was just dropped (`Session::disconnect()` only queues the socket for `SocketMonitor::drop()`, and
+  `SocketInitiator::onStart()` ticks every connection through `onTimeout()` before the drop is processed), then
+  fires `onLogout` twice. With a `MessageStoreAdapter` it is also costly: each store call of that extra tick retries
+  the poisoned store's `load()` on the engine's only network thread, stalling every other session. The fix adds
+  `&& m_pResponder` to the guard in `Session::next()` (`test/session.test.ts`).
+- *A dropped socket is closed only once its disconnect is delivered.* `SocketMonitor::drop()` closed the fd at once
+  and queued it for the next `block()`. A reconnect due in the `onTimeout()` between the two got the same fd number
+  (POSIX hands out the lowest free one), the queued `SocketInitiator::onDisconnect(fd)` matched the new pending
+  connection first and tore it down, and the dropped session was never `setDisconnected()`: it stayed in
+  `Initiator::m_connected`, never redialled, its sends stored and never delivered. A store call that stalls the
+  network thread past `ReconnectInterval` and then fails makes that window near-certain. The fix moves the
+  `socket_close()` from `drop()` to `block()`, after `onError(fd)`, and has the destructor close drops still queued;
+  both `SocketMonitor_UNIX.cpp` and `SocketMonitor_WIN32.cpp` (`test/reconnect.test.ts`).
+
+These are the only changes to QuickFIX's sources; anything else upstream does wrong is worked around in the binding or
+documented.
+
 ---
 
 ## 3. Module loading (dual ESM + CJS)
@@ -488,7 +512,7 @@ onto its dropped queue with **no lock**, while the engine's network thread itera
 `SocketMonitor::block()`. QuickFIX only ever calls them from that thread itself (timeouts, logout handling,
 remote disconnects); from any other thread they are a data race with a crash window of a few instructions
 (upstream quickfix/quickfix#346, closed "not planned"). There is no public hook to run code on the network thread,
-and this binding does not patch QuickFIX, so the supported way to bring a session down is `logout()` — exactly
+and this binding does not carry a patch for it (it carries two others, see §2), so the supported way to bring a session down is `logout()` — exactly
 what `Initiator::stop()` itself does — and to renumber it, the sequence-number setters.
 
 **Lifetime.** `FIX::Session` objects are owned by the engine and `FIX::Session::lookupSession` returns a raw,

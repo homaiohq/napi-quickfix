@@ -9,7 +9,8 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
-Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
+Bundles **QuickFIX v1.16.0** (statically linked, with two upstream fixes carried: see
+"Fixed").
 
 ### Added
 
@@ -63,13 +64,26 @@ Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
 - `worker.terminate()` aborted the whole process when an engine callback was being
   dispatched in the Worker at that moment. The bridge now lets such a callback pass
   through, as it does after the engine's own teardown (see `ARCHITECTURE.md` §4).
+- An initiator whose session was disconnected by an inbound message (a peer's Logout,
+  a failed store write) generated and stored a Logon it never sent (the peer saw a gap)
+  and emitted `'logout'` twice. A QuickFIX v1.16.0 bug with any store; the build now
+  carries the one-line upstream fix (no Logon without a connection).
+- An initiator session could stay disconnected for good, its sends resolving `true`
+  but never delivered, when it was disconnected while handling inbound data in the same
+  network-loop pass as another session's due reconnect: the reconnect reused the
+  dropped socket's number and the queued disconnect tore it down instead. A QuickFIX
+  v1.16.0 bug with two or more sessions on any store (an acceptor could be hit the same
+  way); a store call stalling the network thread past `ReconnectInterval` made it
+  near-certain. The build now carries a `SocketMonitor` fix: a dropped socket is closed
+  only once its disconnect has been processed.
 - The npm package shipped every `CMakeLists.txt` of a local build tree when packed from
   a working tree. The `files` entry now names the root file only.
 
 ### Known QuickFIX limitations
 
 Two file-descriptor leaks found by the same audit are in QuickFIX itself and are not
-patched by this binding (it never patches QuickFIX; see `ARCHITECTURE.md`):
+patched by this binding (it carries two upstream fixes, see "Fixed" and
+`ARCHITECTURE.md`):
 
 - An `Acceptor` whose `start()` fails because its port is already bound leaks the
   listening socket it created (`socket_createAcceptor` returns without closing it on a
