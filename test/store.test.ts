@@ -19,6 +19,7 @@ import {
   FIELD,
   MsgType,
   Side,
+  type ApplicationHandlers,
   type Engine,
   type Message,
   type MessageStoreAdapter,
@@ -82,6 +83,7 @@ interface PairOptions {
   iniStore?: 'memory' | MessageStoreAdapter;
   acc?: Record<string, string>;
   ini?: Record<string, string>;
+  iniHandlers?: ApplicationHandlers;
   storeTimeoutMs?: number;
 }
 
@@ -110,6 +112,7 @@ async function makePair(port: number, o: PairOptions = {}) {
     store: o.iniStore ?? 'memory',
     storeTimeoutMs: typeof o.iniStore === 'object' ? o.storeTimeoutMs : undefined,
     log: 'none',
+    handlers: o.iniHandlers,
   });
   for (const engine of [acc, ini]) {
     engine.on('storeError', (_id, method, err, poisoned) => {
@@ -896,6 +899,73 @@ describe('MessageStoreAdapter: failure policy', () => {
       assert.equal(storeErrors.length, 1, 'a late setMessage is not reported');
     } finally {
       await stopBoth(acc, ini);
+    }
+  });
+
+  test('a call that times out before the adapter was called is never run', { timeout: 30_000 }, async () => {
+    // Block the event loop past the timeout right after the send's toApp
+    // (itself a round trip through the loop) was answered: the store call
+    // the send makes next expires in the bridge's queue. Run once the loop
+    // frees up, a stale setMessage could commit over a retry's row for the
+    // same seqnum; it must be dropped instead. PersistMessages=N makes the
+    // send's only write a fatal setSeqNums, whose drop must still count as
+    // settled or the poison could never lift.
+    const blockLoop = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    const quiet = { HeartBtInt: '60', ReconnectInterval: '60' };
+    for (const persist of ['Y', 'N']) {
+      const port = await freePort();
+      const iniStore = new ControlledStore();
+      const { acc, ini, received, storeErrors } = await makePair(port, {
+        iniStore,
+        ini: { ...quiet, PersistMessages: persist },
+        iniHandlers: {
+          toApp(msg) {
+            // A microtask runs once the trampoline returned, i.e. after
+            // toApp's answer reached the waiting send.
+            if (msg.getFieldIfSet(FIELD.ClOrdID) === 'stale') queueMicrotask(() => blockLoop(800));
+          },
+        },
+        storeTimeoutMs: 300,
+      });
+      try {
+        await logonBoth(acc, ini);
+        const session = ini.getSession(INI_ID)!;
+        const seq = session.getExpectedSenderNum();
+        const method = persist === 'Y' ? 'setMessage' : 'setSeqNums';
+        const calls = iniStore.count(method);
+        assert.equal(await sendToTarget(newOrder('stale'), INI_ID), false, `${method} timed out in the queue: the send failed`);
+        // The failure report was queued behind the expired call, so once it
+        // is in, the call has been through the trampoline.
+        assert.ok(await waitUntil(() => storeErrors.some((e) => e.method === method), T));
+        assert.equal(iniStore.count(method), calls, `the expired ${method} never reached the adapter`);
+        if (persist === 'N') {
+          assert.ok(
+            await waitUntil(() => storeErrors.some((e) => e.method === 'setSeqNums' && e.message.includes('not run')), T),
+            'the drop is reported as a late settlement',
+          );
+          // Nothing is left unsettled: the next tick reloads and lifts.
+          const lifted = () => {
+            try {
+              session.getExpectedSenderNum();
+              return true;
+            } catch {
+              return false;
+            }
+          };
+          assert.ok(await waitUntil(lifted, T), 'the poison lifted');
+        }
+        assert.equal(session.getExpectedSenderNum(), seq, 'the failed send consumed no seqnum');
+        assert.equal(await sendToTarget(newOrder('next'), INI_ID), true);
+        assert.ok(await waitUntil(() => received.length === 1, T));
+        assert.equal(received[0].clOrdID, 'next');
+        assert.equal(received[0].seq, seq);
+        if (persist === 'Y') {
+          assert.equal(iniStore.row(INI_ID).messages.get(seq)?.includes('11=next'), true, 'the row holds the message sent');
+        }
+        assert.equal(session.isLoggedOn(), true);
+      } finally {
+        await stopBoth(acc, ini, true);
+      }
     }
   });
 

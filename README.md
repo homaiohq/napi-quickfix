@@ -697,8 +697,10 @@ the session log.
   makes `sendToTarget()` resolve `false` (nothing was sent, the sequence number
   is reused by the next send: hence the upsert), and a failed `getMessages`
   makes the engine disconnect so the peer reconnects and re-requests — QuickFIX's
-  own behaviour. A `setMessage` that settles after its timeout is not reported,
-  but its write still lands, and nothing holds back the session's next call
+  own behaviour. A call whose timeout passes before your method was even
+  invoked (the event loop was busy) is never run. A `setMessage` that settles
+  after its timeout is not reported, but its write still lands, and nothing
+  holds back the session's next call
   meanwhile: on a connection pool the late write can commit *after* the retry's
   write for the same sequence number, and a later resend of that number then
   delivers the message whose send resolved `false`. Keep one session's writes

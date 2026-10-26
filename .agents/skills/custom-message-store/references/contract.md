@@ -743,9 +743,12 @@ adapter both sides: 20 messages in order, acceptor store calls never overlap"
 executing when the next call for the same session arrives. For `setMessage`
 nothing in the engine stops the newer call, and on a pool the OLDER write can
 land last (D7: serialise per session); for `setSeqNums`/`reset` the engine
-stays poisoned until the late write has settled, then reloads (I4).
-Source: `[store.test]` "setSeqNums timeout then late resolve: poison,
-disconnect, reload after settlement, reconnect reconciles with PossDupFlag=Y".
+stays poisoned until the late write has settled, then reloads (I4). A call
+whose timeout passed while it still waited for the event loop is never
+handed to your adapter at all: only a call your method already received can
+overlap. Sources: `[store.test]` "setSeqNums timeout then late resolve: poison,
+disconnect, reload after settlement, reconnect reconciles with PossDupFlag=Y",
+"a call that times out before the adapter was called is never run".
 
 **H3. Your methods run on the JS event loop**; the engine thread that called is
 parked (not the loop) until your value or Promise settles, bounded by

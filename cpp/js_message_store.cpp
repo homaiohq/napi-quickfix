@@ -422,6 +422,22 @@ void JsMessageStoreFactory::CallJs(Napi::Env env, Napi::Function,
     settle(Failed(Status::kAborted, "engine tearing down"));
     return;
   }
+  // Nor for a call whose waiter gave up while it sat in the queue (the loop
+  // was busy): the engine has moved on, maybe retried it, and a stale
+  // setMessage run now could commit over the retry's row for the same
+  // seqnum. Dropped, it counts as a late settlement that wrote nothing.
+  bool expired = false;
+  self->shared_->pending.WithChannel(
+      data->channelId, [&](const std::shared_ptr<Channel>& ch) {
+        std::lock_guard<std::mutex> lock(ch->mtx);
+        expired = ch->expired && !ch->done;
+        return expired;  // nothing will settle it: erase here
+      });
+  if (expired) {
+    SettledLate(self->shared_, data->req.method, data->req.id,
+                "timed out before the adapter was called; not run");
+    return;
+  }
   Napi::HandleScope scope(env);
   Outcome sync = self->Invoke(env, data->req, data->channelId);
   // kPending: a Promise was bound and the continuation settles the channel
@@ -570,23 +586,28 @@ void JsMessageStoreFactory::OnSettled(const std::shared_ptr<Shared>& shared,
     return false;
   });
   if (!late) return;
-  // A timed-out call settled after its waiter was released with IOException.
-  // Only the fatal writes track this (the poison cannot lift before the
-  // write has landed): setSeqNums, reset, and the create() a reload issues
-  // for a missing row; a late setMessage/getMessages/load is discarded.
+  SettledLate(shared, method, id,
+              std::string(fulfilled ? "settled" : "rejected") +
+                  " after the timeout had already failed the call");
+}
+
+// JS thread: a timed-out call settled after its waiter was released with
+// IOException (OnSettled), or was dropped unrun (CallJs). Only the fatal
+// writes track this (the poison cannot lift before the write has landed):
+// setSeqNums, reset, and the create() a reload issues for a missing row; a
+// late setMessage/getMessages/load is discarded.
+void JsMessageStoreFactory::SettledLate(const std::shared_ptr<Shared>& shared,
+                                        Method method, const FIX::SessionID& id,
+                                        const std::string& how) {
   if (method != Method::kSetSeqNums && method != Method::kReset &&
       method != Method::kCreate) {
     return;
   }
   if (JsMessageStore* store = Lookup(id)) {
-    store->OnLateSettlement(method, fulfilled);
+    store->OnLateSettlement(method);
   }
   if (shared->factory != nullptr) {
-    shared->factory->ReportError(
-        id, method,
-        std::string(fulfilled ? "settled" : "rejected") +
-            " after the timeout had already failed the call",
-        /*poisoned=*/true, /*late=*/true);
+    shared->factory->ReportError(id, method, how, /*poisoned=*/true, /*late=*/true);
   }
 }
 
@@ -1081,8 +1102,9 @@ std::string JsMessageStore::LastError() const {
 // settlement racing that window arrives first and takes the counter to -1;
 // the increment then brings it back to 0. Every kExpired fatal call is
 // counted exactly once (CallDirect() never times out; teardown's ForceFulfil()
-// leaves nothing late), so the count is exact once both have run.
-void JsMessageStore::OnLateSettlement(Factory::Method /*method*/, bool /*fulfilled*/) {
+// leaves nothing late; one dropped unrun by CallJs() is settled there), so
+// the count is exact once both have run.
+void JsMessageStore::OnLateSettlement(Factory::Method /*method*/) {
   std::lock_guard<std::mutex> lock(mtx_);
   --unsettled_;
 }

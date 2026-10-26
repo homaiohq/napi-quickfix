@@ -269,6 +269,10 @@ class JsMessageStoreFactory : public FIX::MessageStoreFactory {
   static void OnSettled(const std::shared_ptr<Shared>& shared, Napi::Env env,
                         std::uint64_t channelId, bool fulfilled,
                         Napi::Value value);
+  // JS thread: a timed-out call settled late or was dropped unrun (`how`
+  // says which, for the report): balance the store's poison bookkeeping.
+  static void SettledLate(const std::shared_ptr<Shared>& shared, Method method,
+                          const FIX::SessionID& id, const std::string& how);
   static Outcome ParseResult(Napi::Env env, Method method, Napi::Value value);
   void DeliverReport(Napi::Env env, const CallData& data);
 
@@ -323,8 +327,9 @@ class JsMessageStore : public FIX::MessageStore {
   bool Poisoned() const;
   std::string LastError() const;
 
-  // JS thread, from the factory: a write that had timed out has settled.
-  void OnLateSettlement(Factory::Method method, bool fulfilled);
+  // JS thread, from the factory: a write that had timed out has settled, or
+  // was dropped before the adapter saw it.
+  void OnLateSettlement(Factory::Method method);
 
  private:
   Factory::State Snapshot() const;  // under C
