@@ -28,6 +28,11 @@ Bundles **QuickFIX v1.16.0** (statically linked, with three upstream fixes carri
   `MapMessageStore` (in-memory reference implementation) is exported. The contract,
   the failure policy, the threadpool and latency rules and `stop()`'s behaviour are in
   [README "Message store"](./README.md#message-store).
+- `.agents/skills/custom-message-store` (in the repository, not the npm package): an
+  agent skill for writing a custom `MessageStoreAdapter` (the contract as sourced rules,
+  the column mapping onto QuickFIX v1.16.0's `sessions`/`messages` tables for interop
+  with links to the upstream DDL, driver guidance from a PostgreSQL adapter trial
+  (issue #35), a test checklist).
 - `SessionSettings.getSessions(connectionType?)`: only the sessions an engine of that
   type would create.
 - `scripts/tsan.sh` and a ThreadSanitizer CI job over the suite, failing on a race in
