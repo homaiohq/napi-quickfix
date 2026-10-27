@@ -11,35 +11,58 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 Bundles **QuickFIX v1.16.0** (statically linked, unchanged).
 
+### Added
+
+- `MessageStoreAdapter`: a pluggable message store. Pass an adapter object (one per
+  engine, keyed by `SessionID`: `load`/`create`/`setSeqNums`/`setMessage`/`getMessages`/
+  `reset`/`close?`, each sync or async) to the new `Initiator.create()` /
+  `Acceptor.create()` factories to persist session state write-through in any database
+  Node can reach, through your own driver and pool. The factories preload every
+  session's state before constructing the engine, and also accept `'file'`/`'memory'`.
+  `storeTimeoutMs` (default 30 s, `0` disables) bounds each adapter call. Failures are
+  reported through the new `'storeError'` event (`sessionID, method, error, poisoned,
+  late`); a failed `setMessage` makes the send resolve `false`, a failed `setSeqNums`/
+  `reset` poisons the session's store until it has been reloaded, and a write the
+  engine gave up on is fenced so it cannot land under a later engine of the session.
+  `MapMessageStore` (in-memory reference implementation) is exported. The contract,
+  the failure policy, the threadpool and latency rules and `stop()`'s behaviour are in
+  [README "Message store"](./README.md#message-store).
+- `SessionSettings.getSessions(connectionType?)`: only the sessions an engine of that
+  type would create.
+- `scripts/tsan.sh` and a ThreadSanitizer CI job over the suite, failing on a race in
+  this addon's code or a QuickFIX race not known to be upstream's
+  (`scripts/tsan-gate.py`), and refusing a build the sanitizer did not instrument.
+
+### Changed
+
+- **Breaking:** `Session.logon()`, `Session.logout()`, `Session.refresh()`,
+  `Session.setNextSenderMsgSeqNum()` and `Session.setNextTargetMsgSeqNum()` now return
+  a `Promise<void>` and run on a libuv worker, like `sendToTarget()`: they take the
+  session-state mutex the engine holds across a store write, which with a
+  `MessageStoreAdapter` waits on the event loop, so taking it on the main thread
+  deadlocked the process. Migration: `await` them (or `.catch()` them). Calls on one
+  session still run in program order whether awaited or not, so `logout(); logon();`
+  ends enabled. Argument validation still throws synchronously (`TypeError`/
+  `RangeError`); `SessionNotFound` is now a rejection, which a `'logout'` listener fired
+  by `stop()` can see. The getters, state queries and option getters/setters stay
+  synchronous.
+- `Initiator.isLoggedOn()` with no argument reads each session's state instead of
+  taking the engine mutex, which QuickFIX holds while a connecting session reads the
+  store: with an adapter, polling it froze the event loop for `storeTimeoutMs` on each
+  reconnect.
+
 ### Fixed
 
-- Every `start()` and `stop()` call rooted one `Promise` for the rest of the process. Both
-  methods created a Promise deferred up front and left it unsettled on the path that
-  hands the work to a worker thread (the only path a live engine takes); the
-  `napi_deferred` behind it is a strong handle on the Promise and was never released.
-  8 bytes of native memory plus a V8 `Promise` and its global handle per call, found
-  with LeakSanitizer and a heap-snapshot diff. The promise is now built only where it is
-  settled on the spot.
-- The addon could not be loaded in a `worker_threads` Worker. The constructors of the
-  exported classes were module statics shared by every environment the addon was loaded
-  in: each Worker that imported the module overwrote them, deleting the previous
-  environment's references from the wrong thread (a use-after-free once that Worker had
-  exited, a cross-isolate handle release when it was the main thread), and the main
-  thread was left building its instances from a dead environment. Observed as glibc
-  heap corruption, a V8 fatal check at Worker teardown and a segmentation fault. The
-  constructors now live in per-environment instance data.
+- Every `start()` and `stop()` call rooted one `Promise` for the rest of the process (a
+  deferred created up front and never settled on the worker path). The promise is now
+  built only where it is settled.
+- The addon could not be loaded in a `worker_threads` Worker: the exported classes'
+  constructors were module statics shared by every environment, so each Worker
+  overwrote them (heap corruption, a V8 fatal check at Worker teardown, a segfault).
+  They now live in per-environment instance data.
 - `worker.terminate()` aborted the whole process when an engine callback was being
-  dispatched in the Worker at that moment. Once a Worker's environment is stopping,
-  every Node-API call that may run JS fails and node-addon-api's wrappers throw a
-  `Napi::Error`, which escaped the bridge's trampoline and terminated the process; and
-  a handler interrupted mid-call leaves V8's termination marker (`null`) as the pending
-  exception, which the wrappers cannot wrap without aborting. The trampoline now
-  catches what a stopping environment throws and lets such a callback pass through,
-  as it does after the engine's own teardown (any other `Napi::Error` still surfaces
-  as an uncaught exception), and the build defines node-addon-api's
-  `NODE_API_SWALLOW_UNTHROWABLE_EXCEPTIONS` for the interrupted-handler case, which is
-  told apart from a handler that threw so the interruption is not reported to QuickFIX
-  as a throw.
+  dispatched in the Worker at that moment. The bridge now lets such a callback pass
+  through, as it does after the engine's own teardown (see `ARCHITECTURE.md` §4).
 
 ### Known QuickFIX limitations
 

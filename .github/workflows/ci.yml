@@ -196,3 +196,75 @@ jobs:
 
       - name: Type-check tests
         run: yarn typecheck
+
+  # ---------------------------------------------------------------------------
+  # ThreadSanitizer: the addon and QuickFIX built with -fsanitize=thread, the
+  # whole suite run with libtsan preloaded (Node itself is not instrumented, so
+  # reports in node / V8 / libstdc++ frames are expected noise). The gate is on
+  # reports whose racing access is in this addon's own code (the message-store
+  # bridge parks QuickFIX threads on JS promises, and that is where a data race
+  # would live) or in QuickFIX outside its known upstream races. See
+  # scripts/tsan.sh and scripts/tsan-gate.py.
+  # ---------------------------------------------------------------------------
+  tsan:
+    name: thread sanitizer (ubuntu, node 22)
+    runs-on: ubuntu-latest
+    env:
+      YARN_ENABLE_GLOBAL_CACHE: 'false'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up CMake
+        uses: lukka/get-cmake@a89e43e22a96abafcd7a62db652a65ecd33052c9 # v4.4.4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Enable Corepack (pinned Yarn)
+        shell: bash
+        run: |
+          node -e "require('fs').mkdirSync(process.env.RUNNER_TEMP + '/corepack', { recursive: true })"
+          corepack enable --install-directory "$RUNNER_TEMP/corepack"
+          echo "$RUNNER_TEMP/corepack" >> "$GITHUB_PATH"
+
+      - name: Cache Yarn
+        uses: actions/cache@v6
+        with:
+          path: .yarn/cache
+          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-
+
+      # Its own cache namespace: build-tsan/_deps holds QuickFIX objects compiled
+      # with -fsanitize=thread (the archive goes to build-tsan/lib), which must
+      # not be linked into a regular addon. v2: the v1 entries were built
+      # without instrumentation (the flags never reached the compiler).
+      - name: Cache CMake FetchContent deps (TSan)
+        uses: actions/cache@v6
+        with:
+          path: build-tsan/_deps
+          key: cmake-deps-tsan-v2-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            cmake-deps-tsan-v2-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: yarn install --immutable --mode=skip-build
+
+      # The TS build is needed by the tests; the regular native build is not
+      # (the script places the TSan binary where the loader looks).
+      - name: Build TypeScript
+        run: yarn build:ts
+
+      - name: Build with ThreadSanitizer and run the suite
+        run: scripts/tsan.sh
+
+      - name: Upload TSan logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tsan-logs
+          path: build-tsan/logs
+          if-no-files-found: ignore

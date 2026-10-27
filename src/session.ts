@@ -20,18 +20,27 @@ import { SessionID, toNativeSessionID } from './session-id.js';
  * same id. A handle never crosses over to another engine's session; obtain a
  * new one from the new engine.
  *
- * **Everything is synchronous.** State queries, sequence-number access, the
- * runtime option getters/setters, {@link Session.logon}, {@link Session.logout}
- * and {@link Session.refresh} never take the mutex QuickFIX holds while running
- * your application handlers, so they cannot deadlock the main thread, and calls
- * made in program order take effect in program order. ({@link Session.logon} /
- * {@link Session.logout} flip a plain flag the engine's network thread reads
- * without a lock, exactly as QuickFIX's own `Initiator::stop()` does; the
- * engine picks the change up on its next pass.) QuickFIX's
- * `Session::disconnect()` / `reset()` are deliberately not exposed: they are
- * only safe on the engine's own network thread (see ARCHITECTURE.md §5). Use
- * {@link Session.logout} to bring a session down, and the sequence-number
- * setters to reset its numbering -- on a quiet session; see
+ * **Sync and async members.** State queries, the sequence-number getters and
+ * the runtime option getters/setters are synchronous. {@link Session.logon},
+ * {@link Session.logout}, {@link Session.refresh},
+ * {@link Session.setNextSenderMsgSeqNum} and
+ * {@link Session.setNextTargetMsgSeqNum} return a Promise: they take the
+ * session-state mutex that the engine holds while it writes to the message
+ * store, and with a {@link MessageStoreAdapter} that write waits on the event
+ * loop, so taking the mutex on the main thread would deadlock the process.
+ * They therefore run on a worker thread, like {@link sendToTarget}. Calls on
+ * one session are serialised in program order, awaited or not:
+ * `session.logout('x'); session.logon();` lands in that order. Their latency is
+ * that of the worker pool: they queue behind in-flight `sendToTarget` calls,
+ * each of which may be waiting on a store write (see the README). Once the
+ * owning engine is gone they reject with `SessionNotFound`.
+ * ({@link Session.logon} / {@link Session.logout} flip a plain flag the
+ * engine's network thread reads without a lock, exactly as QuickFIX's own
+ * `Initiator::stop()` does; the engine picks the change up on its next pass.)
+ * QuickFIX's `Session::disconnect()` / `reset()` are deliberately not exposed:
+ * they are only safe on the engine's own network thread (see ARCHITECTURE.md
+ * §5). Use {@link Session.logout} to bring a session down, and the
+ * sequence-number setters to reset its numbering -- on a quiet session; see
  * {@link Session.setNextSenderMsgSeqNum}.
  *
  * @example
@@ -39,17 +48,20 @@ import { SessionID, toNativeSessionID } from './session-id.js';
  * const session = initiator.getSession(sessionID)!;
  * if (session.isLoggedOn()) {
  *   console.log('next outbound seq', session.getExpectedSenderNum());
- *   session.logout('maintenance');
+ *   await session.logout('maintenance');
  * }
  * ```
  */
 export class Session {
   /** @internal Underlying native handle. */
   readonly #native: NativeSession;
+  /** @internal The serial-chain key (`sessionID.toString()`), see {@link serialise}. */
+  readonly #key: string;
 
   /** @internal Use {@link lookupSession} / {@link Engine.getSession}. */
   private constructor(handle: NativeSession) {
     this.#native = handle;
+    this.#key = SessionID.fromNative(handle.getSessionID()).toString();
   }
 
   /** @internal Wrap an existing native session handle. */
@@ -139,30 +151,42 @@ export class Session {
 
   /**
    * Set the MsgSeqNum the next outbound message will carry (writes to the
-   * message store; a file store may throw `IOException`).
+   * message store). Runs on a worker thread, serialised with the other
+   * control calls on this session; resolves once the store has acknowledged
+   * the write.
    *
    * **Call it on a quiet session.** The setter is not serialised against a
    * message the engine is sending or receiving on this session at the same
    * time: QuickFIX reads the next number into the outbound header, runs your
    * `toApp`/`toAdmin` handler, then increments from the store, all under a
-   * lock this call does not (and must not) take. A value set inside that
-   * window -- from a handler, or while a {@link sendToTarget} promise or a
-   * heartbeat is in flight on this session -- is overwritten by the increment,
-   * and the session ends up one off from its counterparty (a Resend Request or
-   * a "MsgSeqNum too low" Logout). Set it before {@link Engine.start}, from a
+   * lock this call does not take. A value set inside that window -- from a
+   * handler, or while a {@link sendToTarget} promise or a heartbeat is in
+   * flight on this session -- is overwritten by the increment, and the
+   * session ends up one off from its counterparty (a Resend Request or a
+   * "MsgSeqNum too low" Logout). With a {@link MessageStoreAdapter} (and
+   * `PersistMessages=Y`, the default), a value set after the outbound header
+   * was stamped but before the message was written makes that send fail
+   * instead: `sendToTarget()` resolves `false`, a non-poisoning
+   * `'storeError'` names the mismatch, and the new number stands. Set it before {@link Engine.start}, from a
    * `'logout'` event, or when you know nothing is in flight; never from a
    * handler.
    *
-   * @throws `RangeError` if `seqNum` is not a positive safe integer (MsgSeqNum is
-   * 1-based).
+   * @throws `RangeError` synchronously if `seqNum` is not a positive safe
+   *   integer (MsgSeqNum is 1-based).
+   * @returns Rejects with a {@link QuickFixError}: `SessionNotFound` once the
+   *   engine is gone (a `'logout'` listener fired by `stop()` may see this),
+   *   `IOException` if the store refused the write.
    */
-  setNextSenderMsgSeqNum(seqNum: number): void {
-    this.#native.setNextSenderMsgSeqNum(seqNum);
+  setNextSenderMsgSeqNum(seqNum: number): Promise<void> {
+    checkSeqNum(seqNum, 'setNextSenderMsgSeqNum');
+    return serialise(this.#key, () => this.#native.setNextSenderMsgSeqNum(seqNum));
   }
 
   /**
    * Set the MsgSeqNum expected on the next inbound message (writes to the
-   * message store; a file store may throw `IOException`).
+   * message store). Runs on a worker thread, serialised with the other
+   * control calls on this session; resolves once the store has acknowledged
+   * the write.
    *
    * **Call it on a quiet session.** Like {@link Session.setNextSenderMsgSeqNum},
    * it is not serialised against a message the engine is processing on this
@@ -172,11 +196,14 @@ export class Session {
    * before {@link Engine.start}, from a `'logout'` event, or when you know
    * nothing is in flight; never from a handler.
    *
-   * @throws `RangeError` if `seqNum` is not a positive safe integer (MsgSeqNum is
-   * 1-based).
+   * @throws `RangeError` synchronously if `seqNum` is not a positive safe
+   *   integer (MsgSeqNum is 1-based).
+   * @returns Rejects with a {@link QuickFixError}: `SessionNotFound` once the
+   *   engine is gone, `IOException` if the store refused the write.
    */
-  setNextTargetMsgSeqNum(seqNum: number): void {
-    this.#native.setNextTargetMsgSeqNum(seqNum);
+  setNextTargetMsgSeqNum(seqNum: number): Promise<void> {
+    checkSeqNum(seqNum, 'setNextTargetMsgSeqNum');
+    return serialise(this.#key, () => this.#native.setNextTargetMsgSeqNum(seqNum));
   }
 
   // --- runtime options -----------------------------------------------------------
@@ -312,32 +339,94 @@ export class Session {
   /**
    * Enable the session. An initiator session reconnects and logs on at its
    * next `ReconnectInterval`; an acceptor session accepts the next inbound
-   * Logon. Takes effect immediately ({@link Session.isEnabled} is `true` on
-   * return); observe the handshake through the engine's `'logon'` event.
+   * Logon. Resolves once the flag is set ({@link Session.isEnabled} is `true`
+   * then); observe the handshake through the engine's `'logon'` event.
+   *
+   * @returns Rejects with a {@link QuickFixError} (`SessionNotFound`) once the
+   *   engine is gone.
    */
-  logon(): void {
-    this.#native.logon();
+  logon(): Promise<void> {
+    return serialise(this.#key, () => this.#native.logon());
   }
 
   /**
    * Disable the session and initiate a graceful Logout (sent with `reason` as
    * tag 58 on the next engine tick). The session stays disabled — it will not
-   * reconnect — until {@link Session.logon}. Takes effect immediately
-   * ({@link Session.isEnabled} is `false` on return); observe completion
-   * through the engine's `'logout'` event.
+   * reconnect — until {@link Session.logon}. Resolves once the flag is cleared
+   * ({@link Session.isEnabled} is `false` then); observe completion through
+   * the engine's `'logout'` event.
+   *
+   * @returns Rejects with a {@link QuickFixError} (`SessionNotFound`) once the
+   *   engine is gone.
    */
-  logout(reason?: string): void {
-    this.#native.logout(reason);
+  logout(reason?: string): Promise<void> {
+    if (reason !== undefined && typeof reason !== 'string') {
+      throw new TypeError('logout(reason?: string)');
+    }
+    return serialise(this.#key, () => this.#native.logout(reason));
   }
 
   /**
    * Re-read the session state (sequence numbers etc.) from the message store.
    *
-   * @throws {QuickFixError} `IOException` if the store cannot be read.
+   * @returns Rejects with a {@link QuickFixError}: `IOException` if the store
+   *   cannot be read (or a `stop(true)` aborted the read), `SessionNotFound`
+   *   once the engine is gone.
    */
-  refresh(): void {
-    this.#native.refresh();
+  refresh(): Promise<void> {
+    return serialise(this.#key, () => this.#native.refresh());
   }
+}
+
+/* ------------------------------------------------------------------------- *
+ * Per-session serial chain for the worker-thread members.
+ *
+ * The native members queue an AsyncWorker each, and two workers may run on
+ * two pool threads in either order; `logout(); logon();` must still end
+ * enabled. The chain is keyed by `sessionID.toString()` at module level, not
+ * per `Session` instance: every `getSession()` / `lookupSession()` call hands
+ * out a fresh handle, so a per-instance chain would serialise nothing. The
+ * entry is removed once its chain has drained (and no engine or handle is
+ * referenced from it), so the map never pins an engine and does not grow with
+ * the number of ids seen.
+ *
+ * Scope: one JS realm, shared by the ESM and CJS builds through a global
+ * symbol: a handle from each build on the same session must queue on one
+ * chain, or `esm.logout(); cjs.logon();` races.
+ * ------------------------------------------------------------------------- */
+
+const CHAINS_KEY = Symbol.for('@homaiohq/napi-quickfix:sessionChains');
+const chains: Map<string, Promise<void>> = ((globalThis as Record<symbol, unknown>)[CHAINS_KEY] ??= new Map<
+  string,
+  Promise<void>
+>()) as Map<string, Promise<void>>;
+
+// Argument validation happens here, before the call is chained, so a bad
+// argument is a synchronous TypeError/RangeError (as for every other member)
+// rather than a rejection; the native setter checks again.
+function checkSeqNum(seqNum: number, name: string): void {
+  if (typeof seqNum !== 'number') {
+    throw new TypeError(`${name}(seqNum: number)`);
+  }
+  if (!Number.isSafeInteger(seqNum) || seqNum < 1) {
+    throw new RangeError(`${name}: seqNum must be a positive safe integer`);
+  }
+}
+
+function serialise<T>(key: string, op: () => Promise<T>): Promise<T> {
+  const prev = chains.get(key) ?? Promise.resolve();
+  // Run after the previous call settled, whatever its outcome; the caller
+  // gets this call's own result.
+  const run = prev.then(op);
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  chains.set(key, tail);
+  void tail.then(() => {
+    if (chains.get(key) === tail) chains.delete(key);
+  });
+  return run;
 }
 
 /**

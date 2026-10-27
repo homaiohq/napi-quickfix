@@ -10,9 +10,11 @@
 #include <utility>
 
 #include "errors.h"
+#include "js_message_store.h"
 #include "quickfix/Exceptions.h"
 #include "quickfix/FieldTypes.h"
 #include "session_id_wrap.h"
+#include "session_op_gate.h"
 
 namespace napi_quickfix {
 
@@ -235,6 +237,23 @@ Napi::Value SessionWrap::TimeCheck(const Napi::CallbackInfo& info,
 // not a positive safe integer. MsgSeqNum (tag 34) is 1-based: QuickFIX's own
 // SessionState::reset() and MemoryStore start at 1, and a peer answers 34=0
 // with a Logout ("MsgSeqNum too low").
+//
+// The write itself runs on a worker (see the control section below): it
+// takes SessionState::m_mutex and writes to the message store. It is NOT
+// serialised against the engine: Session::sendRaw holds Session::m_mutex
+// across fill() (reads the next sender num into the header), toApp/toAdmin
+// and persist() (incrNextSenderMsgSeqNum from the store), and Session::next()
+// likewise across the target-num verification, fromApp/fromAdmin and
+// incrNextTargetMsgSeqNum. A setter landing inside that window -- from a
+// handler, or while a sendToTarget() / heartbeat is in flight on this
+// session -- is overwritten by the increment that follows, and the wire is
+// left one off from the peer. With a JS message store and PersistMessages=Y,
+// a sender number set after fill() stamped the header but before persist()
+// wrote the message makes that send fail instead (JsMessageStore::CheckStamp
+// refuses it: nothing is sent, and the new number stands). The setters are meant for a quiescent session
+// (before start(), from a 'logout' event, or when the caller knows nothing is
+// in flight); documented on the JS API, not fixable here (m_mutex is
+// private).
 Napi::Value SessionWrap::SeqNumSet(const Napi::CallbackInfo& info, bool sender,
                                    const char* name) {
   Napi::Env env = info.Env();
@@ -249,28 +268,13 @@ Napi::Value SessionWrap::SeqNumSet(const Napi::CallbackInfo& info, bool sender,
         env, std::string(name) + ": seqNum must be a positive safe integer");
   }
   const FIX::SEQNUM num = static_cast<FIX::SEQNUM>(raw);
-  NQ_TRY(env) {
-    // These touch the MessageStore (may throw IOException) but take only the
-    // SessionState mutex, which QuickFIX never holds across a callback -- that
-    // is what makes them safe to run here. It also means they are NOT
-    // serialised against the engine: Session::sendRaw holds m_mutex across
-    // fill() (reads the next sender num into the header), toApp/toAdmin and
-    // persist() (incrNextSenderMsgSeqNum from the store), and Session::next()
-    // likewise across the target-num verification, fromApp/fromAdmin and
-    // incrNextTargetMsgSeqNum. A setter landing inside that window -- from a
-    // handler, or while a sendToTarget() / heartbeat is in flight on this
-    // session -- is overwritten by the increment that follows, and the wire
-    // is left one off from the peer. The setters are meant for a quiescent
-    // session (before start(), from a 'logout' event, or when the caller
-    // knows nothing is in flight); documented on the JS API, not fixable here
-    // (m_mutex is private and must not be taken from the JS thread anyway).
+  return RunOnWorker(info, [sender, num](FIX::Session& session) {
     if (sender) {
-      Resolve().setNextSenderMsgSeqNum(num);
+      session.setNextSenderMsgSeqNum(num);
     } else {
-      Resolve().setNextTargetMsgSeqNum(num);
+      session.setNextTargetMsgSeqNum(num);
     }
-    return env.Undefined();
-  } NQ_CATCH(env)
+  });
 }
 
 // --- state getters -----------------------------------------------------------
@@ -305,11 +309,34 @@ Napi::Value SessionWrap::IsLogonTime(const Napi::CallbackInfo& info) {
 
 // --- sequence numbers --------------------------------------------------------
 
+// With a file/memory store: FIX::Session::getExpected* -> SessionState::
+// getNext* under SessionState::m_mutex, which no thread holds across a wait
+// on the JS loop in that configuration. With a JS store that mutex IS held
+// across such waits (by whichever QuickFIX or libuv thread is in a store
+// call), so the handle bypasses FIX::Session and reads the JsMessageStore
+// cache under the store's own leaf mutex instead; IOException (as a
+// QuickFixError) when the store is poisoned. Both branches run on the JS
+// thread, where stores are created and destroyed, so the store found is
+// alive for the duration of the call.
 Napi::Value SessionWrap::GetExpectedSenderNum(const Napi::CallbackInfo& info) {
-  return IntGet(info, &FIX::Session::getExpectedSenderNum);
+  Napi::Env env = info.Env();
+  NQ_TRY(env) {
+    FIX::Session& session = Resolve();
+    if (JsMessageStore* store = JsMessageStoreFactory::Lookup(id_)) {
+      return Napi::Number::New(env, static_cast<double>(store->CachedNextSender()));
+    }
+    return Napi::Number::New(env, static_cast<double>(session.getExpectedSenderNum()));
+  } NQ_CATCH(env)
 }
 Napi::Value SessionWrap::GetExpectedTargetNum(const Napi::CallbackInfo& info) {
-  return IntGet(info, &FIX::Session::getExpectedTargetNum);
+  Napi::Env env = info.Env();
+  NQ_TRY(env) {
+    FIX::Session& session = Resolve();
+    if (JsMessageStore* store = JsMessageStoreFactory::Lookup(id_)) {
+      return Napi::Number::New(env, static_cast<double>(store->CachedNextTarget()));
+    }
+    return Napi::Number::New(env, static_cast<double>(session.getExpectedTargetNum()));
+  } NQ_CATCH(env)
 }
 Napi::Value SessionWrap::SetNextSenderMsgSeqNum(
     const Napi::CallbackInfo& info) {
@@ -379,20 +406,35 @@ Napi::Value SessionWrap::SetTimestampPrecision(const Napi::CallbackInfo& info) {
 }
 
 // --- control ------------------------------------------------------------------
-// FIX::Session::logon()/logout() only flip SessionState's `enabled` flag and
-// `logoutReason` (the latter under SessionState's own mutex), and refresh()
-// re-reads the store under that same mutex; none of them take
-// FIX::Session::m_mutex or fire a callback, so they cannot deadlock the JS
-// thread against a QuickFIX thread blocked in a handler. That is the property
-// that lets them run here. What they are NOT is race-free: `enabled` is a
-// plain bool that SessionState::enabled(bool) stores with no lock and that
-// the engine's network thread reads in Session::next() under Session::m_mutex
-// -- formally a data race (ThreadSanitizer reports it), the same one
-// FIX::Initiator::stop() makes when it calls logout()/logon() on every session
-// from the stopping thread. In practice the network thread observes the flag
-// on its next pass; this binding does not patch QuickFIX to make it atomic.
-// Keeping them synchronous also keeps them ORDERED: as AsyncWorkers,
-// `logout(); logon();` could have run on two pool threads in either order.
+// logon()/logout()/refresh() and the two sequence-number setters run on a
+// libuv worker, like sendToTarget(), and return a Promise. The reason is the
+// lock they take, not the work they do: each goes through SessionState, whose
+// mutex a QuickFIX network thread -- or a sendToTarget() worker, which runs
+// Session::sendRaw -- holds while it persists through the message store. With
+// a JS message store (js_message_store.h) that thread is parked under the
+// mutex until the JS event loop has served its call; a member taking the same
+// mutex ON the JS thread would then block the loop that has to release it:
+// LOOP -> SessionState::m_mutex -> LOOP, a hard deadlock of the whole process
+// (reproduced in the issue #29 spike, with or without a JS store call in
+// flight at the time of the call, since even a synchronous adapter runs on the
+// loop). On a worker the loop stays free and the member merely waits its
+// turn. The JS layer serialises these five members per session, so
+// `logout(); logon();` still takes effect in that order.
+//
+// logon()/logout() flip SessionState's `enabled` flag, a plain bool that the
+// engine's network thread reads in Session::next() under Session::m_mutex
+// while these members write it without one -- formally a data race, the same
+// one FIX::Initiator::stop() makes when it calls logout()/logon() on every
+// session from the stopping thread. In practice the network thread observes
+// the flag on its next pass; this binding does not patch QuickFIX to make it
+// atomic.
+//
+// The worker holds the engine's SessionOpGate for the whole operation
+// (SessionOpGate::Acquire), exactly as SendToTargetWorker does, so the engine
+// cannot destroy the session under it; the gate was bound when the handle was
+// created, so the operation can never run against a later engine that reuses
+// the id. The pre-check on the JS thread rejects a handle whose engine is
+// already gone without queuing anything.
 //
 // FIX::Session::disconnect() and reset() are deliberately NOT exposed. Through
 // the session's responder they reach FIX::SocketMonitor::drop(), which mutates
@@ -402,12 +444,89 @@ Napi::Value SessionWrap::SetTimestampPrecision(const Napi::CallbackInfo& info) {
 // this binding could run them on -- JS or libuv -- races it. logout() is the
 // supported way to bring a session down from the application.
 
-Napi::Value SessionWrap::Logon(const Napi::CallbackInfo& info) {
+namespace {
+
+class SessionOpWorker : public Napi::AsyncWorker {
+ public:
+  SessionOpWorker(Napi::Env env, FIX::SessionID id,
+                  std::shared_ptr<SessionOpGate> gate,
+                  std::function<void(FIX::Session&)> op)
+      : Napi::AsyncWorker(env),
+        deferred_(Napi::Promise::Deferred::New(env)),
+        id_(std::move(id)),
+        gate_(std::move(gate)),
+        op_(std::move(op)) {}
+
+  Napi::Promise Promise() { return deferred_.Promise(); }
+
+  // Worker thread. NO Napi/JS access.
+  void Execute() override {
+    try {
+      std::unique_ptr<SessionOpGate::OpScope> inflight =
+          SessionOpGate::Acquire(gate_, id_);
+      if (!inflight) {
+        throw FIX::SessionNotFound(id_.toString());
+      }
+      FIX::Session* session = FIX::Session::lookupSession(id_);
+      if (session == nullptr) {
+        throw FIX::SessionNotFound(id_.toString());
+      }
+      op_(*session);
+    } catch (const std::exception& e) {
+      err_.Capture(e);
+    } catch (...) {
+      err_.has = true;
+      err_.message = "unknown native error";
+      err_.fixErrorName = "Error";
+    }
+  }
+
+  void OnOK() override {
+    Napi::Env env = Env();
+    Napi::HandleScope scope(env);
+    if (err_.has) {
+      deferred_.Reject(err_.ToError(env).Value());
+    } else {
+      deferred_.Resolve(env.Undefined());
+    }
+  }
+
+  void OnError(const Napi::Error& e) override {
+    Napi::HandleScope scope(Env());
+    deferred_.Reject(e.Value());
+  }
+
+ private:
+  Napi::Promise::Deferred deferred_;
+  FIX::SessionID id_;
+  std::shared_ptr<SessionOpGate> gate_;
+  std::function<void(FIX::Session&)> op_;
+  CapturedError err_;
+};
+
+}  // namespace
+
+Napi::Value SessionWrap::RunOnWorker(const Napi::CallbackInfo& info,
+                                     std::function<void(FIX::Session&)> op) {
   Napi::Env env = info.Env();
-  NQ_TRY(env) {
-    Resolve().logon();
-    return env.Undefined();
-  } NQ_CATCH(env)
+  // Same owner check as Resolve(), on the JS thread: a handle whose engine
+  // is gone (or whose id now belongs to another engine) is refused before
+  // anything is queued. The worker re-checks under the gate.
+  if (!gate_ || SessionOpGate::Lookup(id_) != gate_) {
+    CapturedError err;
+    err.Capture(FIX::SessionNotFound(id_.toString()));
+    auto deferred = Napi::Promise::Deferred::New(env);
+    deferred.Reject(err.ToError(env).Value());
+    return deferred.Promise();
+  }
+  auto* worker = new SessionOpWorker(env, id_, gate_, std::move(op));
+  Napi::Promise promise = worker->Promise();
+  worker->Queue();
+  return promise;
+}
+
+Napi::Value SessionWrap::Logon(const Napi::CallbackInfo& info) {
+  return RunOnWorker(info, [](FIX::Session& session) { session.logon(); });
 }
 
 Napi::Value SessionWrap::Logout(const Napi::CallbackInfo& info) {
@@ -419,19 +538,28 @@ Napi::Value SessionWrap::Logout(const Napi::CallbackInfo& info) {
     }
     reason = info[0].As<Napi::String>().Utf8Value();
   }
-  NQ_TRY(env) {
-    Resolve().logout(reason);
-    return env.Undefined();
-  } NQ_CATCH(env)
+  return RunOnWorker(
+      info, [reason](FIX::Session& session) { session.logout(reason); });
 }
 
-// May throw IOException from the message store (mapped to QuickFixError).
+// Rejects with IOException (as a QuickFixError) if the message store cannot
+// be read, including when stop(true) aborted the read. A JsMessageStore's
+// refresh() never throws into QuickFIX (it poisons instead, see
+// js_message_store.h), so the worker asks it afterwards.
 Napi::Value SessionWrap::Refresh(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  NQ_TRY(env) {
-    Resolve().refresh();
-    return env.Undefined();
-  } NQ_CATCH(env)
+  const FIX::SessionID id = id_;
+  return RunOnWorker(info, [id](FIX::Session& session) {
+    session.refresh();
+    if (JsMessageStore::TakeRefreshAborted()) {
+      throw FIX::IOException("message store refresh: engine tearing down");
+    }
+    if (JsMessageStore* store = JsMessageStoreFactory::Lookup(id)) {
+      if (store->Poisoned()) {
+        throw FIX::IOException("message store refresh failed (" +
+                               store->LastError() + ")");
+      }
+    }
+  });
 }
 
 }  // namespace napi_quickfix

@@ -15,10 +15,19 @@ import {
 import { Message } from './message.js';
 import { SessionID, toNativeSessionID } from './session-id.js';
 import { Session } from './session.js';
+import {
+  StoreBinding,
+  isMessageStoreAdapter,
+  isStoreBinding,
+  withTimeout,
+  type MessageStoreAdapter,
+  type MessageStoreMethod,
+} from './store.js';
 import type { ApplicationHandlers } from './application.js';
 import type { SessionSettings } from './session-settings.js';
+import type { QuickFixError } from './native.js';
 
-/** Options for constructing an {@link Initiator} or {@link Acceptor}. */
+/** Options for constructing an {@link Initiator} or {@link Acceptor} with `new`. */
 export interface EngineOptions {
   /** Parsed session settings ({@link SessionSettings.fromString}/`fromFile`). */
   settings: SessionSettings;
@@ -27,10 +36,34 @@ export interface EngineOptions {
    * throw to reject inbound ones (see {@link ApplicationHandlers}).
    */
   handlers?: ApplicationHandlers;
-  /** Message-store factory. Defaults to the engine's default (`'file'`). */
+  /**
+   * Message store: QuickFIX's file store (the default) or its memory store. A
+   * {@link MessageStoreAdapter} is accepted by {@link Initiator.create} /
+   * {@link Acceptor.create} only (its state has to be loaded before the engine
+   * can be constructed); passing one here throws a `TypeError`.
+   */
   store?: 'file' | 'memory';
   /** Log factory. Defaults to the engine's default. */
   log?: 'screen' | 'file' | 'none';
+}
+
+/** Options for {@link Initiator.create} / {@link Acceptor.create}. */
+export interface CreateEngineOptions extends Omit<EngineOptions, 'store'> {
+  /**
+   * Message store: `'file'` (default), `'memory'`, or a
+   * {@link MessageStoreAdapter} persisting through your own driver (README:
+   * "Message store").
+   */
+  store?: 'file' | 'memory' | MessageStoreAdapter;
+  /**
+   * With an adapter: how long one adapter call may take, in milliseconds,
+   * before it fails with `IOException` (also `create()`'s wait for writes an
+   * earlier engine of its sessions left pending). An integer from `0` to
+   * `2147483647`, else `create()` throws `RangeError`; default `30_000`; `0`
+   * disables it. Passing it with `'file'`/`'memory'` is a `TypeError`. The
+   * trade-off is in README "Message store" ("Timeout").
+   */
+  storeTimeoutMs?: number;
 }
 
 /**
@@ -46,6 +79,19 @@ export interface EngineEvents {
   fromAdmin: [message: Message, sessionID: SessionID];
   toApp: [message: Message, sessionID: SessionID];
   fromApp: [message: Message, sessionID: SessionID];
+  /**
+   * A {@link MessageStoreAdapter} call failed (rejected, threw, returned a
+   * malformed value or timed out), or the engine refused a write, or a call it
+   * had given up on settled. `error` is an `IOException` `QuickFixError`.
+   * `poisoned`: the session's store refuses writes until it has been reloaded
+   * from the adapter. `late`: the report is about a call the engine had
+   * already given up on (it timed out and settled afterwards or was dropped
+   * unrun, or it was abandoned at teardown and settled after
+   * {@link Engine.stop}); `false` for the timeout itself. Observe-only. What
+   * each case means for the session: README "Message store" ("Failure
+   * policy").
+   */
+  storeError: [sessionID: SessionID, method: MessageStoreMethod, error: QuickFixError, poisoned: boolean, late: boolean];
 }
 
 /**
@@ -62,6 +108,12 @@ export interface EngineEvents {
 export abstract class Engine extends EventEmitter {
   /** @internal Underlying native engine handle. */
   readonly #native: NativeEngine;
+  /** @internal The message-store binding when built with an adapter. */
+  readonly #store: StoreBinding | undefined;
+  /** @internal The in-flight `stop()`: a stop() made meanwhile joins it. */
+  #stopping: Promise<void> | undefined;
+  /** @internal The adapter's `close()` has run (it runs once per engine). */
+  #closed = false;
 
   /**
    * @param Native The native engine constructor (`InitiatorWrap`/`AcceptorWrap`).
@@ -69,6 +121,24 @@ export abstract class Engine extends EventEmitter {
    */
   protected constructor(Native: NativeEngineConstructor, options: EngineOptions) {
     super();
+
+    // A MessageStoreAdapter needs its state loaded before the engine exists:
+    // that is what the async create() factories do. They hand the constructor
+    // an internal StoreBinding in `store`'s place; anything else that is an
+    // object is a bare adapter passed to `new`.
+    let store: 'file' | 'memory' | undefined;
+    let binding: StoreBinding | undefined;
+    if (isStoreBinding(options.store)) {
+      binding = options.store;
+    } else if (options.store === undefined || options.store === 'file' || options.store === 'memory') {
+      store = options.store;
+    } else if (isMessageStoreAdapter(options.store)) {
+      throw new TypeError(
+        `${new.target.name}: a MessageStoreAdapter must be passed to ${new.target.name}.create(), not to new ${new.target.name}()`,
+      );
+    } else {
+      throw new TypeError(`${new.target.name}: store must be 'file', 'memory' or a MessageStoreAdapter`);
+    }
 
     const userHandlers = options.handlers ?? {};
 
@@ -122,12 +192,80 @@ export abstract class Engine extends EventEmitter {
       },
     };
 
+    this.#store = binding;
+    if (binding) {
+      binding.emit = (method, sessionID, error, poisoned, late) => {
+        this.emit('storeError', sessionID, method, error, poisoned, late);
+      };
+    }
     this.#native = new Native({
       settings: options.settings.nativeHandle,
       handlers: nativeHandlers,
-      store: options.store,
+      store: binding ? binding.bridge : store,
+      storeStates: binding?.states,
+      storeTimeoutMs: binding?.timeoutMs,
       log: options.log,
     });
+  }
+
+  /**
+   * @internal Shared body of {@link Initiator.create} / {@link Acceptor.create}:
+   * preload the adapter's state for every session the engine will own, build
+   * the engine with the internal binding, and await the store calls the
+   * constructor itself made (a `reset()` for a session constructed outside
+   * its session time), tearing the engine down if one of them failed.
+   */
+  protected static async createEngine<T extends Engine>(
+    connectionType: 'initiator' | 'acceptor',
+    options: CreateEngineOptions,
+    make: (options: EngineOptions) => T,
+  ): Promise<T> {
+    const { store, storeTimeoutMs, ...rest } = options;
+    if (store === undefined || store === 'file' || store === 'memory') {
+      if (storeTimeoutMs !== undefined) {
+        throw new TypeError('storeTimeoutMs applies to a MessageStoreAdapter only');
+      }
+      return make({ ...rest, store });
+    }
+    if (!isMessageStoreAdapter(store)) {
+      throw new TypeError("store must be 'file', 'memory' or a MessageStoreAdapter");
+    }
+    // Checked here, before the preload's first adapter call, and only here
+    // (the native constructor merely asserts it). Capped at 2^31-1: above it
+    // a timer fires after 1 ms (TimeoutOverflowWarning), failing every
+    // preload call as "timed out".
+    if (
+      storeTimeoutMs !== undefined &&
+      (!Number.isInteger(storeTimeoutMs) || storeTimeoutMs < 0 || storeTimeoutMs > 2_147_483_647)
+    ) {
+      throw new RangeError('storeTimeoutMs must be an integer from 0 to 2147483647 (0 disables the timeout)');
+    }
+    const timeoutMs = storeTimeoutMs ?? 30_000;
+    const ids = options.settings.getSessions(connectionType);
+    const states = await StoreBinding.preload(store, ids, timeoutMs);
+    const binding = new StoreBinding(store, timeoutMs, states);
+    binding.collecting = [];
+    let engine: T;
+    let collected: Promise<unknown>[];
+    try {
+      engine = make({ ...rest, store: binding as unknown as 'memory' });
+    } catch (err) {
+      // The constructor threw (ConfigError): the store calls it made before
+      // throwing, if any, are observed so none is an unhandled rejection.
+      await Promise.allSettled(binding.collecting);
+      throw err;
+    } finally {
+      collected = binding.collecting;
+      binding.collecting = null;
+    }
+    try {
+      // Only reset() is called on the JS thread (see createEngine's JSDoc).
+      await withTimeout(Promise.all(collected), timeoutMs, 'reset');
+    } catch (err) {
+      await engine.stop(true).catch(() => {});
+      throw err;
+    }
+    return engine;
   }
 
   /**
@@ -154,7 +292,11 @@ export abstract class Engine extends EventEmitter {
    * sessions are destroyed. A `stop()` called while another is still in flight
    * (even from a `'logout'` listener that stop fired) returns the same Promise,
    * so it too settles only once the sessions are gone; the first call's
-   * `force` applies to both.
+   * `force` applies to both. With a {@link MessageStoreAdapter}, a graceful
+   * stop lets in-flight store writes complete and calls the adapter's
+   * `close()` for every session before settling; `stop(true)` fails every
+   * pending store call first. Store failures here are `'storeError'`s, never
+   * a rejection. Details: README "Message store" (`stop()`).
    *
    * @param force When `true`, aborts immediately instead of draining gracefully.
    *
@@ -164,7 +306,38 @@ export abstract class Engine extends EventEmitter {
    * ```
    */
   stop(force?: boolean): Promise<void> {
-    return this.#native.stop(force);
+    if (this.#stopping) return this.#stopping;
+    const native = this.#native.stop(force);
+    // stop(true) has just failed every pending store call (the native side
+    // deactivated its store bridge synchronously): whatever the adapter still
+    // runs is abandoned from here on. A graceful stop keeps the store serving
+    // until the engine is destroyed, i.e. until `native` settles. A refused
+    // stop(true) (a start() in flight) leaves the engine running with its
+    // store serving: attach again, or every write it completes would be
+    // reported as abandoned. (A stop() that threw part-way also lands there,
+    // its store aborted: a write it abandoned then settles unreported, the
+    // lesser harm.)
+    if (force && this.#store) {
+      this.#store.detach();
+      native.catch(() => this.#store?.detach(false));
+    }
+    const stopping = native.then(async () => {
+      // The engine is destroyed: no store call can follow. Let the adapter
+      // release what it holds per session, once (a stop() joining this one
+      // -- from the 'logout' listener it fired, say -- shares this promise;
+      // a stop() after settlement is a no-op that must not close() again).
+      if (this.#store && !this.#closed) {
+        this.#closed = true;
+        this.#store.detach();
+        await this.#store.closeAll(this.getSessions(), force === true);
+      }
+    });
+    this.#stopping = stopping;
+    const clear = () => {
+      if (this.#stopping === stopping) this.#stopping = undefined;
+    };
+    stopping.then(clear, clear);
+    return stopping;
   }
 
   /**

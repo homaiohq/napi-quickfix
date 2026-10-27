@@ -73,8 +73,16 @@ export class SessionSettings {
     return this.#native;
   }
 
-  /** The sessions declared by this configuration. */
-  getSessions(): SessionID[] {
-    return this.#native.getSessions().map((h) => SessionID.fromNative(h));
+  /**
+   * The sessions declared by this configuration: every `[SESSION]`, or with
+   * `connectionType` only those an engine of that type (`'initiator'` /
+   * `'acceptor'`) would create, i.e. whose effective `ConnectionType` (own
+   * or from `[DEFAULT]`) matches.
+   */
+  getSessions(connectionType?: 'initiator' | 'acceptor'): SessionID[] {
+    if (connectionType !== undefined && connectionType !== 'initiator' && connectionType !== 'acceptor') {
+      throw new TypeError("getSessions(connectionType?: 'initiator' | 'acceptor')");
+    }
+    return this.#native.getSessions(connectionType).map((h) => SessionID.fromNative(h));
   }
 }
