@@ -9,7 +9,7 @@ the prebuilt binaries (see the [versioning policy](./VERSIONING.md#relationship-
 
 ## [Unreleased]
 
-Bundles **QuickFIX v1.16.0** (statically linked, with two upstream fixes carried: see
+Bundles **QuickFIX v1.16.0** (statically linked, with three upstream fixes carried: see
 "Fixed").
 
 ### Added
@@ -76,13 +76,19 @@ Bundles **QuickFIX v1.16.0** (statically linked, with two upstream fixes carried
   way); a store call stalling the network thread past `ReconnectInterval` made it
   near-certain. The build now carries a `SocketMonitor` fix: a dropped socket is closed
   only once its disconnect has been processed.
+- A store failure on the sequence-number increment QuickFIX makes for a queued Logon or
+  ResendRequest (a peer whose Logon was too high, then a GapFill ending exactly at it)
+  terminated the process: QuickFIX v1.16.0 makes that increment outside its own error
+  handling. A `FileStore` write error was enough; a `MessageStoreAdapter` that rejects,
+  times out or is poisoned at that moment made it reachable. The build now carries a
+  fix: the session logs the error and disconnects, like any other inbound store failure.
 - The npm package shipped every `CMakeLists.txt` of a local build tree when packed from
   a working tree. The `files` entry now names the root file only.
 
 ### Known QuickFIX limitations
 
 Two file-descriptor leaks found by the same audit are in QuickFIX itself and are not
-patched by this binding (it carries two upstream fixes, see "Fixed" and
+patched by this binding (it carries three upstream fixes, see "Fixed" and
 `ARCHITECTURE.md`):
 
 - An `Acceptor` whose `start()` fails because its port is already bound leaks the

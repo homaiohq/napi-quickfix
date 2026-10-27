@@ -1128,13 +1128,13 @@ void JsMessageStore::incrNextSenderMsgSeqNum() EXCEPT(FIX::IOException) {
 // the first, and if it moved the target number the message was accepted
 // against a number the store no longer holds. It is then not counted (no
 // write on top of the moved number) and reported (non-poisoning
-// 'storeError'), but this does NOT throw: nextQueued() reaches this call
-// outside any try (Session.cpp:1157 from :1308; SocketConnection catches
-// only InvalidMessage), where a throw is std::terminate, and the two call
-// paths cannot be told apart from here. Nor does it poison: the reload left
-// cache and adapter equal. The cache keeps the moved number, so QuickFIX's
-// own sequence checks reconcile: the peer's next message is too low (Logout
-// + disconnect) or too high (ResendRequest).
+// 'storeError'), but this does NOT throw: the reload left cache and adapter
+// equal, so there is nothing to disconnect for, and nextQueued() reaches this
+// call past next(Message)'s handlers (Session.cpp:1157 from :1308), where only
+// the carried fix (CMakeLists.txt, patch 3) keeps a throw from being
+// std::terminate. Nor does it poison. The cache keeps the moved number, so
+// QuickFIX's own sequence checks reconcile: the peer's next message is too
+// low (Logout + disconnect) or too high (ResendRequest).
 void JsMessageStore::incrNextTargetMsgSeqNum() EXCEPT(FIX::IOException) {
   const bool inHandler = InQuickFixHandler();
   try {

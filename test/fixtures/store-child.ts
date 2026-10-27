@@ -231,6 +231,66 @@ if (mode === 'graceful-stop-hang' || mode === 'graceful-stop-dead') {
   await ini.stop(true);
   await acc.stop(true);
   console.log(`result ${JSON.stringify({ loads: store.count('load'), accLoggedOn, errors: [...new Set(errors)] })}`);
+} else if (mode === 'queued-logon-store-failure') {
+  // A raw counterparty: its Logon (34=5) is too high, so the initiator queues
+  // it and asks for 1..; the GapFill ends exactly at the Logon (36=5). After
+  // the SequenceReset, Session::next(Message) runs nextQueued() past its
+  // try/catch, which pops the queued Logon and increments the target seqnum
+  // to 6 with no handler: the adapter rejects that write (std::terminate,
+  // exit 134, before the carried fix).
+  const soh = '\x01';
+  const fix = (fields: [string, string | number][]) => {
+    const body = fields.map(([k, v]) => `${k}=${v}${soh}`).join('');
+    const head = `8=FIX.4.4${soh}9=${Buffer.byteLength(body)}${soh}`;
+    const sum = [...Buffer.from(head + body)].reduce((a, b) => a + b, 0) % 256;
+    return `${head}${body}10=${String(sum).padStart(3, '0')}${soh}`;
+  };
+  const sendingTime = () => {
+    const iso = new Date().toISOString();
+    return `${iso.slice(0, 4)}${iso.slice(5, 7)}${iso.slice(8, 10)}-${iso.slice(11, 23)}`;
+  };
+  const header = (type: string, seq: number): [string, string | number][] => [
+    ['35', type],
+    ['34', seq],
+    ['49', 'SERVER'],
+    ['52', sendingTime()],
+    ['56', 'CLIENT'],
+  ];
+  const peer = createServer((sock) => {
+    let buf = '';
+    sock.on('error', () => {});
+    sock.on('data', (d) => {
+      buf += d.toString('latin1');
+      for (let m; (m = /8=FIX[^\x01]*\x01.*?\x0110=\d{3}\x01/s.exec(buf)); ) {
+        buf = buf.slice(m.index + m[0].length);
+        const type = /\x0135=([^\x01]+)/.exec(m[0])?.[1];
+        if (type === 'A') sock.write(fix([...header('A', 5), ['98', 0], ['108', 30]]));
+        if (type === '2') {
+          sock.write(fix([...header('4', 1), ['43', 'Y'], ['122', sendingTime()], ['123', 'Y'], ['36', 5]]));
+        }
+      }
+    });
+  });
+  await new Promise<void>((r) => peer.listen(0, '127.0.0.1', r));
+  const port = (peer.address() as { port: number }).port;
+  const store = new ControlledStore();
+  store.set('setSeqNums', 'reject', (args) => args[2] === 6);
+  const ini = await Initiator.create({
+    settings: SessionSettings.fromString(
+      withSettings(initiatorCfg(port), { ResetOnLogon: 'N', HeartBtInt: '30', ReconnectInterval: '60' }),
+    ),
+    store,
+    storeTimeoutMs: TIMEOUT_MS,
+    log: 'none',
+  });
+  const errors: string[] = [];
+  ini.on('storeError', (_id, method, _err, poisoned) => errors.push(`${method}:${poisoned}`));
+  const logout = new Promise<void>((r) => ini.once('logout', () => r()));
+  await ini.start();
+  const disconnected = await Promise.race([logout.then(() => true), sleep(10_000).then(() => false)]);
+  await ini.stop(true);
+  peer.close();
+  console.log(`result ${JSON.stringify({ disconnected, errors: [...new Set(errors)] })}`);
 } else {
   throw new Error(`unknown mode ${mode}`);
 }

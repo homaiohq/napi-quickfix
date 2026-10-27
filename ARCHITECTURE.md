@@ -94,7 +94,7 @@ flowchart LR
 Key detail: QuickFIX ships headers **flat** in `src/C++/*.h` but code includes them as `quickfix/Message.h`, so
 `CMakeLists.txt` copies them into a generated `quickfix/` include tree at configure time (Windows-safe, no symlinks).
 
-**The two upstream fixes carried.** `CMakeLists.txt` edits the fetched sources (`${quickfix_SOURCE_DIR}/src/C++`)
+**The three upstream fixes carried.** `CMakeLists.txt` edits the fetched sources (`${quickfix_SOURCE_DIR}/src/C++`)
 at configure time through `qf_patch()`, not through a FetchContent `PATCH_COMMAND`, which is skipped for a source
 tree restored from the CI cache or given through `FETCHCONTENT_SOURCE_DIR_QUICKFIX`. Each edit replaces one whole
 line (a CRLF checkout keeps matching), is idempotent, and fails the configure if its anchor line is gone or not
@@ -114,6 +114,13 @@ unique (a new pin: drop the edit if upstream has the fix, otherwise re-anchor it
   network thread past `ReconnectInterval` and then fails makes that window near-certain. The fix moves the
   `socket_close()` from `drop()` to `block()`, after `onError(fd)`, and has the destructor close drops still queued;
   both `SocketMonitor_UNIX.cpp` and `SocketMonitor_WIN32.cpp` (`test/reconnect.test.ts`).
+- *A store failure in the queued-message pass disconnects.* `Session::next(Message)` calls `nextQueued()` after its
+  `try`/`catch`, and `nextQueued()` increments the target seqnum itself for a queued Logon or ResendRequest
+  (`Session.cpp:1157` from `:1308`), so an `IOException` there escaped the network thread: `std::terminate`. It takes
+  a peer whose Logon was too high and whose GapFill ends exactly at it, then a failed increment: a `FileStore` write
+  error, or a `MessageStoreAdapter` that rejects, times out or is already poisoned. The fix wraps that one call in the
+  handler `next(Message)`'s own `try` ends with (log the error, disconnect); the other `nextQueued()` callers already
+  run inside that `try` (`test/store.test.ts`).
 
 These are the only changes to QuickFIX's sources; anything else upstream does wrong is worked around in the binding or
 documented.
@@ -370,9 +377,9 @@ nothing is sent) plus a non-poisoning `storeError` — unless noted.
   reload lifts the poison.
 - **The inbound increment.** `incrNextTargetMsgSeqNum()` on a store poisoned on entry whose own reload moved the target
   seqnum: the message was accepted (`verify()`) against a number the store no longer holds. It is not counted and is
-  reported, but **not thrown**: `nextQueued()` reaches this call outside any `try` (`Session.cpp:1157` from `:1308`;
-  `SocketConnection` catches only `InvalidMessage`), where a throw is `std::terminate`, and the two call paths cannot
-  be told apart. Nor does it poison: the reload left cache and row equal. QuickFIX's own sequence checks reconcile:
+  reported, but **not thrown**: the reload left cache and row equal, so there is nothing to disconnect for, and
+  `nextQueued()` reaches this call past `Session::next(Message)`'s handlers (`Session.cpp:1157` from `:1308`), where
+  only the carried fix (§2) keeps a throw from being `std::terminate`. Nor does it poison. QuickFIX's own sequence checks reconcile:
   the peer's next message is too low (Logout + disconnect) or too high (ResendRequest). A reload by another thread's
   write in that window lifts the poison first and goes unnoticed, as a setter's move does with upstream's stores.
 - **`NonStopSession=Y`.** QuickFIX never reads the creation time, so a poisoned initiator's reconnect
@@ -408,8 +415,9 @@ on the initiator's connect path, swallowed with the session left "pending" for g
 No stale number reaches the wire through these: `persist()`'s writes still throw inside `sendRaw()`'s `try`. With the
 sender getter never throwing, a poisoned initiator's Logon fails at `persist()` after `generateLogon()` marked it
 sent, so that connection attempt ends at `LogonTimeout`. (`nextQueued()` can also call `incrNextTargetMsgSeqNum()`
-unguarded and outside any handler, for a queued Logon or ResendRequest at exactly the expected seqnum; that exposure
-is upstream's own, a `FileStore` write failure terminates there too.)
+outside `next(Message)`'s `try`, for a queued Logon or ResendRequest at exactly the expected seqnum. That exposure is
+upstream's own, a `FileStore` write failure terminated there too; the build carries a fix that disconnects instead,
+see §2.)
 
 ### Timeout, reports, teardown
 
@@ -512,7 +520,7 @@ onto its dropped queue with **no lock**, while the engine's network thread itera
 `SocketMonitor::block()`. QuickFIX only ever calls them from that thread itself (timeouts, logout handling,
 remote disconnects); from any other thread they are a data race with a crash window of a few instructions
 (upstream quickfix/quickfix#346, closed "not planned"). There is no public hook to run code on the network thread,
-and this binding does not carry a patch for it (it carries two others, see §2), so the supported way to bring a session down is `logout()` — exactly
+and this binding does not carry a patch for it (it carries three others, see §2), so the supported way to bring a session down is `logout()` — exactly
 what `Initiator::stop()` itself does — and to renumber it, the sequence-number setters.
 
 **Lifetime.** `FIX::Session` objects are owned by the engine and `FIX::Session::lookupSession` returns a raw,

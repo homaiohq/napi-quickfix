@@ -95,6 +95,21 @@ foreach(_qf_monitor SocketMonitor_UNIX.cpp SocketMonitor_WIN32.cpp)
     "  for (; m_dropped.size(); m_dropped.pop()) { socket_close(m_dropped.front()); } socket_close(m_signal);")
 endforeach()
 
+# 3. Handle a store failure in the queued-message pass like any other.
+# Session::next(Message) calls nextQueued() AFTER its try/catch, and
+# nextQueued(num) increments the target seqnum itself for a queued Logon or
+# ResendRequest (Session.cpp:1157): an IOException there escaped the network
+# thread, std::terminate. Reached when the peer's Logon was too high and its
+# GapFill ends exactly at it, and the increment fails (a FileStore write, or a
+# MessageStoreAdapter that rejects, times out or is already poisoned). The
+# call is wrapped in the handler next(Message)'s own try ends with: log, then
+# disconnect. Only this call site: the other nextQueued() callers run inside
+# that try. The original block is left behind as dead code (`if (false)`) so
+# the edit stays a one-line replacement. test/store.test.ts covers it.
+qf_patch(Session.cpp "queued-message store failure"
+  "  if (!queued) {"
+  "  if (!queued) try { nextQueued(now); } catch (IOException &e) { m_state.onEvent(e.what()); disconnect(); } if (false) {")
+
 # Give musl the same clock as glibc. QuickFIX picks its clock in
 # src/C++/FieldTypes.cpp:
 #     #if defined(_POSIX_SOURCE) || defined(HAVE_GETTIMEOFDAY)   -> gettimeofday, us
