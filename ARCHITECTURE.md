@@ -488,6 +488,26 @@ see "Lock order" below), `getSessions()`, `getSession()`, `ref()`, `unref()`, an
 teardown (the loop drained, a Worker ending), a cleanup hook deactivates the bridge and force-stops the engine
 **before** the TSFN is torn down, so a live session never crashes on shutdown.
 
+`process.exit()` and a fatal exception (uncaught, or an unhandled rejection) take another path:
+`Environment::Exit` → `DefaultProcessExitHandlerInternal` → `uv_library_shutdown()`, which joins the libuv threadpool
+**without running the cleanup hooks**. A pool thread parked on a JS round trip at that instant (a `SendToTargetWorker`
+in `CallSync` for toApp, or in a store call; a stop worker joining a network thread that is) would never be woken, and
+the process would never exit. Both paths emit `'exit'` first, synchronously, so `src/native.ts` registers
+`process.on('exit', () => native.prepareExit())` at module load. `prepareExit()` (`addon.cpp`) walks the engine wraps
+of the environment (`AddonData::engines`, each wrap adds itself at construction and removes itself in its destructor)
+and runs each one's `PrepareExit()`, the non-blocking half of `Teardown()`: `JsMessageStoreFactory::Deactivate()` (a
+parked store call fails with `IOException` and frees the session mutex), `ApplicationBridge::DeactivateForExit()`,
+and `SessionOpGate::RefuseWhileFrozen()`. No join, no TSFN operation: the engine stays as it is until the process is
+gone. `DeactivateForExit()` differs from `Deactivate()` in what a woken or later callback does: it throws
+`FIX::IOException` instead of passing through. QuickFIX contains that exception everywhere it calls the
+`Application` (`Session::sendRaw` returns `false` before persisting, `Session::next(Message)` disconnects before
+incrementing the target seqnum), so an exiting engine never sends what `toApp` might have vetoed or a Logon without
+what `toAdmin` adds, and never advances a persistent store past an inbound message no handler saw.
+`RefuseWhileFrozen()` covers an operation queued after a graceful stop's worker froze the gate: it would wait for the
+`Unfreeze()` the JS thread runs when that stop settles, which never happens once the process is exiting, so it is
+refused with `SessionNotFound` instead (never run under a freeze: in a Worker, whose cleanup hooks do run afterwards,
+the destructor's `Freeze()` still precedes the engine's destruction). `test/exit.test.ts` covers each case in a child.
+
 The promise a `start()`/`stop()` returns is the AsyncWorker's own. The early-return cases (already started or
 stopped, a call in progress, the engine gone) build theirs where they settle it (`ResolvedPromise` /
 `RejectedPromise`, `engine_workers.h`): a `Napi::Promise::Deferred` created up front and then not used is never

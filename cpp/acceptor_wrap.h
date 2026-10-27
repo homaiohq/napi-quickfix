@@ -11,6 +11,7 @@
 #include "quickfix/SessionID.h"
 #include "quickfix/SocketAcceptor.h"
 
+#include "addon_data.h"
 #include "application_bridge.h"
 #include "engine_common.h"
 #include "engine_workers.h"
@@ -47,11 +48,15 @@ class SocketAcceptor final : public FIX::SocketAcceptor {
 // Napi::ObjectWrap over FIX::SocketAcceptor. Mirrors InitiatorWrap.
 //
 //   new Acceptor({ settings, handlers?, store?, log? })
-class AcceptorWrap : public Napi::ObjectWrap<AcceptorWrap> {
+class AcceptorWrap : public Napi::ObjectWrap<AcceptorWrap>,
+                     public ExitParticipant {
  public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
   explicit AcceptorWrap(const Napi::CallbackInfo& info);
   ~AcceptorWrap() override;
+
+  // process.on('exit'): see ExitParticipant (addon_data.h).
+  void PrepareExit() override;
 
  private:
 

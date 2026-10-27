@@ -124,6 +124,9 @@ InitiatorWrap::InitiatorWrap(const Napi::CallbackInfo& info)
   // thread call into an already-destroyed TSFN and abort the process.
   env_ = env;
   cleanupHook_ = env.AddCleanupHook(&InitiatorWrap::CleanupEntry, this);
+  // Last, once nothing above can throw: a wrap only ever registered is one
+  // whose destructor runs (and unregisters it).
+  AddonData::Get(env).engines.insert(this);
 }
 
 void InitiatorWrap::CleanupEntry(InitiatorWrap* self) {
@@ -141,8 +144,30 @@ InitiatorWrap::~InitiatorWrap() {
   if (!cleanupHookFired_ && !cleanupHook_.IsEmpty() && env_ != nullptr) {
     cleanupHook_.Remove(env_);
   }
+  // The instance data outlives every wrap finalizer (addon_data.h).
+  if (env_ != nullptr) AddonData::Get(env_).engines.erase(this);
   Teardown(true);
   DestroyEngine();
+}
+
+void InitiatorWrap::PrepareExit() {
+  // process.exit() and a fatal exception emit 'exit', then join the libuv
+  // threadpool WITHOUT running the environment cleanup hooks: CleanupEntry
+  // never runs, and a pool thread parked on a JS round trip -- a
+  // sendToTarget() in toApp or in a store call, a stop() worker joining a
+  // network thread that is -- would keep the process from exiting. Release
+  // every such wait, the non-blocking half of Teardown(): the store bridge
+  // first (a parked store call holds the session mutex the other waiters
+  // need), then the Application bridge, which from now on refuses every
+  // callback instead of passing it through (see DeactivateForExit), then the
+  // gate, which refuses an operation queued behind a stop()'s freeze instead
+  // of parking it until a destruction that will never run. No join and no
+  // TSFN operation: the engine stays as it is until the process is gone. In
+  // a Worker the cleanup hooks do run afterwards, and Teardown() then finds
+  // both bridges already deactivated.
+  if (jsStore_) jsStore_->Deactivate();
+  if (bridge_) bridge_->DeactivateForExit();
+  gate_->RefuseWhileFrozen();
 }
 
 void InitiatorWrap::Teardown(bool force) {
@@ -150,17 +175,21 @@ void InitiatorWrap::Teardown(bool force) {
   // JS round-trip and MUST NOT deadlock. Ordering matters:
   //   1. Deactivate the bridge (set a flag, no TSFN op): any callback firing on
   //      a QuickFIX network thread during the upcoming stop() will pass through
-  //      immediately without touching the TSFN or waiting on the (frozen) JS
-  //      loop, and every BlockingCall already waiting is woken. This breaks
+  //      immediately (or be refused, if PrepareExit() ran first: an 'exit'
+  //      event precedes every teardown that follows a process exit) without
+  //      touching the TSFN or waiting on the (frozen) JS loop, and every
+  //      BlockingCall already waiting is woken. This breaks
   //      the stop()->onLogout->BlockingCall deadlock.
   //   2. Join the stop() worker if one is in flight: its operation may still
   //      be inside FIX::Initiator::stop() -- or waiting in gate->Freeze() for
   //      a sendToTarget() that step 1 has just unblocked -- on a libuv thread,
   //      and the destructor's DestroyEngine() that follows Teardown() must not
-  //      delete the engine under it. (Node drains the thread pool before it
-  //      runs cleanup hooks or finalizers, so this wait is expected to return
-  //      at once; it makes the ordering a property of this code rather than
-  //      of Node's shutdown sequence.) This is also why the early return is
+  //      delete the engine under it. (An environment torn down once its
+  //      loop has drained has no pool work left, so this wait is expected to
+  //      return at once; it makes the ordering a property of this code rather
+  //      than of Node's shutdown sequence. process.exit() and a fatal
+  //      exception never get here: they join the pool without running the
+  //      cleanup hooks, see PrepareExit().) This is also why the early return is
   //      keyed on tornDown_, not stopped_: stopped_ is set for the whole
   //      duration of an in-flight stop().
   //   3. stop(force): joins all QuickFIX network threads. A no-op if the

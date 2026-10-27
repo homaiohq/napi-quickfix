@@ -127,10 +127,26 @@ void ApplicationBridge::Deactivate() {
   WakeAllPending();
 }
 
+void ApplicationBridge::DeactivateForExit() {
+  exiting_.store(true, std::memory_order_release);
+  WakeAllPending();
+}
+
 void ApplicationBridge::WakeAllPending() {
-  // Pass-through (default Result: no mutate, no throw).
-  pending_.Deactivate(
-      [](const std::shared_ptr<SyncChannel>& ch) { ch->ForceFulfil(Result{}); });
+  // No mutate, no throw: CallSync passes it through, or refuses it once the
+  // process is exiting (NoHandler).
+  pending_.Deactivate([](const std::shared_ptr<SyncChannel>& ch) {
+    Result r;
+    r.aborted = true;
+    ch->ForceFulfil(std::move(r));
+  });
+}
+
+ApplicationBridge::Result ApplicationBridge::NoHandler() const {
+  if (exiting_.load(std::memory_order_acquire)) {
+    throw FIX::IOException("process exiting: no handler can run");
+  }
+  return Result{};
 }
 
 void ApplicationBridge::DropHandlers() {
@@ -186,8 +202,7 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
   // or thrown exception. This is only a cheap fast path; the authoritative
   // check is the one PendingChannels::Register() makes under its lock.
   if (pending_.Inactive()) {
-    Result r;
-    return r;
+    return NoHandler();
   }
 
   // Everything that can throw (the copy, its serialization, the dictionary
@@ -215,8 +230,7 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
   if (!pending_.Register(channel, channelId)) {
     // Lost the race with Deactivate()/Abort(): the wake loop has already run
     // (or is running) over pending_, so waiting now could block until Abort().
-    Result r;
-    return r;
+    return NoHandler();
   }
   data->channel = channel;  // shared: trampoline gets its own owning copy
 
@@ -226,8 +240,7 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
     // channel. Clean up (`data` frees itself) and return a pass-through
     // result.
     pending_.Erase(channelId);
-    Result r;
-    return r;
+    return NoHandler();
   }
   data.release();  // the trampoline owns it now
 
@@ -236,6 +249,7 @@ ApplicationBridge::Result ApplicationBridge::CallSync(
   channel->Wait(std::chrono::milliseconds(0));
   pending_.Erase(channelId);
   std::lock_guard<std::mutex> lock(channel->mtx);
+  if (channel->outcome.aborted) return NoHandler();
   return channel->outcome;
 }
 
