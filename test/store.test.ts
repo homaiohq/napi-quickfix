@@ -936,6 +936,15 @@ describe('MessageStoreAdapter: failure policy', () => {
     assert.ok((result.errors as string[]).includes('load:true'), 'the refresh poisoned the store');
   });
 
+  test('a store failure on the increment of a queued Logon (nextQueued() past next()\'s handlers) disconnects, no abort', { timeout: 40_000 }, async () => {
+    // Before the carried fix: Session::next(Message) calls nextQueued() after
+    // its try/catch, and a queued Logon's incrNextTargetMsgSeqNum() threw
+    // there with no handler: exit 134.
+    const { result } = await runChild('queued-logon-store-failure', 30_000);
+    assert.equal(result.disconnected, true);
+    assert.deepEqual(result.errors, ['setSeqNums:true'], 'the rejected increment poisoned the store');
+  });
+
   for (const rejections of [1, 2, 3, 4]) {
     test(`ResetOnLogon=Y + a reset() that rejects ${rejections}x: every Logon stamped and sent is 34=1 with 141=Y, the reset never undone by a reload`, { timeout: 30_000 }, async () => {
       // generateLogon() resets, then reads the sender seqnum twice: in
