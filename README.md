@@ -682,7 +682,7 @@ provides a generic SQL adapter (below).
   adapter, or one connection per session): it orders a write the engine gave up
   on before a later `reset()` or `close()`.
 
-Writing your own adapter? The repository (not the npm package) has an agent
+Writing your own adapter for another backend? The repository (not the npm package) has an agent
 skill,
 [`.agents/skills/custom-message-store/`](https://github.com/homaiohq/napi-quickfix/tree/main/.agents/skills/custom-message-store),
 that an LLM can follow (copy the directory into your project's skills

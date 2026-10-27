@@ -13,10 +13,10 @@ versions they were read at:
 | `[store.ts]` | `src/store.ts` of `@homaiohq/napi-quickfix`, same revision (the TS interface, its JSDoc, `MapMessageStore`, `StoreBinding.preload()`/`closeAll()`, `validState()`). Repository only; the installed package has it compiled as `dist/esm/store.js` + `store.d.ts` |
 | `[js_message_store.h]` / `[js_message_store.cpp]` | `cpp/js_message_store.{h,cpp}`, same revision (the native `FIX::MessageStore` over the adapter: dispatch, cache, timeout, poison, `ParseResult`). Shipped in the package (`cpp/`) |
 | `[README]` | `README.md` section "Message store", same revision. Shipped in the package |
-| `[README@f802818]` | `README.md` section "Generic SQL adapter" at commit `f802818` (`REPO/blob/f802818ad6d0fc92be3ab61bb81b1b99521d4a49/README.md`, PR #31); in no release yet, it ships with the SQL adapter (PR #33) |
+| `[README@f802818]` | `README.md` section "Generic SQL adapter" at commit `f802818` (`REPO/blob/f802818ad6d0fc92be3ab61bb81b1b99521d4a49/README.md`, PR #31); identical in the `README.md` of the revision that ships the SQL adapter (PR #33). Shipped in the package |
 | `[ARCH]` | `ARCHITECTURE.md` §4b "The message-store bridge" and §5 "Lock order", same revision. Repository only |
 | `[store.test]` | `test/store.test.ts`, same revision; cited by test title. Repository only |
-| `[store-sql.test]` | the SQL adapter test at commit `f802818` (`REPO/blob/f802818ad6d0fc92be3ab61bb81b1b99521d4a49/test/store-sql.test.ts`, PR #31; `contract()` identical at `6b8caa0`, the commit that introduced the SQL adapter, and in PR #33): `contract()`, reproduced as section 1 of `test-checklist.md`, and `loopback()`. In no release yet |
+| `[store-sql.test]` | the SQL adapter test at commit `f802818` (`REPO/blob/f802818ad6d0fc92be3ab61bb81b1b99521d4a49/test/store-sql.test.ts`, PR #31; `contract()` identical at `6b8caa0`, the commit that introduced the SQL adapter, and in `test/store-sql.test.ts` of the revision that ships it, PR #33): `contract()`, reproduced as section 1 of `test-checklist.md`, and `loopback()`. Repository only |
 | `[QF <file>:<line>]` | QuickFIX C++ **v1.16.0** (the tag pinned by `CMakeLists.txt` `GIT_TAG v1.16.0`, commit `2ce8a60667d95a55cdc57a210f165e19cb757126`), path under `src/C++/`: https://github.com/quickfix/quickfix/tree/v1.16.0/src/C++ |
 | `[probe]` | a loopback probe run on 2026-10-23 through the binding at `4dc1231` (PR #32, an ancestor of this revision; later commits changed the poison, reset-retry and reload paths, none of which the probes exercise: the seqnum writes of a healthy store, `setMessage` ordering, `getMessages` parsing): a real `Acceptor` + `Initiator` over 127.0.0.1, the initiator on a test-double adapter. Each probe is reproduced as a scenario in `test-checklist.md` (the rule names it), so you can rerun it against your adapter |
 | `[trial]` | issue #35 (`REPO/issues/35`): a PostgreSQL adapter written from this skill alone (`pg` 8.23.1, PostgreSQL 16.15, Node 22) and run against a live counterparty's FIX UAT and through local fault injection (frozen, stopped and restarted server, `pg_terminate_backend`, a TCP proxy holding one connection's bytes, `kill -9`) |
@@ -514,8 +514,8 @@ timeout is discarded. Sources: `[README]` "Failure policy";
 `[js_message_store.cpp]` `get()` → `Forward(r, /*fatal=*/false)`.
 
 **E9. Return JS strings.** If your driver hands back bytes (MySQL `BLOB`), decode
-as UTF-8 (the removed SQL adapter did `Buffer.from(m).toString('utf8')`, see
-`sql-adapter-reference.md`).
+as UTF-8 (the shipped SQL adapter, `src/store/sql.ts`, does
+`Buffer.from(m).toString('utf8')`, see `sql-adapter-reference.md`).
 
 **E10. Exactly one entry per sequence number: the last one written.** A
 backend that keeps history (an append-only log, an event stream, a table
@@ -1243,5 +1243,5 @@ is ignored; a returned Promise is awaited. Source: `[js_message_store.cpp]`
 **K4. Numbers cross as JS `number`s** (doubles holding safe integers). When your
 backend returns `string` or `bigint` (PostgreSQL `NUMERIC` through `pg`, MySQL
 `BIGINT UNSIGNED` with `supportBigNumbers`), convert with `Number()` and
-validate before returning. Source: the removed SQL adapter's `toSeq()`
-(`sql-adapter-reference.md`).
+validate before returning. Source: the shipped SQL adapter's `toSeq()`
+(`src/store/sql.ts`, reproduced in `sql-adapter-reference.md`).

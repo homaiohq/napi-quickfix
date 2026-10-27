@@ -32,10 +32,13 @@ pins). Where to read each cited file:
   version you installed (`/blob/v<version>/<path>`); until the store ships in a
   release, at `main` once PR #32 is merged, else on branch
   `feat/message-store-adapter`.
-- **The generic SQL adapter** (its source, its test, whose `contract()` section 1
-  of `references/test-checklist.md` extends, and its README section) is in no
-  release yet (PR #33); it is cited at commit `f802818`, permalinks in
-  `references/sql-adapter-reference.md`.
+- **The generic SQL adapter** ships in the package as
+  `@homaiohq/napi-quickfix/store/sql` (`dist/esm/store/sql.{js,d.ts}`, its DDL
+  in `sql/*.sql`; README "Generic SQL adapter"); its source `src/store/sql.ts`
+  and its test `test/store-sql.test.ts`, whose `contract()` section 1 of
+  `references/test-checklist.md` extends, are repository only. They are
+  identical to commit `f802818`, where the references cite them (permalinks in
+  `references/sql-adapter-reference.md`).
 - **QuickFIX C++**: https://github.com/quickfix/quickfix/tree/v1.16.0, paths
   under `src/C++/`.
 
@@ -54,7 +57,7 @@ Reference files next to this one:
 | --- | --- |
 | `references/contract.md` | always: the rules (A-K), each with its source |
 | `references/upstream-schemas.md` | the backend is SQL, or the data must interoperate with a QuickFIX C++ deployment: the column mapping, the statements upstream issues, timestamps, gotchas, **section 7: per backend (PostgreSQL, MySQL/MariaDB, SQL Server) statements, column limits, collations, encodings and upstream's own defects**, section 8: sharing tables with a C++ engine, and where to fetch the upstream DDL (linked, not reproduced) |
-| `references/sql-adapter-reference.md` | you want a worked, tested SQL implementation to adapt (a reference SQL adapter, reproduced abridged: its `sqlSchema()` DDL is elided; a packaged version is planned as a follow-up). Read its "Known defects" before copying: its PostgreSQL timestamp read is DateStyle-dependent and it has no SQL Server dialect |
+| `references/sql-adapter-reference.md` | you want a worked, tested SQL implementation to adapt (the shipped `@homaiohq/napi-quickfix/store/sql`, reproduced abridged: its `sqlSchema()` DDL is elided). Read its "Known defects" before copying or using it as is: its PostgreSQL timestamp read is DateStyle-dependent and it has no SQL Server dialect |
 | `references/test-checklist.md` | always, before declaring the adapter done: differential tests against `MapMessageStore`, engine-level scenarios, failure injection |
 
 ## Workflow
