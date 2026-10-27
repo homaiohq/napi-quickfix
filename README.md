@@ -39,7 +39,8 @@ included.
   a separate stunnel process.
 - **Pluggable message store** — persist session state (sequence numbers, sent
   messages) write-through in any database Node can reach, through a small
-  `MessageStoreAdapter` over your own driver and pool.
+  `MessageStoreAdapter` over your own driver and pool; a generic SQL adapter for
+  Postgres, MySQL and SQLite ships as a subpath export.
 
 ## Install
 
@@ -659,7 +660,8 @@ does a constructor-time `reset()`; a timeout rejects with a `QuickFixError`
 `TypeError`. With several sessions, `create()` rejects once every session's
 preload has settled, with the first failure in session order. A ready-made
 `MapMessageStore` (an in-memory `Map` per session) is exported as the reference
-implementation and a test double.
+implementation and a test double, and `@homaiohq/napi-quickfix/store/sql`
+provides a generic SQL adapter (below).
 
 **What an adapter must do.**
 
@@ -680,7 +682,7 @@ implementation and a test double.
   adapter, or one connection per session): it orders a write the engine gave up
   on before a later `reset()` or `close()`.
 
-Writing your own adapter? The repository (not the npm package) has an agent
+Writing your own adapter for another backend? The repository (not the npm package) has an agent
 skill,
 [`.agents/skills/custom-message-store/`](https://github.com/homaiohq/napi-quickfix/tree/main/.agents/skills/custom-message-store),
 that an LLM can follow (copy the directory into your project's skills
@@ -902,6 +904,45 @@ that it cannot land under the session's next engine:
 The tracking is per JS realm (the main thread or one Worker) and per process:
 a write left behind by a crashed or killed process is not fenced (see the
 store skill's contract).
+
+#### Generic SQL adapter
+
+`@homaiohq/napi-quickfix/store/sql` turns an `execute(sql, params)` function
+and a dialect into an adapter, with the upstream QuickFIX table layout
+(`sessions` / `messages`, configurable prefix) so an existing QuickFIX C++
+deployment interoperates. Schema files for each dialect are in the package's
+`sql/` directory.
+
+```ts
+import { createSqlMessageStore } from '@homaiohq/napi-quickfix/store/sql';
+
+// pg
+const store = createSqlMessageStore({
+  dialect: 'postgres',
+  execute: async (sql, params) => (await pool.query(sql, params)).rows,
+});
+// mysql2 (promise API)
+const store = createSqlMessageStore({
+  dialect: 'mysql',
+  execute: async (sql, params) => (await pool.execute(sql, params))[0] as Record<string, unknown>[],
+});
+// node:sqlite
+const store = createSqlMessageStore({
+  dialect: 'sqlite',
+  execute: (sql, params) => db.prepare(sql).all(...params) as Record<string, unknown>[],
+});
+// Prisma
+const store = createSqlMessageStore({
+  dialect: 'postgres',
+  execute: (sql, params) => prisma.$queryRawUnsafe(sql, ...params),
+});
+```
+
+`reset()` runs its two statements in a transaction when `transaction` is
+provided (`transaction: (fn) => pool.transaction(fn)`-style, receiving an
+`execute` bound to the transaction); without it they run back to back.
+Upstream stores keep `creation_time` at second precision; the adapter
+preserves whatever precision the column holds.
 
 ### Handlers vs. events
 

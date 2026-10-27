@@ -50,6 +50,16 @@
         "default": "./dist/cjs/generated/values.js"
       }
     },
+    "./store/sql": {
+      "import": {
+        "types": "./dist/esm/store/sql.d.ts",
+        "default": "./dist/esm/store/sql.js"
+      },
+      "require": {
+        "types": "./dist/cjs/store/sql.d.ts",
+        "default": "./dist/cjs/store/sql.js"
+      }
+    },
     "./package.json": "./package.json"
   },
   "sideEffects": [
@@ -59,6 +69,7 @@
   "files": [
     "dist/",
     "prebuilds/",
+    "sql/",
     "cpp/",
     "/CMakeLists.txt",
     "src/load-native.cjs",
@@ -79,7 +90,8 @@
     "typecheck": "tsc -p test/tsconfig.json",
     "prebuild": "node scripts/prebuild.mjs",
     "install": "node-gyp-build || cmake-js compile --CDCMAKE_BUILD_TYPE=Release --CDCMAKE_POLICY_VERSION_MINIMUM=3.5",
-    "clean": "node -e \"const fs=require('node:fs');for(const d of ['dist','build']){fs.rmSync(d,{recursive:true,force:true});}\""
+    "clean": "node -e \"const fs=require('node:fs');for(const d of ['dist','build']){fs.rmSync(d,{recursive:true,force:true});}\"",
+    "test:pg": "PGURL=${PGURL:-postgres://postgres:postgres@127.0.0.1:5432/postgres} node --test --import tsx test/store-sql.test.ts"
   },
   "cmake-js": {
     "runtime": "node"
@@ -90,7 +102,9 @@
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
+    "@types/pg": "^8.23.1",
     "cmake-js": "^8",
+    "pg": "^8.23.1",
     "tsx": "^4",
     "typescript": "~7"
   }

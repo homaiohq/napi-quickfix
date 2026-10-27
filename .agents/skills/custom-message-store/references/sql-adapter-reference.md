@@ -1,25 +1,25 @@
 # Worked example: the generic SQL adapter (abridged: DDL elided)
 
-This is `src/store/sql.ts` of `@homaiohq/napi-quickfix` at commit `f802818`
-(PR #31; introduced by commit `6b8caa0` "feat: generic SQL message-store
-adapter"; in no release yet, it ships with PR #33). Permalinks, readable
-without a checkout:
+This is `src/store/sql.ts` of `@homaiohq/napi-quickfix`, the adapter the
+package ships as `@homaiohq/napi-quickfix/store/sql` (`createSqlMessageStore`,
+`sqlSchema`; PR #33). It is unchanged since commit `f802818` (PR #31;
+introduced by commit `6b8caa0` "feat: generic SQL message-store adapter").
+Permalinks at that commit, readable without a checkout:
 
 - the adapter: https://github.com/homaiohq/napi-quickfix/blob/f802818ad6d0fc92be3ab61bb81b1b99521d4a49/src/store/sql.ts
 - its test: https://github.com/homaiohq/napi-quickfix/blob/f802818ad6d0fc92be3ab61bb81b1b99521d4a49/test/store-sql.test.ts
 - its DDL: https://github.com/homaiohq/napi-quickfix/tree/f802818ad6d0fc92be3ab61bb81b1b99521d4a49/sql
 
-It was removed from PR #31 to be shipped separately; it is reproduced here,
-abridged (the body of `sqlSchema()` is elided: this skill links to schemas, it
+It is reproduced here, abridged (the body of `sqlSchema()` is elided: this skill links to schemas, it
 does not copy them, see `upstream-schemas.md` section 5), as the executable
 form of the contract in `contract.md`, because it passed `test/store-sql.test.ts` (the
 `contract()` function, a subset of section 1 of `test-checklist.md`, which
 adds begin > end, gaps and numeric order, seqnums at 2^40; and a loopback
 restart) against `node:sqlite` and PostgreSQL. Run the full section 1 against
-anything you derive from it. A packaged version is
-planned as a follow-up: the doc comments below that mention the
-`@homaiohq/napi-quickfix/store/sql` subpath export and the package's `sql/`
-directory describe that packaged form, which this package does not ship yet.
+anything you derive from it. The DDL ships in the package's `sql/`
+directory (`sql/postgres.sql`, `sql/mysql.sql`, `sql/sqlite.sql`), the same
+statements `sqlSchema(dialect)` returns. The "Known defects" below apply to
+the shipped adapter as well: use it as is only where none of them bites.
 
 What to copy from it, in order of importance:
 
@@ -248,7 +248,7 @@ export function createSqlMessageStore(options: SqlMessageStoreOptions): MessageS
 }
 ```
 
-## How to wire it to real drivers (adapted from the README and test of the same revision)
+## How to wire it to real drivers (adapted from the README "Generic SQL adapter" and `test/store-sql.test.ts`)
 
 Give every wiring a `transaction`: without one, `reset()` runs its DELETE and
 its UPSERT as two autocommitted statements (on a pool, possibly on two
@@ -369,12 +369,12 @@ What these wirings still do NOT do:
   reconnects inside its own budget (contract H4); a production `execute`
   checks out, and `release()`s a client that got a server error.
 
-Two things the adapter did NOT do, which a production copy should consider:
+Two things the adapter does NOT do, which a production copy should consider:
 
-- It did not reject a `setSeqNums` that updated zero rows (contract C3). With
+- It does not reject a `setSeqNums` that updated zero rows (contract C3). With
   `pg`, `result.rowCount === 0` is available; with `mysql2`,
   `result.affectedRows`.
-- It did not set timeouts (contract I2); do that on the store's pool
+- It does not set timeouts (contract I2); do that on the store's pool
   (`statement_timeout`, `lock_timeout` and `connectionTimeoutMillis` for
   PostgreSQL; `connectTimeout` and `innodb_lock_wait_timeout` for MySQL, whose
   `max_execution_time` covers `SELECT`s only), checkout + statement together
@@ -472,7 +472,8 @@ take the server away.
 
 ## Known defects (found by running it against upstream's stores, 2026-10-23)
 
-The code above is kept as it was at `f802818`. Challenged against QuickFIX
+The code above is kept as it was at `f802818`, which is also the shipped
+`src/store/sql.ts`. Challenged against QuickFIX
 v1.16.0's own `PostgreSQLStore`/`MySQLStore`/`OdbcStore` and real servers
 (see "Verification" in `upstream-schemas.md`), it has these defects; fix them
 in any copy:

@@ -15,11 +15,12 @@ the tables with a C++ engine during a cutover or as a standby.
   relative to the QuickFIX repository root. Line numbers are those of v1.16.0.
 - No DDL is reproduced in this skill, neither upstream's (section 5 links to
   it) nor the binding's own: that one is `sqlSchema()` in `src/store/sql.ts`
-  and `sql/*.sql` of the generic SQL adapter, in no release yet (PR #33), at
-  commit `f802818` of https://github.com/homaiohq/napi-quickfix (PR #31,
-  identical at `6b8caa0`, the commit that added it), elided from the
-  reproduction in `sql-adapter-reference.md`; it was tested against
-  `node:sqlite` and PostgreSQL by that revision's SQL adapter test.
+  and `sql/*.sql` of the generic SQL adapter (`sql/` ships in the package;
+  PR #33; unchanged since commit `f802818` of
+  https://github.com/homaiohq/napi-quickfix, PR #31, and `6b8caa0`, the
+  commit that added it), elided from the reproduction in
+  `sql-adapter-reference.md`; `test/store-sql.test.ts` tests it against
+  `node:sqlite` and PostgreSQL.
 - **Verification** (2026-10-23). Statements marked "observed" were run, not
   only read: upstream's unmodified `PostgreSQLStore`, `MySQLStore` and
   `OdbcStore` from v1.16.0, built with `HAVE_POSTGRESQL`/`HAVE_MYSQL`/`HAVE_ODBC`
@@ -136,7 +137,7 @@ adapter must reject in every case (contract I6).
 - **Read it as text in a fixed format, never through the server's default
   rendering.** `pg` parses `timestamp without time zone` as LOCAL time when it
   builds a `Date`; `mysql2` applies its `timezone` option; `tedious` applies
-  `useUTC`. The removed SQL adapter read `creation_time::text`, which is NOT
+  `useUTC`. The shipped SQL adapter reads `creation_time::text`, which is NOT
   safe: a timestamp's text form follows the session's `DateStyle`. Observed:
   under `DateStyle = 'SQL, DMY'` it is `22/10/2026 10:11:12.345` (the adapter's
   fallback `new Date(v)` is `Invalid Date`, so `load()` throws and
@@ -169,10 +170,10 @@ adapter must reject in every case (contract I6).
 ## 4. Table prefix
 
 Upstream hard-codes the names `sessions` and `messages` in database `quickfix`
-(and the log tables, section 5). The binding's removed SQL adapter added an optional
+(and the log tables, section 5). The binding's shipped SQL adapter adds an optional
 `tablePrefix` that is prepended to BOTH names (`${prefix}sessions`,
-`${prefix}messages`) so several deployments can share one schema; its test
-used `t<pid>_` to isolate CI runs. Interop with an
+`${prefix}messages`) so several deployments can share one schema;
+`test/store-sql.test.ts` uses `t<pid>_` to isolate CI runs. Interop with an
 upstream deployment means an empty prefix.
 
 A PostgreSQL **schema** is the other way to separate deployments, and the one
@@ -370,7 +371,7 @@ driver takes; `<key>` is the four key columns compared to four parameters.
 
 ### 7.3 SQL Server (`OdbcStore`, driver `mssql`/`tedious`)
 
-The binding's removed SQL adapter has no SQL Server dialect; this subsection is
+The binding's shipped SQL adapter has no SQL Server dialect; this subsection is
 the verified replacement (statements from the eval adapters that passed the
 checklist against SQL Server 2022).
 

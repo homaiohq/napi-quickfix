@@ -4,7 +4,7 @@ Run the candidate adapter through every scenario below. `MapMessageStore`
 (exported by `@homaiohq/napi-quickfix`) is the oracle: for the adapter-level
 scenarios, run the same script against a `MapMessageStore` and against the
 candidate and compare the outputs. The examples these scenarios are lifted
-from: the SQL adapter test of the source revision (`contract()`, which
+from: the SQL adapter test, `test/store-sql.test.ts` (`contract()`, which
 section 1 below extends with begin > end, gaps and numeric order, seqnums at
 2^40 and the safe-integer check, and `loopback()`; see the sources table in `contract.md`),
 and, in the repository (not in the npm package; see `contract.md` for where to

@@ -52,6 +52,10 @@ Useful scripts:
   `QUICKFIX_SOURCE_DIR=build/_deps/quickfix-src` to reuse an already fetched QuickFIX.
   CI runs it on every push; run it locally after touching `cpp/js_message_store.*`,
   `cpp/sync_channel.h` or the Application bridge.
+- `yarn test:pg` — run the SQL message-store adapter tests against a PostgreSQL at
+  `PGURL` (default `postgres://postgres:postgres@127.0.0.1:5432/postgres`); e.g.
+  `docker run -d --rm -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16` first.
+  The `node:sqlite` path of the same test runs as part of `yarn test`.
 - `yarn prebuild` — produce prebuilt binaries for the current platform. On Linux the
   binary is libc-tagged (`node.napi.glibc.node` / `node.napi.musl.node`); detection is
   automatic and the script *fails* rather than guessing. Override with `PREBUILD_LIBC`.

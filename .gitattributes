@@ -1,3 +1,6 @@
 # The generated FIELD table is byte-compared against the generator output in CI;
 # keep it LF on every platform so a Windows checkout does not read as stale.
 src/generated/fields.ts text eol=lf
+# The schema files are byte-compared against sqlSchema() in the tests; keep
+# them LF so a core.autocrlf=true checkout (the Windows runners) matches.
+sql/*.sql text eol=lf
