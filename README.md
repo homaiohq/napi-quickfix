@@ -680,6 +680,15 @@ implementation and a test double.
   adapter, or one connection per session): it orders a write the engine gave up
   on before a later `reset()` or `close()`.
 
+Writing your own adapter? The repository (not the npm package) has an agent
+skill,
+[`.agents/skills/custom-message-store/`](https://github.com/homaiohq/napi-quickfix/tree/main/.agents/skills/custom-message-store),
+that an LLM can follow (copy the directory into your project's skills
+directory, e.g. `.claude/skills/`): the store contract as numbered rules with their sources,
+the verified column mapping onto QuickFIX's own `sessions`/`messages` tables
+(v1.16.0; the upstream DDL is linked, not copied) for interoperating with a C++
+deployment, and a test checklist.
+
 **Credentials in the store.** Every outbound message is persisted, Logons
 included, so a `Password` (554) or `RawData` (96) that your `toAdmin` adds is
 stored in clear, by QuickFIX's file store as well, and printed by the session
